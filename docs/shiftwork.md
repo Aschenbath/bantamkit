@@ -788,9 +788,12 @@ records the review-only replay evidence and its measurement harness. Some limits
 
 This guidance adds no runtime/schema guarantee.
 
-**Host practices measured in the #310 follow-ons (guidance only).** These are about
-how a host runs repairs and re-reviews. They were measured only inside grouped
-review, and the runtime enforces none of them. Each was compared live against a
+**Host practices measured in the #310 follow-ons (advice the runtime now carries).**
+These are about how a host runs repairs and re-reviews. They were measured only
+inside grouped review. Since #324 the runtime carries the first two as `hints` on
+the brief and records which path ran as `accounting.path` (see
+[Hints and `accounting.path`](#hints-and-accountingpath-324)). It is still advice:
+the runtime enforces none of them. Each was compared live against a
 paired baseline under pre-declared quality gates: seeds caught, a hidden oracle,
 protocol stops, false findings and latency. Every gate held. The sample is two
 repeats per mode on one-line seeded defects, so treat these as defaults to try,
@@ -966,15 +969,65 @@ refused before anything is written —
 `history_entry notes are <n> code points; an attempt keeps at most 2000` —
 counted in code points so both runtimes agree on Thai and astral text.
 
-Every brief then carries two keys, always present:
+Every brief then carries these keys, always present:
 
 - `upstream` — one `{unit, title, status, last}` per `depends_on` id, in
   `depends_on` order; `last` is that unit's newest attempt or `null`.
 - `prior_attempts` — this unit's own attempts, oldest first.
+- `hints` — the #310 repair and re-review advice, below (#324).
 
 **Rework is a status, not a verdict.** A unit clocked out `todo` with an attempt
 recorded is a rework: its next brief carries what the last tries found in
 `prior_attempts`. Spec: `docs/superpowers/specs/2026-11-03-shiftwork-unit-results-design.md`.
+
+#### Hints and `accounting.path` (#324)
+
+Every brief also carries `hints`, always present:
+`{"repair": null, "review": null}` when neither applies. It carries the two #310
+practices above as advice. The runtime reads no files, runs no git and no fast
+check, and refuses nothing on their account. Spec:
+`docs/superpowers/specs/2026-11-14-shiftwork-runtime-hints-design.md`, which also
+holds the fixed sentences in each hint.
+
+- `hints.repair` is an object when the unit is an `implementer` that has a
+  reviewer whose newest attempt is neither `done` nor `dropped`, and the unit has
+  a non-empty `touches`. Otherwise `null`.
+  - Fields: `lever` (`patch`), `owned` (the unit's `touches`), `fast_check` (its
+    `verify`), then `use_when`, `call`, `write`, `fallback`, `skip_when`, `log`.
+  - The one-file condition is on the findings, which only the host can read. The
+    runtime states it in `use_when` and does not guess.
+- `hints.review` is an object when the unit has `reviews` and an accounting line
+  of its own (a re-review). Otherwise `null`.
+  - `lever` is `resume`. `thread` is `agent_id` from the reviewer's newest
+    accounting line, or `null`.
+  - `resumes_so_far` counts the newest consecutive lines with `path: resume`.
+    A line with another `path`, or none, stops the count.
+  - `resume_allowed` is `thread` set and `resumes_so_far < 2`. The cap of 2 is
+    the measured setup's. It is advice, and nothing refuses a third.
+  - `members` has one entry per `reviews` id, in order: `unit`, `changed`,
+    `revision`, `fast_check`, `paths`. `changed` follows ledger order: the member
+    clocked out after the reviewer's newest line, or has no line at all. It can
+    be true for a member whose content did not change, so the host may compare
+    content to send less. `revision` is the newest `commit` ref the member
+    produced, or `null`.
+  - Then `turn`, `fresh_when` and `log`.
+
+`accounting.path` is an optional key on the accounting line: one of `patch`,
+`fallback`, `resume`, `fresh`. It says which path the unit ran when it followed a
+hint. A value outside those four is refused by the existing accounting-shape
+check, so no new sentence was added. A missing `path` counts as "not resume" when
+`resumes_so_far` is counted.
+
+**Measure the saving from real use.** The ledger holds `path`, `tokens` and
+`cache_read_tokens` per line, so cost by path is one group-by:
+
+```sh
+jq -s 'map(select(.path)) | group_by(.path) | map({path: .[0].path, n: length, tokens: (map(.tokens // 0) | add)})' .shiftwork/checkpoint.json.log.jsonl
+```
+
+It prints one row per `path` with the number of lines and their summed `tokens`.
+Compare like with like: a resume against a fresh review of the same size, and
+read the #310 caveats above first, since those numbers came from Codex only.
 
 #### Follow-ups: a unit adds the work it found (#260)
 
