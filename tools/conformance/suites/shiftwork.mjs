@@ -635,6 +635,7 @@ function sessions(packDir, anyPackDir, brokenPacks) {
   // `unitIdSessions`.
   for (const [name, doc, calls] of unitIdSessions()) cases.push({ name, file: 'checkpoint.json', checkpoint: doc, calls });
   for (const [name, doc, calls] of j655Sessions()) cases.push({ name, file: 'checkpoint.json', checkpoint: doc, calls });
+  for (const [name, doc, calls] of hintsSessions()) cases.push({ name, file: 'checkpoint.json', checkpoint: doc, calls });
 
   return cases;
 }
@@ -1217,6 +1218,65 @@ const droppedReviewDocument = ({ c = 'dropped', reviews = ['A', 'C', 'D'], curso
   },
 });
 const DROPPED_SENTENCE = 'unit R reviews C, which was dropped; remove it from reviews or restore it';
+
+/**
+ * #324: members A (two `touches`, a commit on its newest attempt) and C (one `touches`), reviewer
+ * R of both. `a`, `c`, `r` override a unit's fields; `d` adds a third reviewed member D. The
+ * cursor is R; the repair sessions move it to A.
+ */
+const hintsDocument = ({ cursor = 'R', a = {}, c = {}, r = {}, d = null } = {}) => {
+  const members = [
+    unit('A', [], {
+      status: 'done',
+      touches: ['src/a.py', 'src/b.py'],
+      verify: 'python checks/check_A.py',
+      attempts: [{ status: 'done', outcome: 'a done', produced: [{ kind: 'commit', ref: '3f9c1d' }] }],
+      ...a,
+    }),
+    unit('C', [], { status: 'done', touches: ['src/c.py'], verify: 'python checks/check_C.py', ...c }),
+  ];
+  if (d) members.push(unit('D', [], { status: 'done', touches: ['src/d.py'], verify: 'python checks/check_D.py', ...d }));
+  const ids = members.map((m) => m.id);
+  return baseDocument({
+    plan: { cursor, units: [...members, unit('R', ids, { role: 'reviewer', reviews: ids, ...r })] },
+  });
+};
+/** A clock-out ledger line for `unitId`; `over` adds `agent_id`, `path`, `event`. */
+const hintLine = (unitId, over = {}) =>
+  JSON.stringify({ briefed: true, role: unitId === 'R' ? 'reviewer' : 'implementer', status: 'done', ts: 'x', unit: unitId, ...over });
+const HL_A = hintLine('A');
+const HL_C = hintLine('C');
+const HL_R = (agentId, path) => hintLine('R', { ...(agentId === null ? {} : { agent_id: agentId }), ...(path ? { path } : {}) });
+const HL_UNCOMMITTED = (unitId) => JSON.stringify({ event: 'uncommitted', role: unitId === 'R' ? 'reviewer' : 'implementer', ts: 'x', unit: unitId });
+const BLOCKED_REVIEW = [{ status: 'blocked', outcome: 'findings against A' }];
+const hintPathOut = (path) => OUT('N1', 'done', { accounting: b64(JSON.stringify({ tokens: 5, duration_ms: 9, path })) });
+
+/** `[name, checkpoint, calls]` triples for #324: the clock_in `hints` and `accounting.path`. */
+function hintsSessions() {
+  const doc = (o) => b64(raw(hintsDocument(o)));
+  const todoA = { status: 'todo', attempts: undefined };
+  const repairDoc = (o = {}) => hintsDocument({ cursor: 'A', a: todoA, r: { attempts: BLOCKED_REVIEW }, ...o });
+  return [
+    ['hints/none', b64(raw(baseDocument())), [IN()]],
+    ['hints/repair', b64(raw(repairDoc())), [IN()]],
+    ['hints/no-repair-no-touches', b64(raw(repairDoc({ a: { ...todoA, touches: undefined } }))), [IN()]],
+    ['hints/no-repair-approved', b64(raw(repairDoc({ r: { attempts: [{ status: 'done', outcome: 'approved' }] } }))), [IN()]],
+    ['hints/no-repair-non-implementer', b64(raw(repairDoc({ a: { ...todoA, role: 'planner' } }))), [IN()]],
+    ['hints/review-first', doc({}), [IN()]],
+    ['hints/review-thread-changed', doc({}), [LEDGER(HL_A, HL_C, HL_R('th1', 'fresh'), HL_A), IN()]],
+    ['hints/resume-cap', doc({}), [LEDGER(HL_A, HL_C, HL_R('th1', 'fresh'), HL_R('th1', 'resume'), HL_R('th1', 'resume')), IN()]],
+    ['hints/resume-reset', doc({}), [LEDGER(HL_A, HL_C, HL_R('th1', 'resume'), HL_R('th1', 'resume'), HL_R('th1', 'fresh'), HL_R('th1', 'resume')), IN()]],
+    ['hints/no-thread', doc({}), [LEDGER(HL_A, HL_C, HL_R(null, 'fresh')), IN()]],
+    ['hints/uncommitted', doc({}), [LEDGER(HL_A, HL_C, HL_R('th1', 'fresh'), HL_R('th2', 'resume'), HL_UNCOMMITTED('R')), IN()]],
+    ['hints/uncommitted-other-unit', doc({}), [LEDGER(HL_A, HL_R('th1', 'resume'), HL_UNCOMMITTED('A')), IN()]],
+    ['hints/event-null-line', doc({}), [LEDGER(HL_A, HL_C, hintLine('R', { event: null, agent_id: 'th1', path: 'resume' })), IN()]],
+    ['hints/review-brief-only', doc({}), [LEDGER(JSON.stringify({ event: 'brief', role: 'reviewer', ts: 'x', unit: 'R' })), IN()]],
+    ['hints/member-added', doc({ d: {} }), [LEDGER(HL_A, HL_C, HL_R('th1', 'fresh')), IN()]],
+    ['hints/path-refused', b64(raw(baseDocument())), [hintPathOut('patched'), IN()]],
+    ['hints/path-written', b64(raw(baseDocument())), [hintPathOut('patch'), ST()]],
+    ...['fallback', 'resume', 'fresh'].map((value) => [`hints/path-written-${value}`, b64(raw(baseDocument())), [hintPathOut(value)]]),
+  ];
+}
 
 /**
  * #259: `C` depends on `Z` then `A`, so `upstream` order is depends_on order, not plan order. `Z`
@@ -3316,6 +3376,42 @@ export async function run(ctx) {
       bit(`${viaTools}/member-dropped`, viaTools, 1, 'ok');
       says(`${viaTools}/clock-in-default`, viaTools, 2, DROPPED_SENTENCE);
       bit(`${viaTools}/unrelated-flows`, viaTools, 3, 'brief');
+    }
+
+    // #324, per side: the hints as constants off each side's own brief (a regression made in
+    // both runtimes at once leaves the differential sessions above green), and `path`.
+    {
+      const hint = (label, name, step, expected, read) => row(`hints/${label}`, name, step, expected, (r) => read(r.hints));
+      const review = (r) => (r === null ? null : { thread: r.thread, resumes: r.resumes_so_far, allowed: r.resume_allowed, changed: r.members.map((m) => m.changed) });
+      const none = { repair: null, review: null };
+      hint('none', 'hints/none', 0, none, (h) => h);
+      hint('repair-keys', 'hints/repair', 0, ['lever', 'owned', 'fast_check', 'use_when', 'call', 'write', 'fallback', 'skip_when', 'log'], (h) => Object.keys(h.repair));
+      hint('repair-owned', 'hints/repair', 0, { lever: 'patch', owned: ['src/a.py', 'src/b.py'], fast_check: 'python checks/check_A.py' }, (h) => ({ lever: h.repair.lever, owned: h.repair.owned, fast_check: h.repair.fast_check }));
+      hint('repair-review-null', 'hints/repair', 0, null, (h) => h.review);
+      for (const name of ['no-repair-no-touches', 'no-repair-approved', 'no-repair-non-implementer']) {
+        hint(name, `hints/${name}`, 0, none, (h) => h);
+      }
+      hint('review-first', 'hints/review-first', 0, none, (h) => h);
+      hint('thread-changed', 'hints/review-thread-changed', 1, { thread: 'th1', resumes: 0, allowed: true, changed: [true, false] }, (h) => review(h.review));
+      hint('thread-changed-revision', 'hints/review-thread-changed', 1, ['3f9c1d', null], (h) => h.review.members.map((m) => m.revision));
+      hint('resume-cap', 'hints/resume-cap', 1, { thread: 'th1', resumes: 2, allowed: false, changed: [false, false] }, (h) => review(h.review));
+      hint('resume-reset', 'hints/resume-reset', 1, { thread: 'th1', resumes: 1, allowed: true, changed: [false, false] }, (h) => review(h.review));
+      hint('no-thread', 'hints/no-thread', 1, { thread: null, resumes: 0, allowed: false, changed: [false, false] }, (h) => review(h.review));
+      hint('uncommitted', 'hints/uncommitted', 1, { thread: 'th1', resumes: 0, allowed: true, changed: [false, false] }, (h) => review(h.review));
+      hint('uncommitted-other-unit', 'hints/uncommitted-other-unit', 1, { thread: 'th1', resumes: 1, allowed: true, changed: [true, true] }, (h) => review(h.review));
+      hint('event-null-line', 'hints/event-null-line', 1, { thread: 'th1', resumes: 1, allowed: true, changed: [false, false] }, (h) => review(h.review));
+      hint('review-brief-only', 'hints/review-brief-only', 1, none, (h) => h);
+      hint('member-added', 'hints/member-added', 1, { thread: 'th1', resumes: 0, allowed: true, changed: [false, false, true] }, (h) => review(h.review));
+
+      bit('hints/path-refused', 'hints/path-refused', 0, 'error');
+      row('hints/path-refused-names-the-shape', 'hints/path-refused', 0, true, (r) => /accounting line the schema refuses/.test(r.reason ?? ''));
+      untouched('hints/path-refused', 'hints/path-refused', 0);
+      bit('hints/path-refused-cursor-unmoved', 'hints/path-refused', 1, 'brief');
+      const pathOnLine = (_, raw_) => (raw_.log === null ? null : unb64(raw_.log).trim().split('\n').map((t) => JSON.parse(t)).filter((l) => !('event' in l)).map((l) => l.path ?? null));
+      for (const [name, value] of [['path-written', 'patch'], ['path-written-fallback', 'fallback'], ['path-written-resume', 'resume'], ['path-written-fresh', 'fresh']]) {
+        bit(`hints/${name}`, `hints/${name}`, 0, 'ok');
+        row(`hints/${name}-on-the-ledger-line`, `hints/${name}`, 0, [value], pathOnLine);
+      }
     }
 
     notes.push(
