@@ -1248,6 +1248,15 @@ const HL_A = hintLine('A');
 const HL_C = hintLine('C');
 const HL_R = (agentId, path) => hintLine('R', { ...(agentId === null ? {} : { agent_id: agentId }), ...(path ? { path } : {}) });
 const HL_UNCOMMITTED = (unitId) => JSON.stringify({ event: 'uncommitted', role: unitId === 'R' ? 'reviewer' : 'implementer', ts: 'x', unit: unitId });
+/** #324: `hintsDocument()` plus a non-member repair unit Ar1 that touches A's src/a.py and sits in R.depends_on. */
+const hintsDocumentWithRepairUnit = () => {
+  const d = hintsDocument();
+  const units = d.plan.units;
+  const r = units[units.length - 1];
+  r.depends_on = [...r.depends_on, 'Ar1'];
+  units.splice(units.length - 1, 0, unit('Ar1', ['A'], { status: 'done', touches: ['src/a.py'], verify: 'python checks/check_Ar1.py' }));
+  return d;
+};
 const BLOCKED_REVIEW = [{ status: 'blocked', outcome: 'findings against A' }];
 const hintPathOut = (path) => OUT('N1', 'done', { accounting: b64(JSON.stringify({ tokens: 5, duration_ms: 9, path })) });
 
@@ -1272,6 +1281,8 @@ function hintsSessions() {
     ['hints/event-null-line', doc({}), [LEDGER(HL_A, HL_C, hintLine('R', { event: null, agent_id: 'th1', path: 'resume' })), IN()]],
     ['hints/review-brief-only', doc({}), [LEDGER(JSON.stringify({ event: 'brief', role: 'reviewer', ts: 'x', unit: 'R' })), IN()]],
     ['hints/member-added', doc({ d: {} }), [LEDGER(HL_A, HL_C, HL_R('th1', 'fresh')), IN()]],
+    ['hints/member-rewritten-by-other-unit', b64(raw(hintsDocumentWithRepairUnit())), [LEDGER(HL_A, HL_C, HL_R('th1', 'fresh'), hintLine('Z'), hintLine('Ar1')), IN()]],
+    ['hints/reviewer-status-dropped', doc({ cursor: 'A', a: todoA, r: { status: 'dropped', attempts: BLOCKED_REVIEW } }), [IN()]],
     ['hints/path-refused', b64(raw(baseDocument())), [hintPathOut('patched'), IN()]],
     ['hints/path-written', b64(raw(baseDocument())), [hintPathOut('patch'), ST()]],
     ...['fallback', 'resume', 'fresh'].map((value) => [`hints/path-written-${value}`, b64(raw(baseDocument())), [hintPathOut(value)]]),
@@ -3426,6 +3437,9 @@ export async function run(ctx) {
       hint('event-null-line', 'hints/event-null-line', 1, { thread: 'th1', resumes: 1, allowed: true, changed: [false, false] }, (h) => review(h.review));
       hint('review-brief-only', 'hints/review-brief-only', 1, none, (h) => h);
       hint('member-added', 'hints/member-added', 1, { thread: 'th1', resumes: 0, allowed: true, changed: [false, false, true] }, (h) => review(h.review));
+
+      hint('member-rewritten-by-other-unit', 'hints/member-rewritten-by-other-unit', 1, { thread: 'th1', resumes: 0, allowed: true, changed: [true, false] }, (h) => review(h.review));
+      hint('reviewer-status-dropped', 'hints/reviewer-status-dropped', 0, 'patch', (h) => h.repair && h.repair.lever);
 
       bit('hints/path-refused', 'hints/path-refused', 0, 'error');
       row('hints/path-refused-names-the-shape', 'hints/path-refused', 0, true, (r) => /accounting line the schema refuses/.test(r.reason ?? ''));
