@@ -2935,3 +2935,205 @@ def test_j65_5_default_clock_in_passes_a_graph_refusal_through_like_the_named_pa
     assert _j65_out(path, "A")["result"] == "ok"  # clock_out still RECORDS on a broken graph
     path.write_text(json.dumps(_j65_graph(units, "GHOST")), encoding="utf-8")
     assert ops.clock_in(str(path)) == {"result": "escalate", "reason": "cursor GHOST names no unit"}
+
+
+# --- #324: clock_in hints -------------------------------------------------
+
+
+def _h_unit(unit_id, role="implementer", **extra):
+    unit = _j65_unit(unit_id)
+    unit["role"] = role
+    unit["verify"] = f"check {unit_id}"
+    unit.update(extra)
+    return unit
+
+
+def _h_ledger(path, *lines):
+    log = Path(str(path) + ".log.jsonl")
+    log.write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
+
+
+def _h_line(unit, **extra):
+    return {"unit": unit, "role": "x", "status": "done", "ts": "t", **extra}
+
+
+def _h_review_doc(path, members=("A",), reviewer_extra=None, **member_extra):
+    units = [_h_unit(m, touches=[f"{m}.py"], **member_extra) for m in members]
+    rev = _h_unit(
+        "R",
+        role="reviewer",
+        depends_on=list(members),
+        reviews=list(members),
+        **(reviewer_extra or {}),
+    )
+    units.append(rev)
+    _j65_write(path, units, cursor="R")
+    return path
+
+
+def _h_brief(path, unit="R"):
+    brief = ops.clock_in(str(path), unit)
+    assert brief["result"] == "brief", brief
+    return brief
+
+
+def _h_done(path, members=("A",)):
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    for u in doc["plan"]["units"]:
+        if u["id"] in members:
+            u["status"] = "done"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+
+def test_324_hints_absent_without_reviewers(tmp_path):
+    path = tmp_path / "cp.json"
+    _j65_write(path, [_h_unit("A")])
+    assert ops.clock_in(str(path))["hints"] == {"repair": None, "review": None}
+
+
+def _h_repair_doc(path, touches=("src/a.py", "src/b.py"), status="blocked", role="implementer"):
+    a = _h_unit("A2", role=role)
+    if touches is not None:
+        a["touches"] = list(touches)
+    r = _h_unit("R", role="reviewer", depends_on=["A2"], reviews=["A2"], status="todo")
+    r["attempts"] = [{"status": status, "outcome": "rejected"}]
+    _j65_write(path, [a, r], cursor="A2")
+
+
+def test_324_repair_hint_under_blocked_reviewer(tmp_path):
+    path = tmp_path / "cp.json"
+    _h_repair_doc(path)
+    repair = ops.clock_in(str(path))["hints"]["repair"]
+    assert repair["owned"] == ["src/a.py", "src/b.py"]
+    assert repair["fast_check"] == "check A2"
+    assert repair["use_when"] == ops.REPAIR_USE_WHEN
+    assert list(repair) == [
+        "lever", "owned", "fast_check", "use_when", "call", "write", "fallback", "skip_when", "log",
+    ]
+
+
+def test_324_no_repair_hint_without_touches_or_after_approval(tmp_path):
+    path = tmp_path / "cp.json"
+    _h_repair_doc(path, touches=None)
+    assert ops.clock_in(str(path))["hints"]["repair"] is None
+    _h_repair_doc(path, status="done")
+    assert ops.clock_in(str(path))["hints"]["repair"] is None
+    _h_repair_doc(path, role="planner")
+    assert ops.clock_in(str(path))["hints"]["repair"] is None
+
+
+def test_324_review_hint_null_on_first_review(tmp_path):
+    path = _h_review_doc(tmp_path / "cp.json")
+    _h_done(path)
+    assert _h_brief(path)["hints"]["review"] is None
+
+
+def test_324_review_hint_thread_and_changed(tmp_path):
+    path = _h_review_doc(tmp_path / "cp.json", members=("A", "C"))
+    _h_done(path, ("A", "C"))
+    _h_ledger(
+        path,
+        _h_line("C"),
+        _h_line("A"),
+        _h_line("R", agent_id="t1"),
+        _h_line("A"),
+    )
+    review = _h_brief(path)["hints"]["review"]
+    assert review["thread"] == "t1"
+    assert review["resumes_so_far"] == 0
+    assert review["resume_allowed"] is True
+    assert [(m["unit"], m["changed"]) for m in review["members"]] == [("A", True), ("C", False)]
+    assert list(review) == [
+        "lever",
+        "thread",
+        "resumes_so_far",
+        "resume_allowed",
+        "members",
+        "turn",
+        "fresh_when",
+        "log",
+    ]
+    assert review["members"][1] == {
+        "unit": "C", "changed": False, "revision": None, "fast_check": "check C", "paths": ["C.py"],
+    }
+
+
+def test_324_resume_cap_and_reset(tmp_path):
+    path = _h_review_doc(tmp_path / "cp.json")
+    _h_done(path)
+    _h_ledger(
+        path,
+        _h_line("A"),
+        _h_line("R", agent_id="t1", path="resume"),
+        _h_line("R", agent_id="t1", path="resume"),
+    )
+    review = _h_brief(path)["hints"]["review"]
+    assert (review["resumes_so_far"], review["resume_allowed"]) == (2, False)
+    _h_ledger(
+        path,
+        _h_line("A"),
+        _h_line("R", agent_id="t1", path="resume"),
+        _h_line("R", agent_id="t1", path="fresh"),
+        _h_line("R", agent_id="t1", path="resume"),
+    )
+    review = _h_brief(path)["hints"]["review"]
+    assert (review["resumes_so_far"], review["resume_allowed"]) == (1, True)
+
+
+def test_324_review_hint_no_agent_id(tmp_path):
+    path = _h_review_doc(tmp_path / "cp.json")
+    _h_done(path)
+    _h_ledger(path, _h_line("A"), _h_line("R", accounting=None))
+    review = _h_brief(path)["hints"]["review"]
+    assert review is not None
+    assert (review["thread"], review["resume_allowed"]) == (None, False)
+
+
+def test_324_uncommitted_cancels_reviewer_line(tmp_path):
+    path = _h_review_doc(tmp_path / "cp.json")
+    _h_done(path)
+    _h_ledger(
+        path,
+        _h_line("A"),
+        _h_line("R", agent_id="t1"),
+        _h_line("R", agent_id="t2"),
+        {"event": "uncommitted", "unit": "R", "role": "reviewer", "ts": "t"},
+    )
+    review = _h_brief(path)["hints"]["review"]
+    assert review["thread"] == "t1"
+    assert review["members"][0]["changed"] is False
+
+
+def test_324_member_without_ledger_line_is_changed(tmp_path):
+    path = _h_review_doc(tmp_path / "cp.json", members=("A", "C"))
+    _h_done(path, ("A", "C"))
+    _h_ledger(path, _h_line("A"), _h_line("R", agent_id="t1"))
+    members = _h_brief(path)["hints"]["review"]["members"]
+    assert [m["changed"] for m in members] == [False, True]
+
+
+def test_324_unreadable_ledger_degrades(tmp_path):
+    path = _h_review_doc(tmp_path / "cp.json")
+    _h_done(path)
+    Path(str(path) + ".log.jsonl").mkdir()
+    assert _h_brief(path)["hints"]["review"] is None
+
+
+def test_324_revision_from_commit_produced(tmp_path):
+    path = _h_review_doc(
+        tmp_path / "cp.json",
+        attempts=[
+            {
+                "status": "done",
+                "outcome": "ok",
+                "produced": [{"kind": "file", "ref": "x"}, {"kind": "commit", "ref": "abc"}],
+            }
+        ],
+    )
+    _h_done(path)
+    _h_ledger(path, _h_line("A"), _h_line("R", agent_id="t1"))
+    assert _h_brief(path)["hints"]["review"]["members"][0]["revision"] == "abc"
+    path = _h_review_doc(tmp_path / "cp2.json")
+    _h_done(path)
+    _h_ledger(path, _h_line("A"), _h_line("R", agent_id="t1"))
+    assert _h_brief(path)["hints"]["review"]["members"][0]["revision"] is None
