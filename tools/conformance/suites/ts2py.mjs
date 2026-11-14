@@ -1,0 +1,178 @@
+/**
+ * ts2py — the work planner three ways: TypeScript, ts2py's generated Python, and `bantamkit.workplan`.
+ *
+ * THE PROPERTY (#314). `runtime-ts/src/workplan.ts` compiled by `tools/ts2py` answers every case
+ * in `fixtures/workplan-cases.json` exactly as the TypeScript does, and so does whatever serves
+ * `bantamkit.workplan` on the Python side. Each case is compared on three arms against the ONE
+ * expected answer written in that file:
+ *
+ *   node/<case>       `plan` from `runtime-ts/dist/workplan.js` (run `npm run build` if stale)
+ *   generated/<case>  the module ts2py writes into this run's scratch, compiled FRESH every run
+ *   legacy/<case>     `bantamkit.workplan` from `runtime-py/src` — the committed generated module
+ *                     since #314 switched (J85-3); the arm checks what the package actually serves
+ *
+ * Every arm is compared as TEXT: Node's `JSON.stringify(answer)` against Python's
+ * `json.dumps(answer, ensure_ascii=False, separators=(",", ":"))`, so key order (`held` last)
+ * is under test and not only the values. A Python arm that raises answers
+ * `RAISED <type>: <message>`, one red case naming itself.
+ *
+ * WHY IT COMPILES AT RUN TIME. A checked-in generated file could go stale against `workplan.ts`
+ * and still pass a suite that imported it. Here `cargo run` (from `~/.cargo/bin/cargo`, or
+ * `$TS2PY_CARGO`, or `cargo` on PATH) rebuilds the compiler from `tools/ts2py` and recompiles the
+ * source on every run, and `generated/source-sha256` checks the module's header names the bytes
+ * on disk. No Rust toolchain means this suite is red, with the reason, rather than skipped.
+ * `committed/workplan.py` and `committed/_ts2py_runtime.py` then compile again with the flags the
+ * committed files were made with (`--runtime-module ._ts2py_runtime`, `--emit-runtime`) and
+ * compare every byte with `runtime-py/src/bantamkit/_generated/`, so a hand-edited body or a
+ * compiler change that was never regenerated is red, with the regenerate command (J85-R F4).
+ *
+ * WHY THE PYTHON ARMS READ THE FIXTURE THEMSELVES. `ref/ts2py_ref.py` opens the file with
+ * `json.load`; the cases are not sent as a payload, because the payload goes through
+ * `JSON.stringify`, which would turn `3.0` into `3` and `-0.0` into `0` before Python saw them.
+ * Each side parses the same bytes with its own parser, which is what the MCP servers do with a
+ * request.
+ *
+ * THE EXPECTED ANSWERS ARE DATA, WRITTEN ONCE (#312). `fixtures/workplan-cases.json` holds the 21
+ * real graphs and the synthetic corpus of `suites/workplan.mjs` (which now reads its inputs from
+ * the same file), every `plan()` input in `runtime-ts/test/workplan.test.mjs` and
+ * `runtime-py/tests/test_workplan.py`, and adversarial cases where Python and JS semantics split.
+ * An input that appears in several places is one case whose `source` lists them all. Every
+ * `expected` is the TypeScript planner's answer, written in on 2026-11-15 after every literal those
+ * three locations pin (widths, first batches, refusal sentences, `held`) was checked against it.
+ *
+ * NO RULINGS. Every arm must match the expected answer. Until #314 switched `bantamkit.workplan` to
+ * the generated module (J85-3), the hand-written planner differed from the TypeScript on 8 cases,
+ * carried here as `ruling:` cases; the switch fixed all 8 on the Python side and the list was
+ * deleted (`docs/porting.md`, Generated modules). A disagreement now is a red case, never a ruling.
+ */
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+export const name = 'ts2py';
+export const summary = 'workplan three ways: TypeScript, ts2py-generated Python and bantamkit.workplan against one expected file';
+
+const here = dirname(dirname(fileURLToPath(import.meta.url)));
+const repoRoot = dirname(dirname(here));
+const FIXTURE = join(here, 'fixtures', 'workplan-cases.json');
+const REF = join(here, 'ref', 'ts2py_ref.py');
+const SOURCE = 'runtime-ts/src/workplan.ts';
+
+/**
+ * The case count per category, typed out. A case dropped from the fixture is red here rather
+ * than a smaller suite that still passes.
+ */
+const HEADLINE = { cases: 148, graph: 21, core: 53, ts: 21, py: 13, adversarial: 40 };
+
+function findCargo() {
+  if (process.env.TS2PY_CARGO) return process.env.TS2PY_CARGO;
+  const home = join(homedir(), '.cargo', 'bin', process.platform === 'win32' ? 'cargo.exe' : 'cargo');
+  return existsSync(home) ? home : 'cargo';
+}
+
+/** Run the ts2py binary with `args` (from the repo root). Throws (a red suite) with cargo's own words. */
+function ts2py(args, out) {
+  const cargo = findCargo();
+  const r = spawnSync(
+    cargo,
+    ['run', '--release', '--quiet', '--manifest-path', join(repoRoot, 'tools', 'ts2py', 'Cargo.toml'), '--', ...args],
+    { cwd: repoRoot, encoding: 'utf8', timeout: 900_000, maxBuffer: 64 * 1024 * 1024 },
+  );
+  if (r.error) throw new Error(`ts2py: could not run ${cargo}: ${r.error.message} (set TS2PY_CARGO)`);
+  if (r.status !== 0) throw new Error(`ts2py ${args.join(' ')} failed (exit ${r.status})\n${r.stderr}`);
+  if (!existsSync(out)) throw new Error(`ts2py: exited 0 but wrote no ${out}`);
+}
+
+/** Compile `workplan.ts` with ts2py into `out` (the runtime inlined). */
+function compile(out) {
+  ts2py([SOURCE, '-o', out], out);
+}
+
+/**
+ * THE COMMITTED FILES, byte for byte (J85-R F4). `runtime-py/src/bantamkit/_generated/` is what the
+ * wheel serves, and the header line alone cannot vouch for it: a hand-edited body keeps its
+ * header, and so does a module that a changed `lower.rs` or `runtime.py` would now write
+ * differently. So the suite compiles with exactly the flags the committed files were made with
+ * and compares every byte; a mismatch is red and its message is the command that regenerates.
+ */
+const COMMITTED = 'runtime-py/src/bantamkit/_generated';
+const REGENERATE =
+  'regenerate from the repository root:\n' +
+  `  cargo run --release --manifest-path tools/ts2py/Cargo.toml -- ${SOURCE} -o ${COMMITTED}/workplan.py --runtime-module ._ts2py_runtime\n` +
+  `  cargo run --release --manifest-path tools/ts2py/Cargo.toml -- --emit-runtime ${COMMITTED}/_ts2py_runtime.py`;
+
+function committedCases(bed) {
+  const module = join(bed, 'committed_workplan.py');
+  const runtime = join(bed, 'committed_ts2py_runtime.py');
+  ts2py([SOURCE, '-o', module, '--runtime-module', '._ts2py_runtime'], module);
+  ts2py(['--emit-runtime', runtime], runtime);
+  return [
+    ['workplan.py', module],
+    ['_ts2py_runtime.py', runtime],
+  ].map(([file, fresh]) => {
+    const committed = join(repoRoot, COMMITTED, file);
+    const want = readFileSync(fresh);
+    const have = existsSync(committed) ? readFileSync(committed) : Buffer.alloc(0);
+    return {
+      name: `committed/${file}`,
+      kind: 'string',
+      expected: `${COMMITTED}/${file} is byte-identical to ts2py's output`,
+      actual: want.equals(have)
+        ? `${COMMITTED}/${file} is byte-identical to ts2py's output`
+        : `${COMMITTED}/${file} differs from what ts2py writes now (${have.length} bytes committed, ${want.length} fresh); ${REGENERATE}`,
+    };
+  });
+}
+
+export async function run(ctx) {
+  const fixture = JSON.parse(readFileSync(FIXTURE, 'utf8'));
+  const { plan } = await import(new URL('workplan.js', pathToFileURL(join(ctx.runtimeTs, 'dist', '/'))));
+
+  const bed = join(ctx.scratch, 'ts2py');
+  mkdirSync(bed, { recursive: true });
+  const generatedPath = join(bed, 'workplan_generated.py');
+  compile(generatedPath);
+
+  const cases = [...committedCases(bed)];
+  const notes = [];
+
+  // The module is what the source on disk compiles to NOW: its header names those bytes.
+  const sha = createHash('sha256').update(readFileSync(join(repoRoot, SOURCE))).digest('hex');
+  cases.push({
+    name: 'generated/source-sha256',
+    kind: 'string',
+    expected: `# source-sha256: ${sha}`,
+    actual: readFileSync(generatedPath, 'utf8').split('\n')[1] ?? '(no second line)',
+  });
+
+  const counts = { cases: fixture.length };
+  for (const c of fixture) {
+    const category = c.name.split('/')[0];
+    counts[category] = (counts[category] ?? 0) + 1;
+  }
+  cases.push({ name: 'fixture/headline', kind: 'json', expected: HEADLINE, actual: counts });
+
+  const python = ctx.runPython(REF, { fixture: FIXTURE, generated: generatedPath });
+
+  fixture.forEach((c, i) => {
+    const expected = JSON.stringify(c.expected);
+    let node;
+    try {
+      node = JSON.stringify(plan(c.input));
+    } catch (e) {
+      node = `RAISED ${e && e.name}: ${e && e.message}`;
+    }
+    cases.push({ name: `node/${c.name}`, kind: 'string', expected, actual: node });
+
+    cases.push({ name: `generated/${c.name}`, kind: 'string', expected, actual: python.generated[i] });
+    cases.push({ name: `legacy/${c.name}`, kind: 'string', expected, actual: python.legacy[i] });
+  });
+
+  notes.push(
+    `compiled ${SOURCE} with ts2py this run (sha256 ${sha.slice(0, 12)}); ${fixture.length} cases x 3 arms against fixtures/workplan-cases.json`,
+  );
+  return { cases, notes };
+}

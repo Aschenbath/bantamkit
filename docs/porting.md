@@ -970,6 +970,98 @@ user-facing call on either side that this ending could make diverge. `agent`, `b
 no observable behaviour on either side for it to hold constant — so adding one would be a case
 that can never fail, which is worse than no case.
 
+## Generated modules: `workplan` is compiled from TypeScript (#314)
+
+Since #314 (J85-3) the Python work planner is not a port. `runtime-ts/src/workplan.ts` is the
+one source; `tools/ts2py` (Rust, `tools/ts2py/SUBSET.md`) compiles it to
+`runtime-py/src/bantamkit/_generated/workplan.py`, with its JS-semantics support in
+`_generated/_ts2py_runtime.py`. `bantamkit/workplan.py` is a 50-line shim that keeps the public
+names (`plan`, `touches_refusal`). The hand-written 311-line planner is gone;
+`tools/conformance/ref/workplan_ref.py` still imports `bantamkit.workplan` and so now runs the
+generated code.
+
+**Both files are committed**, so `pip install`, `python -m build` and the wheel need no Rust.
+After any edit to `workplan.ts`, regenerate from the repository root:
+
+```
+cargo run --release --manifest-path tools/ts2py/Cargo.toml -- runtime-ts/src/workplan.ts \
+  -o runtime-py/src/bantamkit/_generated/workplan.py --runtime-module ._ts2py_runtime
+cargo run --release --manifest-path tools/ts2py/Cargo.toml -- \
+  --emit-runtime runtime-py/src/bantamkit/_generated/_ts2py_runtime.py
+```
+
+(`~/.cargo/bin/cargo` when cargo is not on PATH.) Output is deterministic, so an unchanged
+source regenerates byte-identical files.
+
+**Two gates.** `runtime-py/tests/test_ts2py_fresh.py` fails when line 2 of the committed module,
+`# source-sha256: <hex>`, no longer equals sha256 of `runtime-ts/src/workplan.ts`, or when the
+committed runtime differs from `tools/ts2py/src/runtime.py`. Both failure messages print the
+commands above. It needs no Rust. `node tools/conformance/run.mjs --suite ts2py` recompiles the
+TypeScript fresh on every run and compares Node, the fresh module and `bantamkit.workplan`
+against the 148 expected answers in `tools/conformance/fixtures/workplan-cases.json`, with no
+rulings. `runtime-py/tests/test_workplan.py` reads the same file. Since J85-5 the same suite also
+compiles with the committed flags (`--runtime-module ._ts2py_runtime`, `--emit-runtime`) and
+byte-compares the output with both committed files (`committed/workplan.py`,
+`committed/_ts2py_runtime.py`), so a hand-edited body, or a change to `tools/ts2py` that was never
+regenerated, is red with the regenerate command; the sha256 header alone could not see either.
+
+**Python-side behaviour changes, all toward Node.** The hand-written planner disagreed with the
+TypeScript on 8 fixture cases, which J85-2 carried as `ruling:` cases (`KNOWN_LEGACY_FINDINGS`,
+now deleted). The switch fixes each one on the Python side. The Node side does not move:
+
+| Case | Python before | Python now = Node |
+|---|---|---|
+| `ts/shape-no-id` (library `plan`) | raised `KeyError: 'id'` | refusal `nodes[0].id must be a string` |
+| `adversarial/touches/1e21` | sentence printed `1000000000000000000000` (Python `repr`) | `1e+21` |
+| `adversarial/touches/1e-7` | printed `1e-07` | `1e-7` |
+| `adversarial/touches/object-nested-floats-and-keys` | nested `3.0` kept as `3.0`; keys in insertion order | `3`; array-index keys first, as `JSON.stringify` orders them |
+| `adversarial/touches/object-array-index-keys` | keys in insertion order | array-index keys first, ascending (`"2"`, `"10"`, then `"b"`) |
+| `adversarial/touches/object-in-list` | nested `1.0` printed `1.0` | `1` |
+| `adversarial/priority/2^53-plus-one-ties-in-js` | `9007199254740993` outranked `9007199254740992` (exact ints) | they tie as doubles; insertion order decides |
+| `adversarial/touches/int-beyond-2^53` | printed the exact `12345678901234567890` | the rounded double `12345678901234567000` |
+
+The `work_plan` MCP tool still raises `KeyError('id')` for a node with no `id`
+(`--suite workplan` `tool/no-id`, `test_sdk_wire_text.py`). `mcpserver.py`'s handler maps the
+planner's `nodes[<i>].id must be a string` back to that `KeyError` when node `<i>` is a dict
+with no `id` key. The planner stops at the first faulty node, which is where the old
+`node["id"]` raised, so the tool's answer is unchanged for every input.
+
+**One `work_plan` change on the Node side (J85-5, review finding F5, older than #314).** The
+reference read `node["id"]` inside its shape pass, in input order, so a fault in an EARLIER node
+was the answer and a later node's missing `id` was never reached. `runtime-ts/src/mcp/server.ts`'s
+`planNodes` instead checked every node for an `id` before the planner ran, so the port raised
+`Error executing tool work_plan: 'id'` where the reference refused the earlier node. Node was the
+wrong side (its own comment says it reproduces the reference) and is fixed: it now maps the
+planner's `nodes[<i>].id must be a string` back to the raise only when node `<i>` is a dict with
+no `id`, the seam `mcpserver.py` uses. Python does not move. Pinned by four `--suite workplan`
+cases, red against the old port on the first three:
+
+| Input (`nodes`) | Node before | Both now |
+|---|---|---|
+| `[{id:'a', depends_on:5}, {depends_on:[]}]` (`tool/no-id-after-depends_on-fault`) | raised `'id'` | `nodes[0].depends_on must be a list of strings` |
+| `[{id:7}, {depends_on:[]}]` (`tool/no-id-after-int-id`) | raised `'id'` | `nodes[0].id must be a string` |
+| `[{id:'a', touches:'x'}, {depends_on:[]}]` (`tool/no-id-after-touches-fault`) | raised `'id'` | `node a touches "x", which is not a plain relative path` |
+| `[{depends_on:[]}, {id:'b', depends_on:5}]` (`tool/no-id-before-a-fault`) | raised `'id'` | raises `'id'` (unchanged) |
+
+**Inputs only a Python caller can build.** JSON has no tuples, so neither MCP surface nor
+`shiftwork` can produce these. A top-level `tuple` of nodes is still accepted: the shim turns
+it into a list, because the old planner took any sequence. `plan(nodes=...)` by keyword still
+works. Two cases changed and are recorded here instead of patched: a nested `tuple` for
+`touches` used to be refused with a sentence and now raises `TypeError: ts2py: JSON.stringify of
+tuple is outside the subset`. A top-level `dict` used to be refused `nodes[0] must be an object`,
+because the old planner iterated its keys, and now raises `TypeError` (`.entries() on dict`).
+`None` raised `TypeError` before and still does. Two more, found by the J85-R review (F6): a
+`tuple` used as a **node** (`plan([("a",)])`) used to be refused `nodes[0] must be an object` and
+is now refused `nodes[0].id must be a string`, because the generated code reads a property of a
+non-object as `undefined`; and a **generator** of nodes used to return an empty plan
+(`{"batches": [], "sequence": [], "width": 0}`, wrongly: the old planner exhausted it in its shape
+pass and planned nothing) and now raises `TypeError: ts2py: .entries() on generator is outside
+the subset`. The shim stays as it is. The reviewer's judgement, which these four changes rest on:
+no caller can produce any of them. The three callers, `shiftwork.py:768`, `shiftwork.py:2093` and
+the `work_plan` MCP tool (`mcpserver.py:1817`), all pass a `list` of `dict`s that came from JSON
+(`json.loads` of a checkpoint or ticket file, or the MCP request), and JSON has no tuples or
+generators.
+
 ## Concurrency
 
 Measured, not assumed: 12 pipelined saves all land in order; a recall behind a save **sees**
