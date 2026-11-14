@@ -1008,8 +1008,10 @@ holds the fixed sentences in each hint.
     `revision`, `fast_check`, `paths`. `changed` follows ledger order: the member
     clocked out after the reviewer's newest line, or has no line at all. It can
     be true for a member whose content did not change, so the host may compare
-    content to send less. `revision` is the newest `commit` ref the member
-    produced, or `null`.
+    content to send less. `revision` is the newest `commit` ref in the member's
+    newest attempt, or `null`. Units rarely report a commit, so expect `null`
+    most of the time. When it is `null`, the host computes its own revision (for
+    example a content hash) if it wants one.
   - Then `turn`, `fresh_when` and `log`.
 
 `accounting.path` is an optional key on the accounting line: one of `patch`,
