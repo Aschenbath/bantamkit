@@ -3388,6 +3388,30 @@ export async function run(ctx) {
       hint('repair-keys', 'hints/repair', 0, ['lever', 'owned', 'fast_check', 'use_when', 'call', 'write', 'fallback', 'skip_when', 'log'], (h) => Object.keys(h.repair));
       hint('repair-owned', 'hints/repair', 0, { lever: 'patch', owned: ['src/a.py', 'src/b.py'], fast_check: 'python checks/check_A.py' }, (h) => ({ lever: h.repair.lever, owned: h.repair.owned, fast_check: h.repair.fast_check }));
       hint('repair-review-null', 'hints/repair', 0, null, (h) => h.review);
+      // The fixed prose, as literals off each side: a sentence reworded in both runtimes at once
+      // leaves the differential green. Copied from global-constraints.md, not from either source.
+      hint('repair-strings', 'hints/repair', 0, {
+        use_when: `Every finding against this unit names one file, and that file is in owned.`,
+        call: `One call with no tools. Send the unit's brief, the reviewer's findings verbatim, and the full current text of every owned path. It answers {"files": [{"path", "content"}]}.`,
+        write: `Write only owned paths. A path that is a symlink, or that resolves outside the workspace, makes the answer invalid. Then run fast_check.`,
+        fallback: `If the answer is invalid or fast_check fails, run exactly one ordinary repair with tools, then clock out with accounting.path = fallback.`,
+        skip_when: `The repair would continue a session that already holds this work in its cache (the parent session authored it). There the fresh patch call cost more uncached input + output in #310.`,
+        log: `Clock out with accounting.path = patch when the patch answer was written and fast_check passed.`,
+      }, (h) => ({ use_when: h.repair.use_when, call: h.repair.call, write: h.repair.write, fallback: h.repair.fallback, skip_when: h.repair.skip_when, log: h.repair.log }));
+      hint('review-strings', 'hints/review-thread-changed', 1, {
+        lever: 'resume',
+        turn: `Resume thread with a delta turn only: a new reviewer context id, every member's revision, fast check and changed flag, and the full current text of every path of a changed member. changed is a superset: a member flagged changed may be identical, and the host may compare content to send less. Acceptance still binds every member and criterion to the current revision.`,
+        fresh_when: `resume_allowed is false, the thread cannot be resumed, or the resumed answer is invalid: run one fresh full review and clock out with accounting.path = fresh.`,
+        log: `Clock out with accounting.path = resume when the resumed answer was used, and pass the thread as clock_out's agent_id argument again.`,
+      }, (h) => ({ lever: h.review.lever, turn: h.review.turn, fresh_when: h.review.fresh_when, log: h.review.log }));
+      hint('review-key-order', 'hints/review-thread-changed', 1,
+        ['lever', 'thread', 'resumes_so_far', 'resume_allowed', 'members', 'turn', 'fresh_when', 'log'], (h) => Object.keys(h.review));
+      hint('member-key-order', 'hints/review-thread-changed', 1, ['unit', 'changed', 'revision', 'fast_check', 'paths'], (h) => Object.keys(h.review.members[0]));
+      hint('members-full', 'hints/review-thread-changed', 1, [
+        { unit: 'A', changed: true, revision: '3f9c1d', fast_check: 'python checks/check_A.py', paths: ['src/a.py', 'src/b.py'] },
+        { unit: 'C', changed: false, revision: null, fast_check: 'python checks/check_C.py', paths: ['src/c.py'] },
+      ], (h) => h.review.members);
+      hint('members-full-added', 'hints/member-added', 1, { unit: 'D', changed: true, revision: null, fast_check: 'python checks/check_D.py', paths: ['src/d.py'] }, (h) => h.review.members[2]);
       for (const name of ['no-repair-no-touches', 'no-repair-approved', 'no-repair-non-implementer']) {
         hint(name, `hints/${name}`, 0, none, (h) => h);
       }
