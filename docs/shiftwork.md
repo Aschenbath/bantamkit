@@ -997,7 +997,8 @@ holds the fixed sentences in each hint.
   - The one-file condition is on the findings, which only the host can read. The
     runtime states it in `use_when` and does not guess.
 - `hints.review` is an object when the unit has `reviews` and an accounting line
-  of its own (a re-review). Otherwise `null`.
+  of its own (a re-review). Otherwise `null`. Eligibility counts committed
+  lines: an `uncommitted` line cancels one.
   - `lever` is `resume`. `thread` is `agent_id` from the reviewer's newest
     accounting line, or `null`.
   - `resumes_so_far` counts the newest consecutive lines with `path: resume`.
@@ -1006,7 +1007,8 @@ holds the fixed sentences in each hint.
     the measured setup's. It is advice, and nothing refuses a third.
   - `members` has one entry per `reviews` id, in order: `unit`, `changed`,
     `revision`, `fast_check`, `paths`. `changed` follows ledger order: the member
-    clocked out after the reviewer's newest line, or has no line at all. It can
+    clocked out after the reviewer's newest line, or has no line at all, or another
+    unit whose `touches` share a path with the member clocked out after it. It can
     be true for a member whose content did not change, so the host may compare
     content to send less. `revision` is the newest `commit` ref in the member's
     newest attempt, or `null`. Units rarely report a commit, so expect `null`
@@ -1024,10 +1026,13 @@ check, so no new sentence was added. A missing `path` counts as "not resume" whe
 `cache_read_tokens` per line, so cost by path is one group-by:
 
 ```sh
-jq -s 'map(select(.path)) | group_by(.path) | map({path: .[0].path, n: length, tokens: (map(.tokens // 0) | add)})' .shiftwork/checkpoint.json.log.jsonl
+jq -s 'map(select(.path)) | group_by(.path) | map({path: .[0].path, n: length, tokens: (map(.tokens // 0) | add), avg: ((map(.tokens // 0) | add) / length)})' .shiftwork/checkpoint.json.log.jsonl
 ```
 
-It prints one row per `path` with the number of lines and their summed `tokens`.
+It prints one row per `path` with the number of lines, their summed `tokens` and
+the per-line average `avg`. A retried clock-out (an accounting line followed by an
+`uncommitted` line) is counted twice by this recipe. Compare `avg`, not the
+totals, when the groups differ in size.
 Compare like with like: a resume against a fresh review of the same size, and
 read the #310 caveats above first, since those numbers came from Codex only.
 

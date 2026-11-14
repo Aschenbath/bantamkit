@@ -1,6 +1,6 @@
 # Shiftwork carries the #310 repair and re-review hints (design, #324)
 
-Status: **frozen**, 2026-11-14 (owner approved). Issue:
+Status: **frozen**, 2026-11-14 (owner approved), amended 2026-11-14. Issue:
 [#324](https://github.com/Ink01101011/bantamkit/issues/324), milestone 0.40.0.
 The owner made two picks on 2026-11-14:
 - Approach A: advisory hints, with no change to the checkpoint schema.
@@ -206,6 +206,13 @@ re-review). Otherwise `null`.
     `R.reviews` after it (it has no line before R's). A member with no ledger
     line at all is `changed: true`, because the runtime cannot show it is
     unchanged.
+    A member is also `changed: true` when any committed clock-out line after
+    R's newest committed line belongs to a unit whose `touches` intersect the
+    member's `touches` (exact repo-relative path equality; a line whose unit no
+    longer exists in the checkpoint contributes nothing). The test uses the
+    checkpoint and the ledger only, and reads no files (amended 2026-11-14
+    after final review: a non-member writer of a member's path also sets
+    `changed`).
     **This is a superset (owner ruling 2026-11-14, A1).** A member that clocked
     out again with identical content is still `changed: true`. The runtime
     reads no files to rule that out, so the host may resend a member that did
