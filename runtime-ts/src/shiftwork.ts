@@ -1045,7 +1045,18 @@ function reviewHint(doc: PyDict, unit: PyDict, lines: LedgerLine[]): PyValue {
   const members: PyValue[] = reviews.map((memberId) => {
     const member = findUnit(doc, memberId)!;
     const idx = at(memberId);
-    const changed = !idx.some((i) => i < last) || idx.some((i) => i > last);
+    let changed = !idx.some((i) => i < last) || idx.some((i) => i > last);
+    if (!changed) {
+      // A writer that is not the member: any clock-out after R's newest line whose unit still
+      // exists and touches one of the member's paths (exact path equality).
+      const mt = member.v.get('touches');
+      const paths = new Set(mt !== undefined && mt.t === 'list' ? mt.v.map(text) : []);
+      for (let i = last + 1; i < lines.length && !changed; i++) {
+        const w = findUnit(doc, String(lines[i]!.unit ?? ''));
+        const wt = w === null ? undefined : w.v.get('touches');
+        if (wt !== undefined && wt.t === 'list' && wt.v.some((p) => paths.has(text(p)))) changed = true;
+      }
+    }
     const touches = member.v.get('touches');
     return dict([
       ['unit', str(memberId)],
@@ -1067,7 +1078,11 @@ function reviewHint(doc: PyDict, unit: PyDict, lines: LedgerLine[]): PyValue {
   ]);
 }
 
-/** #324: advisory levers for a brief, from the graph and the ledger alone; never throws. */
+/**
+ * #324: advisory levers for a brief, from the graph and the ledger alone. Never throws on a
+ * missing ledger or one the OS cannot read; a ledger that is not valid UTF-8 throws, as
+ * clock_out already does.
+ */
 export function hints(doc: PyDict, unit: PyDict, lines: LedgerLine[]): PyValue {
   return dict([
     ['repair', repairHint(doc, unit)],

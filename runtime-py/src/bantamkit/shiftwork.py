@@ -982,6 +982,15 @@ def _review_hint(document: dict, unit: dict, lines: list[dict]) -> dict | None:
         member = _find_unit(document, member_id)
         idx = [i for i, line in enumerate(lines) if line.get("unit") == member_id]
         changed = not any(i < last for i in idx) or any(i > last for i in idx)
+        if not changed:
+            # A writer that is not the member: any clock-out after R's newest line whose unit
+            # still exists and touches one of the member's paths (exact path equality).
+            paths = set(member.get("touches") or [])
+            for i in range(last + 1, len(lines)):
+                writer = _find_unit(document, lines[i].get("unit"))
+                if writer is not None and paths & set(writer.get("touches") or []):
+                    changed = True
+                    break
         members.append(
             {
                 "unit": member_id,
@@ -1004,7 +1013,11 @@ def _review_hint(document: dict, unit: dict, lines: list[dict]) -> dict | None:
 
 
 def _hints(document: dict, unit: dict, lines: list[dict]) -> dict[str, Any]:
-    """#324: advisory levers for a brief, from the graph and the ledger alone; never raises."""
+    """#324: advisory levers for a brief, from the graph and the ledger alone.
+
+    Never raises on a missing ledger or one the OS cannot read; a ledger that is not valid
+    UTF-8 raises, as clock_out already does.
+    """
     return {
         "repair": _repair_hint(document, unit),
         "review": _review_hint(document, unit, lines),

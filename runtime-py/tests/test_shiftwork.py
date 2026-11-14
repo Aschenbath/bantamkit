@@ -3080,6 +3080,36 @@ def test_324_resume_cap_and_reset(tmp_path):
     assert (review["resumes_so_far"], review["resume_allowed"]) == (1, True)
 
 
+def _h_other_writer_doc(path, writer_touches):
+    a = _h_unit("A", touches=["src/a.py"], status="done")
+    w = _h_unit("Ar1", touches=writer_touches, status="done", depends_on=["A"])
+    r = _h_unit("R", role="reviewer", depends_on=["A", "Ar1"], reviews=["A"])
+    _j65_write(path, [a, w, r], cursor="R")
+    return path
+
+
+def test_324_member_rewritten_by_a_non_member_writer_is_changed(tmp_path):
+    path = _h_other_writer_doc(tmp_path / "cp.json", ["src/a.py"])
+    _h_ledger(path, _h_line("A"), _h_line("R", agent_id="th1", path="fresh"), _h_line("Ar1"))
+    review = _h_brief(path)["hints"]["review"]
+    assert review["resume_allowed"] is True
+    assert review["members"][0] == {
+        "unit": "A", "changed": True, "revision": None, "fast_check": "check A",
+        "paths": ["src/a.py"],
+    }
+
+
+def test_324_non_intersecting_or_earlier_or_gone_writer_leaves_changed_false(tmp_path):
+    path = _h_other_writer_doc(tmp_path / "cp.json", ["src/other.py"])
+    _h_ledger(path, _h_line("A"), _h_line("R", agent_id="th1", path="fresh"), _h_line("Ar1"))
+    assert _h_brief(path)["hints"]["review"]["members"][0]["changed"] is False
+    path = _h_other_writer_doc(tmp_path / "cp2.json", ["src/a.py"])
+    _h_ledger(path, _h_line("A"), _h_line("Ar1"), _h_line("R", agent_id="th1", path="fresh"))
+    assert _h_brief(path)["hints"]["review"]["members"][0]["changed"] is False
+    _h_ledger(path, _h_line("A"), _h_line("R", agent_id="th1"), _h_line("Gone"))
+    assert _h_brief(path)["hints"]["review"]["members"][0]["changed"] is False
+
+
 def test_324_review_hint_no_agent_id(tmp_path):
     path = _h_review_doc(tmp_path / "cp.json")
     _h_done(path)

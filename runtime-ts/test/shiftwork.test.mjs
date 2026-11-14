@@ -2683,6 +2683,37 @@ test('#324: a member with no ledger line is changed', () => {
   rmSync(root, { recursive: true, force: true });
 });
 
+function hOtherWriterDoc(root, name, writerTouches) {
+  return hWrite(join(root, name), [
+    hUnit('A', 'implementer', { touches: ['src/a.py'], status: 'done' }),
+    hUnit('Ar1', 'implementer', { touches: writerTouches, status: 'done', depends_on: ['A'] }),
+    hUnit('R', 'reviewer', { depends_on: ['A', 'Ar1'], reviews: ['A'] }),
+  ], 'R');
+}
+
+test('#324: a member rewritten by a non-member writer after the reviewer line is changed', () => {
+  const root = fresh();
+  const path = hOtherWriterDoc(root, 'cp.json', ['src/a.py']);
+  hLedger(path, hLine('A'), hLine('R', { agent_id: 'th1', path: 'fresh' }), hLine('Ar1'));
+  const review = hBrief(path).hints.review;
+  assert.equal(review.resume_allowed, true);
+  assert.deepEqual(review.members[0], { unit: 'A', changed: true, revision: null, fast_check: 'check A', paths: ['src/a.py'] });
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('#324: a non-intersecting, earlier or vanished writer leaves changed false', () => {
+  const root = fresh();
+  let path = hOtherWriterDoc(root, 'cp.json', ['src/other.py']);
+  hLedger(path, hLine('A'), hLine('R', { agent_id: 'th1', path: 'fresh' }), hLine('Ar1'));
+  assert.equal(hBrief(path).hints.review.members[0].changed, false);
+  path = hOtherWriterDoc(root, 'cp2.json', ['src/a.py']);
+  hLedger(path, hLine('A'), hLine('Ar1'), hLine('R', { agent_id: 'th1', path: 'fresh' }));
+  assert.equal(hBrief(path).hints.review.members[0].changed, false);
+  hLedger(path, hLine('A'), hLine('R', { agent_id: 'th1' }), hLine('Gone'));
+  assert.equal(hBrief(path).hints.review.members[0].changed, false);
+  rmSync(root, { recursive: true, force: true });
+});
+
 test('#324: an unreadable ledger degrades to review null, and non-object lines are skipped', () => {
   const root = fresh();
   const path = hReviewDoc(root);
