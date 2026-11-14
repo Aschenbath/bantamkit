@@ -177,8 +177,8 @@ test('clock_in returns the brief, and `invariants` is SYNTHESIZED from job.const
   assert.deepEqual(answer.invariants, ['PURE NODE at runtime.', 'เป้าหมาย — no pipe/uv']);
   assert.deepEqual(answer.do_not, ['do not guess']);
   assert.deepEqual(answer.files, [{ path: 'probe.md', role: 'evidence' }]);
-  // #259 added `upstream` and `prior_attempts`, #261 `agreements`, all always present.
-  assert.deepEqual(Object.keys(answer), ['result', 'unit', 'role', 'invariants', 'handoff', 'do_not', 'files', 'upstream', 'prior_attempts', 'agreements']);
+  // #259 added `upstream` and `prior_attempts`, #261 `agreements`, #324 `hints`, all always present.
+  assert.deepEqual(Object.keys(answer), ['result', 'unit', 'role', 'invariants', 'handoff', 'do_not', 'files', 'upstream', 'prior_attempts', 'agreements', 'hints']);
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -1858,8 +1858,8 @@ test('D1: no unit_id is the cursor unit, and the codefix template answers what i
   assert.equal(answer.unit.id, doc.plan.cursor);
   assert.deepEqual(answer.unit, doc.plan.units[0]);
   assert.deepEqual(answer.invariants, doc.job.constraints);
-  // #259 added `upstream` and `prior_attempts`, #261 `agreements`, all always present.
-  assert.deepEqual(Object.keys(answer), ['result', 'unit', 'role', 'invariants', 'handoff', 'do_not', 'files', 'upstream', 'prior_attempts', 'agreements']);
+  // #259 added `upstream` and `prior_attempts`, #261 `agreements`, #324 `hints`, all always present.
+  assert.deepEqual(Object.keys(answer), ['result', 'unit', 'role', 'invariants', 'handoff', 'do_not', 'files', 'upstream', 'prior_attempts', 'agreements', 'hints']);
   assert.deepEqual(logLines(path).map((l) => [l.event, l.unit]), [['brief', doc.plan.cursor]]);
   // An omitted argument and an explicit null are ONE case — the MCP server hands over the
   // latter for a host that sends `"unit_id": null`.
@@ -2534,5 +2534,237 @@ test('#164: default clock_in refuses a done cursor unit and a cursor unit whose 
   const ghost = join(root, 'ghost.json');
   writeFileSync(ghost, JSON.stringify(j65Graph([['A', [], 'todo'], ['B', ['C'], 'todo'], ['C', ['B'], 'todo']], 'GHOST')), 'utf8');
   assert.deepEqual(js(clockIn(ghost, null, { now: 1 })), { result: 'escalate', reason: 'cursor GHOST names no unit' });
+  rmSync(root, { recursive: true, force: true });
+});
+
+// ================================================================ #324: clock_in hints
+
+const hUnit = (id, role = 'implementer', extra = {}) => ({
+  id, title: id, brief_path: 'b.md', status: 'todo', role, depends_on: [], verify: `check ${id}`, ...extra,
+});
+const hWrite = (path, units, cursor) => {
+  writeFileSync(path, JSON.stringify({
+    version: 1,
+    job: { id: 'j', goal: 'g', done_definition: 'd', constraints: [] },
+    plan: { cursor: cursor ?? units[0].id, units },
+    state: { repo: { branch: 'b', head_sha: 'h', dirty: false }, artifacts: [], external: [] },
+    history: [], retro: [],
+    handoff: { next_action: 'n', open_questions: [], do_not: [] },
+  }), 'utf8');
+  return path;
+};
+const hLedger = (path, ...lines) => writeFileSync(`${path}.log.jsonl`, lines.map((l) => `${JSON.stringify(l)}\n`).join(''), 'utf8');
+const hLine = (unit, extra = {}) => ({ unit, role: 'x', status: 'done', ts: 't', ...extra });
+function hReviewDoc(root, name = 'cp.json', members = ['A'], memberExtra = {}) {
+  const units = members.map((m) => hUnit(m, 'implementer', { touches: [`${m}.py`], ...memberExtra }));
+  units.push(hUnit('R', 'reviewer', { depends_on: members, reviews: members }));
+  return hWrite(join(root, name), units, 'R');
+}
+function hDone(path, members = ['A']) {
+  const doc = JSON.parse(readFileSync(path, 'utf8'));
+  for (const u of doc.plan.units) if (members.includes(u.id)) u.status = 'done';
+  writeFileSync(path, JSON.stringify(doc), 'utf8');
+}
+const hBrief = (path, unit = 'R') => {
+  const brief = js(clockIn(path, unit));
+  assert.equal(brief.result, 'brief', JSON.stringify(brief));
+  return brief;
+};
+function hRepairDoc(root, { touches = ['src/a.py', 'src/b.py'], status = 'blocked', role = 'implementer' } = {}) {
+  const a = hUnit('A2', role);
+  if (touches !== null) a.touches = touches;
+  const r = hUnit('R', 'reviewer', { depends_on: ['A2'], reviews: ['A2'], attempts: [{ status, outcome: 'rejected' }] });
+  return hWrite(join(root, 'cp.json'), [a, r], 'A2');
+}
+
+test('#324: hints are null/null without reviewers', () => {
+  const root = fresh();
+  const path = hWrite(join(root, 'cp.json'), [hUnit('A')]);
+  assert.deepEqual(js(clockIn(path)).hints, { repair: null, review: null });
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('#324: repair hint under a blocked reviewer, in Python key order', () => {
+  const root = fresh();
+  const repair = js(clockIn(hRepairDoc(root))).hints.repair;
+  assert.deepEqual(repair.owned, ['src/a.py', 'src/b.py']);
+  assert.equal(repair.fast_check, 'check A2');
+  assert.equal(repair.lever, 'patch');
+  assert.equal(repair.use_when, 'Every finding against this unit names one file, and that file is in owned.');
+  assert.equal(repair.call, 'One call with no tools. Send the unit\'s brief, the reviewer\'s findings verbatim, and the full current text of every owned path. It answers {"files": [{"path", "content"}]}.');
+  assert.equal(repair.skip_when, 'The repair would continue a session that already holds this work in its cache (the parent session authored it). There the fresh patch call cost more uncached input + output in #310.');
+  assert.deepEqual(Object.keys(repair), ['lever', 'owned', 'fast_check', 'use_when', 'call', 'write', 'fallback', 'skip_when', 'log']);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('#324: no repair hint without touches, after approval, or for a non-implementer', () => {
+  const root = fresh();
+  assert.equal(js(clockIn(hRepairDoc(root, { touches: null }))).hints.repair, null);
+  assert.equal(js(clockIn(hRepairDoc(root, { status: 'done' }))).hints.repair, null);
+  assert.equal(js(clockIn(hRepairDoc(root, { role: 'planner' }))).hints.repair, null);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('#324: review hint is null on a first review', () => {
+  const root = fresh();
+  const path = hReviewDoc(root);
+  hDone(path);
+  assert.equal(hBrief(path).hints.review, null);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('#324: review hint carries the thread and a per-member changed flag, in Python key order', () => {
+  const root = fresh();
+  const path = hReviewDoc(root, 'cp.json', ['A', 'C']);
+  hDone(path, ['A', 'C']);
+  hLedger(path, hLine('C'), hLine('A'), hLine('R', { agent_id: 't1' }), hLine('A'));
+  const review = hBrief(path).hints.review;
+  assert.equal(review.thread, 't1');
+  assert.equal(review.resumes_so_far, 0);
+  assert.equal(review.resume_allowed, true);
+  assert.deepEqual(review.members.map((m) => [m.unit, m.changed]), [['A', true], ['C', false]]);
+  assert.deepEqual(Object.keys(review), ['lever', 'thread', 'resumes_so_far', 'resume_allowed', 'members', 'turn', 'fresh_when', 'log']);
+  assert.deepEqual(review.members[1], { unit: 'C', changed: false, revision: null, fast_check: 'check C', paths: ['C.py'] });
+  assert.deepEqual(Object.keys(review.members[1]), ['unit', 'changed', 'revision', 'fast_check', 'paths']);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('#324: resume cap is 2 and a non-resume line resets the count', () => {
+  const root = fresh();
+  const path = hReviewDoc(root);
+  hDone(path);
+  hLedger(path, hLine('A'), hLine('R', { agent_id: 't1', path: 'resume' }), hLine('R', { agent_id: 't1', path: 'resume' }));
+  let review = hBrief(path).hints.review;
+  assert.deepEqual([review.resumes_so_far, review.resume_allowed], [2, false]);
+  hLedger(path, hLine('A'), hLine('R', { agent_id: 't1', path: 'resume' }), hLine('R', { agent_id: 't1', path: 'fresh' }), hLine('R', { agent_id: 't1', path: 'resume' }));
+  review = hBrief(path).hints.review;
+  assert.deepEqual([review.resumes_so_far, review.resume_allowed], [1, true]);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('#324: a reviewer line with accounting null still counts; no agent_id gives thread null', () => {
+  const root = fresh();
+  const path = hReviewDoc(root);
+  hDone(path);
+  hLedger(path, hLine('A'), hLine('R', { accounting: null }));
+  const review = hBrief(path).hints.review;
+  assert.notEqual(review, null);
+  assert.deepEqual([review.thread, review.resume_allowed], [null, false]);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('#324: thread is the line\'s agent_id verbatim, with no type check', () => {
+  const root = fresh();
+  const path = hReviewDoc(root);
+  hDone(path);
+  hLedger(path, hLine('A'), hLine('R', { agent_id: 7 }));
+  assert.equal(hBrief(path).hints.review.thread, 7);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('#324: an uncommitted event cancels the newest surviving reviewer line', () => {
+  const root = fresh();
+  const path = hReviewDoc(root);
+  hDone(path);
+  hLedger(path, hLine('A'), hLine('R', { agent_id: 't1' }), hLine('R', { agent_id: 't2' }),
+    { event: 'uncommitted', unit: 'R', role: 'reviewer', ts: 't' });
+  const review = hBrief(path).hints.review;
+  assert.equal(review.thread, 't1');
+  assert.equal(review.members[0].changed, false);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('#324: a member with no ledger line is changed', () => {
+  const root = fresh();
+  const path = hReviewDoc(root, 'cp.json', ['A', 'C']);
+  hDone(path, ['A', 'C']);
+  hLedger(path, hLine('A'), hLine('R', { agent_id: 't1' }));
+  assert.deepEqual(hBrief(path).hints.review.members.map((m) => m.changed), [false, true]);
+  rmSync(root, { recursive: true, force: true });
+});
+
+function hOtherWriterDoc(root, name, writerTouches) {
+  return hWrite(join(root, name), [
+    hUnit('A', 'implementer', { touches: ['src/a.py'], status: 'done' }),
+    hUnit('Ar1', 'implementer', { touches: writerTouches, status: 'done', depends_on: ['A'] }),
+    hUnit('R', 'reviewer', { depends_on: ['A', 'Ar1'], reviews: ['A'] }),
+  ], 'R');
+}
+
+test('#324: a member rewritten by a non-member writer after the reviewer line is changed', () => {
+  const root = fresh();
+  const path = hOtherWriterDoc(root, 'cp.json', ['src/a.py']);
+  hLedger(path, hLine('A'), hLine('R', { agent_id: 'th1', path: 'fresh' }), hLine('Ar1'));
+  const review = hBrief(path).hints.review;
+  assert.equal(review.resume_allowed, true);
+  assert.deepEqual(review.members[0], { unit: 'A', changed: true, revision: null, fast_check: 'check A', paths: ['src/a.py'] });
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('#324: a non-intersecting, earlier or vanished writer leaves changed false', () => {
+  const root = fresh();
+  let path = hOtherWriterDoc(root, 'cp.json', ['src/other.py']);
+  hLedger(path, hLine('A'), hLine('R', { agent_id: 'th1', path: 'fresh' }), hLine('Ar1'));
+  assert.equal(hBrief(path).hints.review.members[0].changed, false);
+  path = hOtherWriterDoc(root, 'cp2.json', ['src/a.py']);
+  hLedger(path, hLine('A'), hLine('Ar1'), hLine('R', { agent_id: 'th1', path: 'fresh' }));
+  assert.equal(hBrief(path).hints.review.members[0].changed, false);
+  hLedger(path, hLine('A'), hLine('R', { agent_id: 'th1' }), hLine('Gone'));
+  assert.equal(hBrief(path).hints.review.members[0].changed, false);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('#324: an unreadable ledger degrades to review null, and non-object lines are skipped', () => {
+  const root = fresh();
+  const path = hReviewDoc(root);
+  hDone(path);
+  mkdirSync(`${path}.log.jsonl`);
+  assert.equal(hBrief(path).hints.review, null);
+  rmSync(`${path}.log.jsonl`, { recursive: true });
+  writeFileSync(`${path}.log.jsonl`, `[1]\n3\nnull\n${JSON.stringify(hLine('A'))}\n${JSON.stringify(hLine('R', { agent_id: 't1' }))}\n`, 'utf8');
+  assert.equal(hBrief(path).hints.review.thread, 't1');
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('#324: revision is the newest commit ref of the member\'s last attempt', () => {
+  const root = fresh();
+  let path = hReviewDoc(root, 'cp.json', ['A'], {
+    attempts: [{ status: 'done', outcome: 'ok', produced: [{ kind: 'file', ref: 'x' }, { kind: 'commit', ref: 'abc' }] }],
+  });
+  hDone(path);
+  hLedger(path, hLine('A'), hLine('R', { agent_id: 't1' }));
+  assert.equal(hBrief(path).hints.review.members[0].revision, 'abc');
+  path = hReviewDoc(root, 'cp2.json');
+  hDone(path);
+  hLedger(path, hLine('A'), hLine('R', { agent_id: 't1' }));
+  assert.equal(hBrief(path).hints.review.members[0].revision, null);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('#324: hints sit after agreements in the brief', () => {
+  const root = fresh();
+  const keys = Object.keys(js(clockIn(hWrite(join(root, 'cp.json'), [hUnit('A')]))));
+  assert.deepEqual(keys.slice(-2), ['agreements', 'hints']);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('#324: accounting.path outside the enum is refused and nothing is written', () => {
+  const root = fresh();
+  const path = writeCheckpoint(root);
+  const before = bytes(path);
+  const r = attempt(path, { tokens: 1, duration_ms: 1, path: 'patched' });
+  assert.equal(r.result, 'error');
+  assert.ok(r.reason.startsWith(REFUSED), r.reason);
+  assert.deepEqual(bytes(path), before);
+  assert.deepEqual(logLines(path), []);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('#324: accounting.path is written verbatim', () => {
+  const root = fresh();
+  const path = writeCheckpoint(root);
+  const r = attempt(path, { tokens: 1, duration_ms: 1, path: 'patch' });
+  assert.equal(r.result, 'ok', JSON.stringify(r));
+  assert.equal(logLines(path).at(-1).path, 'patch');
   rmSync(root, { recursive: true, force: true });
 });

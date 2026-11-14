@@ -266,6 +266,47 @@ def _record_event(log_path: Path, event: str, unit_id: str, role: str) -> None:
     except OSError:
         return
 
+# #324: the fixed prose of the two clock_in hints. Byte-identical in runtime-ts (camelCase).
+RESUME_CAP = 2
+REPAIR_USE_WHEN = "Every finding against this unit names one file, and that file is in owned."
+REPAIR_CALL = (
+    "One call with no tools. Send the unit's brief, the reviewer's findings verbatim, and the "
+    "full current text of every owned path. It answers "
+    '{"files": [{"path", "content"}]}.'
+)
+REPAIR_WRITE = (
+    "Write only owned paths. A path that is a symlink, or that resolves outside the "
+    "workspace, makes the answer invalid. Then run fast_check."
+)
+REPAIR_FALLBACK = (
+    "If the answer is invalid or fast_check fails, run exactly one ordinary repair with "
+    "tools, then clock out with accounting.path = fallback."
+)
+REPAIR_SKIP_WHEN = (
+    "The repair would continue a session that already holds this work in its cache (the "
+    "parent session authored it). There the fresh patch call cost more uncached input + "
+    "output in #310."
+)
+REPAIR_LOG = (
+    "Clock out with accounting.path = patch when the patch answer was written and "
+    "fast_check passed."
+)
+REVIEW_TURN = (
+    "Resume thread with a delta turn only: a new reviewer context id, every member's "
+    "revision, fast check and changed flag, and the full current text of every path of a "
+    "changed member. changed is a superset: a member flagged changed may be identical, and "
+    "the host may compare content to send less. Acceptance still binds every member and "
+    "criterion to the current revision."
+)
+REVIEW_FRESH_WHEN = (
+    "resume_allowed is false, the thread cannot be resumed, or the resumed answer is "
+    "invalid: run one fresh full review and clock out with accounting.path = fresh."
+)
+REVIEW_LOG = (
+    "Clock out with accounting.path = resume when the resumed answer was used, and pass the "
+    "thread as clock_out's agent_id argument again."
+)
+
 
 def _briefed(log_path: Path, unit_id: str) -> bool:
     """F6: was a brief issued for `unit_id` since its last clock-out? Read off the ledger.
@@ -863,6 +904,126 @@ def _upstream(document: dict, dep: str) -> dict[str, Any]:
     }
 
 
+def _clock_out_lines(log_path: Path) -> list[dict]:
+    """#324: every clock-out line in file order — a line with no `event` key — minus any line
+    an `uncommitted` event cancels (`_briefed`'s rule, for every unit at once).
+
+    An `uncommitted` line cancels the newest surviving clock-out line of its own unit. A
+    missing or unreadable ledger is `[]`, a line that is not an object is skipped.
+    """
+    lines: list[dict] = []
+    for record in _ledger(log_path):
+        if not isinstance(record, dict):
+            continue
+        event = record.get("event")
+        if event is None:
+            lines.append(record)
+        elif event == UNCOMMITTED_EVENT:
+            for i in range(len(lines) - 1, -1, -1):
+                if lines[i].get("unit") == record.get("unit"):
+                    del lines[i]
+                    break
+    return lines
+
+
+def _repair_hint(document: dict, unit: dict) -> dict | None:
+    touches = unit.get("touches") or []
+    if unit["role"] != "implementer" or not touches:
+        return None
+    rejected = False
+    for other in document["plan"]["units"]:
+        if unit["id"] not in (other.get("reviews") or []):
+            continue
+        attempts = other.get("attempts") or []
+        if attempts and attempts[-1]["status"] not in ("done", "dropped"):
+            rejected = True
+            break
+    if not rejected:
+        return None
+    return {
+        "lever": "patch",
+        "owned": list(touches),
+        "fast_check": unit["verify"],
+        "use_when": REPAIR_USE_WHEN,
+        "call": REPAIR_CALL,
+        "write": REPAIR_WRITE,
+        "fallback": REPAIR_FALLBACK,
+        "skip_when": REPAIR_SKIP_WHEN,
+        "log": REPAIR_LOG,
+    }
+
+
+def _revision(member: dict) -> str | None:
+    attempts = member.get("attempts") or []
+    if not attempts:
+        return None
+    for item in reversed(attempts[-1].get("produced") or []):
+        if item.get("kind") == "commit":
+            return item["ref"]
+    return None
+
+
+def _review_hint(document: dict, unit: dict, lines: list[dict]) -> dict | None:
+    reviews = unit.get("reviews") or []
+    if not reviews:
+        return None
+    mine = [i for i, line in enumerate(lines) if line.get("unit") == unit["id"]]
+    if not mine:
+        return None
+    last = mine[-1]
+    thread = lines[last].get("agent_id")
+    resumes = 0
+    for i in reversed(mine):
+        if lines[i].get("path") != "resume":
+            break
+        resumes += 1
+    members = []
+    for member_id in reviews:
+        member = _find_unit(document, member_id)
+        idx = [i for i, line in enumerate(lines) if line.get("unit") == member_id]
+        changed = not any(i < last for i in idx) or any(i > last for i in idx)
+        if not changed:
+            # A writer that is not the member: any clock-out after R's newest line whose unit
+            # still exists and touches one of the member's paths (exact path equality).
+            paths = set(member.get("touches") or [])
+            for i in range(last + 1, len(lines)):
+                writer = _find_unit(document, lines[i].get("unit"))
+                if writer is not None and paths & set(writer.get("touches") or []):
+                    changed = True
+                    break
+        members.append(
+            {
+                "unit": member_id,
+                "changed": changed,
+                "revision": _revision(member),
+                "fast_check": member["verify"],
+                "paths": list(member.get("touches") or []),
+            }
+        )
+    return {
+        "lever": "resume",
+        "thread": thread,
+        "resumes_so_far": resumes,
+        "resume_allowed": thread is not None and resumes < RESUME_CAP,
+        "members": members,
+        "turn": REVIEW_TURN,
+        "fresh_when": REVIEW_FRESH_WHEN,
+        "log": REVIEW_LOG,
+    }
+
+
+def _hints(document: dict, unit: dict, lines: list[dict]) -> dict[str, Any]:
+    """#324: advisory levers for a brief, from the graph and the ledger alone.
+
+    Never raises on a missing ledger or one the OS cannot read; a ledger that is not valid
+    UTF-8 raises, as clock_out already does.
+    """
+    return {
+        "repair": _repair_hint(document, unit),
+        "review": _review_hint(document, unit, lines),
+    }
+
+
 def clock_in(checkpoint: str, unit_id: str | None = None) -> dict[str, Any]:
     """Validate the checkpoint and return a unit's brief, or a refusal.
 
@@ -955,6 +1116,7 @@ def clock_in(checkpoint: str, unit_id: str | None = None) -> dict[str, Any]:
         return _error(over)
     # F6: the brief is issued, so say so in the ledger — best effort, and only on this
     # branch: a refusal above issued nothing and therefore records nothing.
+    hints = _hints(document, unit, _clock_out_lines(_log_path(Path(checkpoint))))
     _freeze(Path(checkpoint), document)  # #265: before the brief line, so it is read first
     _record_brief(_log_path(Path(checkpoint)), selected, unit["role"])
     return {
@@ -970,6 +1132,8 @@ def clock_in(checkpoint: str, unit_id: str | None = None) -> dict[str, Any]:
         "prior_attempts": list(unit.get("attempts") or []),
         # #261: always present, `[]` when the job has adopted none.
         "agreements": list(document["job"].get("agreements") or []),
+        # #324: advisory hints, computed before the brief's own line is written.
+        "hints": hints,
     }
 
 
