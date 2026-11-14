@@ -3137,3 +3137,23 @@ def test_324_revision_from_commit_produced(tmp_path):
     _h_done(path)
     _h_ledger(path, _h_line("A"), _h_line("R", agent_id="t1"))
     assert _h_brief(path)["hints"]["review"]["members"][0]["revision"] is None
+
+
+# --- #324: accounting.path ------------------------------------------------
+
+
+def test_324_accounting_path_enum_refused(tmp_path, example):
+    path = write_checkpoint(tmp_path, example)
+    before = path.read_bytes()
+    r = _attempt(path, {"tokens": 1, "duration_ms": 1, "path": "patched"})
+    assert r["result"] == "error"
+    assert r["reason"].startswith(REFUSED)
+    assert path.read_bytes() == before
+    assert read_log(path) == []
+
+
+def test_324_accounting_path_written_verbatim(tmp_path, example):
+    path = write_checkpoint(tmp_path, example)
+    r = _attempt(path, {"tokens": 1, "duration_ms": 1, "path": "patch"})
+    assert r["result"] == "ok", r
+    assert read_log(path)[-1]["path"] == "patch"
