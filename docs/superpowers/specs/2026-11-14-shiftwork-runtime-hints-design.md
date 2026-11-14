@@ -1,6 +1,6 @@
 # Shiftwork carries the #310 repair and re-review hints (design, #324)
 
-Status: **draft**, 2026-11-14. Not frozen. Issue:
+Status: **frozen**, 2026-11-14 (owner approved). Issue:
 [#324](https://github.com/Ink01101011/bantamkit/issues/324), milestone 0.40.0.
 The owner made two picks on 2026-11-14:
 - Approach A: advisory hints, with no change to the checkpoint schema.
