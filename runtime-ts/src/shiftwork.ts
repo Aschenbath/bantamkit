@@ -915,6 +915,166 @@ function ledger(log: string): unknown[] {
   return lines;
 }
 
+// #324: the fixed prose of the two clock_in hints. Byte-identical in `shiftwork.py` (UPPER_SNAKE).
+export const RESUME_CAP = 2;
+const REPAIR_USE_WHEN = 'Every finding against this unit names one file, and that file is in owned.';
+const REPAIR_CALL =
+  "One call with no tools. Send the unit's brief, the reviewer's findings verbatim, and the " +
+  'full current text of every owned path. It answers ' +
+  '{"files": [{"path", "content"}]}.';
+const REPAIR_WRITE =
+  'Write only owned paths. A path that is a symlink, or that resolves outside the ' +
+  'workspace, makes the answer invalid. Then run fast_check.';
+const REPAIR_FALLBACK =
+  'If the answer is invalid or fast_check fails, run exactly one ordinary repair with ' +
+  'tools, then clock out with accounting.path = fallback.';
+const REPAIR_SKIP_WHEN =
+  'The repair would continue a session that already holds this work in its cache (the ' +
+  'parent session authored it). There the fresh patch call cost more uncached input + ' +
+  'output in #310.';
+const REPAIR_LOG =
+  'Clock out with accounting.path = patch when the patch answer was written and ' +
+  'fast_check passed.';
+const REVIEW_TURN =
+  "Resume thread with a delta turn only: a new reviewer context id, every member's " +
+  'revision, fast check and changed flag, and the full current text of every path of a ' +
+  'changed member. changed is a superset: a member flagged changed may be identical, and ' +
+  'the host may compare content to send less. Acceptance still binds every member and ' +
+  'criterion to the current revision.';
+const REVIEW_FRESH_WHEN =
+  'resume_allowed is false, the thread cannot be resumed, or the resumed answer is ' +
+  'invalid: run one fresh full review and clock out with accounting.path = fresh.';
+const REVIEW_LOG =
+  'Clock out with accounting.path = resume when the resumed answer was used, and pass the ' +
+  "thread as clock_out's agent_id argument again.";
+
+type LedgerLine = Record<string, unknown>;
+
+/**
+ * #324: every clock-out line in file order (a line with no `event` key), minus any line an
+ * `uncommitted` event cancels — `briefed`'s rule for every unit at once. An `uncommitted` line
+ * cancels the newest surviving clock-out line of its own unit. A missing ledger is `[]`, and a
+ * line that is not an object is skipped. As `_clock_out_lines` in `shiftwork.py`.
+ */
+export function clockOutLines(log: string): LedgerLine[] {
+  const lines: LedgerLine[] = [];
+  for (const record of ledger(log)) {
+    if (record === null || typeof record !== 'object' || Array.isArray(record)) continue;
+    const rec = record as LedgerLine;
+    const event = rec.event;
+    if (event === undefined || event === null) {
+      // Python `record.get("event")` is None for a missing key AND for an explicit null.
+      lines.push(rec);
+    } else if (event === UNCOMMITTED_EVENT) {
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if ((lines[i]!.unit ?? null) === (rec.unit ?? null)) {
+          lines.splice(i, 1);
+          break;
+        }
+      }
+    }
+  }
+  return lines;
+}
+
+const NULL: PyValue = { t: 'null' };
+
+function repairHint(doc: PyDict, unit: PyDict): PyValue {
+  const touches = unit.v.get('touches');
+  const owned = touches !== undefined && touches.t === 'list' ? touches.v : [];
+  if (text(field(unit, 'role')) !== 'implementer' || owned.length === 0) return NULL;
+  const id = text(field(unit, 'id'));
+  let rejected = false;
+  for (const other of subList(subDict(doc, 'plan'), 'units').v) {
+    const reviews = (other as PyDict).v.get('reviews');
+    if (reviews === undefined || reviews.t !== 'list' || !reviews.v.some((r) => r.t === 'str' && r.v === id)) continue;
+    const attempts = attemptsOf(other as PyDict);
+    if (attempts.length > 0) {
+      const status = text(field(attempts[attempts.length - 1] as PyDict, 'status'));
+      if (status !== 'done' && status !== 'dropped') {
+        rejected = true;
+        break;
+      }
+    }
+  }
+  if (!rejected) return NULL;
+  return dict([
+    ['lever', str('patch')],
+    ['owned', { t: 'list', v: [...owned] }],
+    ['fast_check', field(unit, 'verify')],
+    ['use_when', str(REPAIR_USE_WHEN)],
+    ['call', str(REPAIR_CALL)],
+    ['write', str(REPAIR_WRITE)],
+    ['fallback', str(REPAIR_FALLBACK)],
+    ['skip_when', str(REPAIR_SKIP_WHEN)],
+    ['log', str(REPAIR_LOG)],
+  ]);
+}
+
+/** The newest `commit` ref in a member's last attempt's `produced`, or null. */
+function revisionOf(member: PyDict): PyValue {
+  const attempts = attemptsOf(member);
+  if (attempts.length === 0) return NULL;
+  const produced = (attempts[attempts.length - 1] as PyDict).v.get('produced');
+  const items = produced !== undefined && produced.t === 'list' ? produced.v : [];
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i]!;
+    if (item.t === 'dict') {
+      const kind = item.v.get('kind');
+      if (kind !== undefined && kind.t === 'str' && kind.v === 'commit') return field(item, 'ref');
+    }
+  }
+  return NULL;
+}
+
+function reviewHint(doc: PyDict, unit: PyDict, lines: LedgerLine[]): PyValue {
+  const rv = unit.v.get('reviews');
+  const reviews = rv !== undefined && rv.t === 'list' ? rv.v.map(text) : [];
+  if (reviews.length === 0) return NULL;
+  const at = (id: string): number[] => lines.flatMap((l, i) => ((l.unit ?? null) === id ? [i] : []));
+  const mine = at(text(field(unit, 'id')));
+  if (mine.length === 0) return NULL;
+  const last = mine[mine.length - 1]!;
+  const agent = lines[last]!.agent_id;
+  const thread: PyValue = agent === undefined || agent === null ? NULL : fromJs(agent);
+  let resumes = 0;
+  for (let k = mine.length - 1; k >= 0; k--) {
+    if (lines[mine[k]!]!.path !== 'resume') break;
+    resumes++;
+  }
+  const members: PyValue[] = reviews.map((memberId) => {
+    const member = findUnit(doc, memberId)!;
+    const idx = at(memberId);
+    const changed = !idx.some((i) => i < last) || idx.some((i) => i > last);
+    const touches = member.v.get('touches');
+    return dict([
+      ['unit', str(memberId)],
+      ['changed', { t: 'bool', v: changed }],
+      ['revision', revisionOf(member)],
+      ['fast_check', field(member, 'verify')],
+      ['paths', { t: 'list', v: touches !== undefined && touches.t === 'list' ? [...touches.v] : [] }],
+    ]);
+  });
+  return dict([
+    ['lever', str('resume')],
+    ['thread', thread],
+    ['resumes_so_far', int(resumes)],
+    ['resume_allowed', { t: 'bool', v: thread.t !== 'null' && resumes < RESUME_CAP }],
+    ['members', { t: 'list', v: members }],
+    ['turn', str(REVIEW_TURN)],
+    ['fresh_when', str(REVIEW_FRESH_WHEN)],
+    ['log', str(REVIEW_LOG)],
+  ]);
+}
+
+/** #324: advisory levers for a brief, from the graph and the ledger alone; never throws. */
+export function hints(doc: PyDict, unit: PyDict, lines: LedgerLine[]): PyValue {
+  return dict([
+    ['repair', repairHint(doc, unit)],
+    ['review', reviewHint(doc, unit, lines)],
+  ]);
+}
+
 /**
  * #262: Layer 1's budget view of this checkpoint, or null when `job.budget` is absent. In flight
  * is the set `briefed` measures, each reserving one unit and one per-unit token estimate;
@@ -1064,6 +1224,8 @@ export function clockIn(checkpoint: string, unitId: string | null = null, option
   // normalisation `clockOut` applies before it builds ITS log path, so the two land in one file.
   // The line names the unit ACTUALLY briefed, which is what D2 reads back.
   // #265: before the brief line, so it is read first.
+  // #324: computed before the brief's own line is written, as Python does.
+  const briefHints = hints(doc, unit, clockOutLines(logPath(pyJoin(checkpoint))));
   freeze(logPath(pyJoin(checkpoint)), doc, options.now ?? Date.now() / 1000);
   recordBrief(logPath(pyJoin(checkpoint)), selected, field(unit, 'role'), options.now ?? Date.now() / 1000);
   return dict([
@@ -1079,6 +1241,8 @@ export function clockIn(checkpoint: string, unitId: string | null = null, option
     ['prior_attempts', { t: 'list', v: [...attemptsOf(unit)] }],
     // #261: always present, `[]` when the job has adopted none.
     ['agreements', { t: 'list', v: [...strings(subDict(doc, 'job').v.get('agreements'))].map(str) }],
+    // #324: advisory hints, computed before the brief's own line is written.
+    ['hints', briefHints],
   ]);
 }
 
