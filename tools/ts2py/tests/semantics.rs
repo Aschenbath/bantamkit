@@ -36,7 +36,7 @@ export function probe(input: any): unknown[] {
     [...m].map((e) => e[1]).join(','),
     [...s].join(','),
     rows.map((r) => r.v).join(''),
-    `${input.f}|${input.n}|${input.flag}|${input.nil}|${0.1}|${input.big}|${input.tiny}`,
+    `${input.f}|${input.n}|${input.flag}|${input.nil}|${0.1}|${input.bigN}|${input.tiny}`,
     JSON.stringify(input.obj),
     !input.emptyList,
     input.zero || 'fallback',
@@ -58,7 +58,7 @@ fn js_semantics_hold_under_python() {
 import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("p", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-data = {"flag": True, "n": 3.0, "f": 3.0, "nil": None, "big": 1e21, "tiny": 1e-7,
+data = {"flag": True, "n": 3.0, "f": 3.0, "nil": None, "bigN": 1e21, "tiny": 1e-7,
         "obj": {"b": [1, 2.5, "é"], "1": None, "a": {"x": 3.0}}, "emptyList": [], "zero": 0}
 print(json.dumps(m.probe(data), ensure_ascii=False, separators=(",", ":")))
 "#;
@@ -138,11 +138,11 @@ export function numbers(input: any): string {
     -input.hi,
     input.lo + 1,
     input.lo + 1 === input.lo,
-    input.big,
-    `${input.big}|${input.hi}|${input.small - 1}|${-input.small}`,
-    [input.small, input.small - 1, -input.small, input.small + 2, input.small + 0.5],
+    input.bigN,
+    `${input.bigN}|${input.hi}|${input.smallN - 1}|${-input.smallN}`,
+    [input.smallN, input.smallN - 1, -input.smallN, input.smallN + 2, input.smallN + 0.5],
     input.huge,
-    input.huge > input.big,
+    input.huge > input.bigN,
   ]);
 }
 "#;
@@ -159,7 +159,7 @@ fn numbers_beyond_2_pow_53_behave_as_js_doubles() {
 import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("n", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-data = json.loads('{"lo": 9007199254740992, "hi": 9007199254740993, "big": 12345678901234567890, "small": 3, "huge": 1' + '0' * 400 + '}')
+data = json.loads('{"lo": 9007199254740992, "hi": 9007199254740993, "bigN": 12345678901234567890, "smallN": 3, "huge": 1' + '0' * 400 + '}')
 print(m.numbers(data))
 "#;
     let python = std::env::var("TS2PY_PYTHON").unwrap_or_else(|_| "python3".to_string());
@@ -449,5 +449,161 @@ print("\n".join(bad[:20]))
     assert!(
         stdout.starts_with("0\n"),
         "accepted patterns that re cannot compile:\n{stdout}"
+    );
+}
+
+/// J86-5: the runtime's fast paths. Each one answers for exactly the operand types it tests for at
+/// run time (`type(x) is int` inside +-2^53, `type(x) is str`, a list) and hands every other pair
+/// to the general path, so the answers must not move at the edges: an int one past 2^53 (`hi`,
+/// which JS reads as 2^53), sums past 2^53, a bool against 1, a float 1.0 position, NaN, an astral
+/// string indexed and measured by code unit, SameValueZero over a mixed array, `fromCodePoint` at
+/// and past U+10FFFF, and the code-unit memo past both of its bounds (600 distinct strings, one of
+/// 70,001 characters). The JSON line is what Node prints for the same source on the same input;
+/// the second line is Node's `RangeError: Invalid code point 1114112` under the runtime's class.
+const FAST_PATHS: &str = r#"
+export function fast(input: any): string {
+  const xs: any[] = [];
+  const pushed = xs.push(input.smallN, input.lo);
+  let total = 0;
+  let k = 0;
+  while (k < 600) {
+    total = total + (input.e + k + input.grin).length;
+    k = k + 1;
+  }
+  const long = input.e.repeat(70000) + input.grin;
+  return JSON.stringify([
+    input.lo === input.hi, input.lo === input.lo, input.smallN === input.smallN, input.smallN === input.three,
+    input.t === input.one, input.one === input.onef, input.onestr === input.one, input.s === input.s2,
+    input.nan === input.nan, input.neg === input.neg,
+    input.lo + input.one, input.hi + input.hi, input.smallN + input.smallN, input.lo + input.lo,
+    input.neg + input.smallN, input.smallN + input.onef, (input.lo + input.one) - input.lo, (input.hi + input.smallN) - input.hi, (input.hi + input.one) - input.lo,
+    input.hi > input.lo, input.hi >= input.lo, input.hi < input.lo, input.hi <= input.lo,
+    input.neg < input.smallN, input.smallN > input.neg, input.smallN <= input.smallN, input.smallN >= input.three,
+    input.t >= input.one, input.nan < input.one, input.nan >= input.one, input.bigN > input.lo,
+    input.astral[1], input.astral[2], input.astral[0], input.thai[2], input.s[99] === undefined,
+    input.list[1], input.list[5] === undefined, input.list[input.neg] === undefined, input.thai[input.neg] === undefined,
+    input.astral.length, input.thai.length, input.s.length,
+    input.mixed.includes(input.onestr), input.mixed.includes(input.one), input.mixed.includes(input.t),
+    input.nums.includes(input.onestr), input.mixed.includes(input.nan), input.strs.includes(input.thai),
+    input.grin.codePointAt(input.zero), input.grin.codePointAt(input.one), input.grin.codePointAt(input.hi),
+    input.grin.codePointAt(input.neg) === undefined, input.grin.codePointAt(input.onef),
+    String.fromCodePoint(input.cp), String.fromCodePoint(input.maxcp).length, String.fromCodePoint(input.zero).length,
+    pushed, xs.length, total, long.length, long[70000] === input.grin[0], long.length,
+  ]);
+}
+
+export function over(input: any): string {
+  return String.fromCodePoint(input.over);
+}
+"#;
+
+#[test]
+fn fast_paths_answer_exactly_as_the_general_paths_and_js_do() {
+    let module = ts2py::compile(FAST_PATHS, "fast.ts", &ts2py::Options::default())
+        .unwrap_or_else(|lines| panic!("fast-path probe refused:\n{}", lines.join("\n")));
+    for helper in [
+        "_js_strict_eq(",
+        "_js_add(",
+        "_js_lt(",
+        "_js_gt(",
+        "_js_le(",
+        "_js_ge(",
+        "_js_get(_js_get(input, \"astral\"), 1)",
+        "_js_len(",
+        "_js_m_includes(",
+        "_js_m_codePointAt(",
+        "_js_from_code_point(",
+    ] {
+        assert!(
+            module.contains(helper),
+            "the probe no longer reaches {helper}"
+        );
+    }
+    let dir = std::env::temp_dir().join(format!("ts2py-fast-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("fast.py");
+    std::fs::write(&path, module).unwrap();
+    let driver = r#"
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("f", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+data = json.loads('{"lo": 9007199254740992, "hi": 9007199254740993, "bigN": 12345678901234567890, "smallN": 3, "three": 3, "neg": -1, "zero": 0, "one": 1, "onestr": "1", "t": true, "s": "abc", "s2": "abc", "astral": "a\\ud835\\udd18b", "thai": "\\u0e17\\u0e14\\u0e2a\\u0e2d\\u0e1a", "grin": "\\ud83d\\ude00", "e": "\\u00e9", "list": [10, 20, 30], "mixed": [true, 1, "1", null], "nums": [1, 2], "strs": ["x", "\\u0e17\\u0e14\\u0e2a\\u0e2d\\u0e1a"], "cp": 128512, "maxcp": 1114111, "over": 1114112}')
+data["nan"] = float("nan")
+data["onef"] = 1.0
+sys.stdout.reconfigure(encoding="utf-8")
+print(m.fast(data))
+try:
+    m.over(data)
+except Exception as e:
+    print(f"{type(e).__name__}: {e}")
+"#;
+    let python = std::env::var("TS2PY_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let run = Command::new(&python)
+        .arg("-c")
+        .arg(driver)
+        .arg(&path)
+        .output()
+        .unwrap_or_else(|err| panic!("{}", python_missing(&python, &err)));
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let expected = concat!(
+        r#"[true,true,true,true,false,true,false,true,false,true,9007199254740992,18014398509481984,"#,
+        r#"6,18014398509481984,2,4,0,4,0,false,true,false,true,true,true,true,true,true,false,false,"#,
+        r#"true,"\ud835","\udd18","a","ส",true,20,true,true,true,4,5,3,true,true,true,false,false,"#,
+        r#"true,128512,56832,null,true,56832,"😀",2,1,2,2,3490,70002,true,70002]"#,
+        "\n_JsRangeError: Invalid code point 1114112",
+    );
+    assert_eq!(String::from_utf8(run.stdout).unwrap().trim_end(), expected);
+}
+
+/// J86-R finding 3, the run-time half: a COMPUTED key the compiler cannot see that names a method
+/// of the receiver's JS type (`xs[k]`, `k === 'push'`) is a function in Node; the generated code
+/// raises instead of answering `undefined`. Data keys, and method names on a plain object (which
+/// has no such method), still read as Node reads them.
+#[test]
+fn a_computed_key_naming_a_method_raises() {
+    let source = "export class A {\n  m(): number {\n    return 1;\n  }\n}\nexport function read(o: any, k: string): unknown {\n  return o[k];\n}\nexport function make(): A {\n  return new A();\n}\n";
+    let module = ts2py::compile(source, "read.ts", &ts2py::Options::default())
+        .unwrap_or_else(|lines| panic!("refused:\n{}", lines.join("\n")));
+    let dir = std::env::temp_dir().join(format!("ts2py-meth-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("read.py");
+    std::fs::write(&path, module).unwrap();
+    let driver = r#"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("r", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+rt = vars(m)
+out = []
+for obj, key in [([1], "push"), ("s", "slice"), (rt["_JsMap"](), "get"), (rt["_JsSet"](), "add"),
+                 (1.5, "toFixed"), (m.make(), "m"), ([1], "0"), ("s", "0"), ({"push": 2}, "push"),
+                 ({}, "slice"), (True, "toFixed")]:
+    try:
+        got = m.read(obj, key)
+        out.append(repr(got if got is not rt["_JS_UNDEFINED"] else "undefined"))
+    except TypeError as e:
+        out.append("raise")
+print(",".join(out))
+"#;
+    let python = std::env::var("TS2PY_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let run = Command::new(&python)
+        .arg("-c")
+        .arg(driver)
+        .arg(&path)
+        .output()
+        .unwrap_or_else(|err| panic!("{}", python_missing(&python, &err)));
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).trim(),
+        "raise,raise,raise,raise,raise,raise,1,'s',2,'undefined','undefined'"
     );
 }
