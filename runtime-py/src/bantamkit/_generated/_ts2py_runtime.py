@@ -2,6 +2,7 @@
 # Pure standard library. Every name starts with `_js_`, `_Js` or `_JS_`, and ts2py refuses a
 # TypeScript identifier with one of those prefixes, so nothing here can be shadowed by source.
 import functools as _js_functools
+import json as _js_jsonlib
 import math as _js_math
 import re as _js_re
 
@@ -457,6 +458,141 @@ def _js_len(value):
     if isinstance(value, list):
         return len(value)
     return _js_get(value, "length")
+
+
+# J87 (#316): helpers for a receiver the compiler PROVED to be a `str` or a `list` (SUBSET.md,
+# Types). Each returns exactly what the general helper named in its docstring returns for that
+# receiver; it only skips the type dispatch the proof made redundant, and takes the general path for
+# any argument its own fast case does not cover.
+
+
+def _js_is_double(value):
+    """The guard of a parameter annotated `number`: an int a double holds exactly, or a float."""
+    kind = type(value)
+    return kind is float or (kind is int and _JS_SAFE_MIN <= value <= _JS_SAFE_MAX)
+
+
+def _js_str_len(text):
+    """`_js_len(text)` for a `str`: UTF-16 code units."""
+    return len(text) if text.isascii() else len(_js_code_units(text))
+
+
+def _js_str_at(text, key):
+    """`_js_get(text, key)` for a `str`: the UTF-16 code unit at a plain int index."""
+    if type(key) is int:
+        units = text if text.isascii() else _js_code_units(text)
+        return units[key] if 0 <= key < len(units) else _JS_UNDEFINED
+    return _js_get(text, key)
+
+
+def _js_units_at(units, text, key):
+    """`_js_str_at(text, key)` given `units`, the hoisted `_js_code_units(text)`."""
+    if type(key) is int:
+        return units[key] if 0 <= key < len(units) else _JS_UNDEFINED
+    return _js_get(text, key)
+
+
+def _js_units_index_of(units, search, position=0):
+    """`_js_m_indexOf(text, search, position)` given `units`, the hoisted `_js_code_units(text)`,
+    and an ASCII `search` (its own code units)."""
+    if type(position) is int:
+        return units.find(search, min(max(position, 0), len(units)))
+    return units.find(search, int(min(max(_js_to_integer(position), 0), len(units))))
+
+
+def _js_units_slice(units, start=_JS_UNDEFINED, end=_JS_UNDEFINED):
+    """`_js_m_slice(text, start, end)` given `units`, the hoisted `_js_code_units(text)`."""
+    length = len(units)
+    if type(start) is int and (end is _JS_UNDEFINED or type(end) is int):
+        lo = max(length + start, 0) if start < 0 else min(start, length)
+        if end is _JS_UNDEFINED:
+            hi = length
+        else:
+            hi = max(length + end, 0) if end < 0 else min(end, length)
+    else:
+        lo = _js_slice_bound(start, length, 0)
+        hi = _js_slice_bound(end, length, length)
+    return _js_from_units(units[lo:hi])
+
+
+def _js_list_join(items, separator):
+    """`_js_m_join(items, separator)` for a `list` and a `str` separator: when every element is a
+    `str` (the only elements `str.join` accepts), joining them is the same join."""
+    try:
+        joined = separator.join(items)
+    except TypeError:
+        return _js_m_join(items, separator)
+    return _js_from_units(joined)
+
+
+def _js_re_exec(pattern, text):
+    """`_js_m_exec(pattern, text)` for a regex literal and a `str`; an ASCII subject is its own code
+    units and every group of it is its own canonical spelling."""
+    if not text.isascii():
+        return _js_m_exec(pattern, text)
+    match = pattern.search(text)
+    if match is None:
+        return None
+    out = _JsMatchArray(
+        _JS_UNDEFINED if group is None else group for group in [match.group(0), *match.groups()]
+    )
+    out.index = match.start()
+    out.input = text
+    return out
+
+
+def _js_re_replace(text, pattern, replacement):
+    """`_js_m_replace(text, pattern, replacement)` for a `str`, a regex literal (no `g`) and a
+    literal replacement holding neither `$` nor a backslash, which `re.sub` inserts as it is."""
+    units = text if text.isascii() else _js_code_units(text)
+    return _js_from_units(pattern.sub(replacement, units, count=1))
+
+
+def _js_list_at(items, key):
+    """`_js_get(items, key)` for a `list`: the element at a plain int index."""
+    if type(key) is int:
+        return items[key] if 0 <= key < len(items) else _JS_UNDEFINED
+    return _js_get(items, key)
+
+
+def _js_str_includes(text, search):
+    """`_js_m_includes(text, search)` for two `str`s: by UTF-16 code unit."""
+    if text.isascii() and search.isascii():
+        return search in text
+    return _js_code_units(search) in _js_code_units(text)
+
+
+def _js_str_starts_with(text, prefix):
+    """`_js_m_startsWith(text, prefix)` for two `str`s."""
+    if text.isascii() and prefix.isascii():
+        return text.startswith(prefix)
+    return _js_code_units(text).startswith(_js_code_units(prefix))
+
+
+def _js_str_index_of(text, search, position=0):
+    """`_js_m_indexOf(text, search, position)` for two `str`s (a missing position is 0, which is
+    what ToIntegerOrInfinity makes of `undefined`)."""
+    if type(position) is int and text.isascii() and search.isascii():
+        return text.find(search, min(max(position, 0), len(text)))
+    return _js_m_indexOf(text, search, position)
+
+
+def _js_str_slice(text, start=_JS_UNDEFINED, end=_JS_UNDEFINED):
+    """`_js_m_slice(text, start, end)` for a `str`; an ASCII string cut at plain int bounds is its
+    own code units, so the cut is Python's."""
+    if (
+        text.isascii()
+        and type(start) is int
+        and (end is _JS_UNDEFINED or type(end) is int)
+    ):
+        length = len(text)
+        lo = max(length + start, 0) if start < 0 else min(start, length)
+        if end is _JS_UNDEFINED:
+            hi = length
+        else:
+            hi = max(length + end, 0) if end < 0 else min(end, length)
+        return text[lo:hi]
+    return _js_m_slice(text, start, end)
 
 
 def _js_size(value):
@@ -1706,6 +1842,54 @@ def _js_object_entries(value):
     return [[key, _js_get(value, key)] for key in _js_own_property_names(value)]
 
 
+def _js_is_primitive_key(key):
+    """A property key ToPropertyKey spells as `String(key)`: a primitive, never an object."""
+    return isinstance(key, (bool, int, float, _JsBigInt)) or key is None or key is _JS_UNDEFINED
+
+
+def _js_object_has_own(obj, key):
+    """`Object.hasOwn(obj, key)`: an OWN property only, never what `Object.prototype` gives; so a
+    plain object answers for its own keys, `__proto__` included, an array or a string for an index
+    in range and `length`, and a number, boolean or BigInt has none (J87-3F)."""
+    if obj is None or obj is _JS_UNDEFINED:
+        raise _JsTypeError("Cannot convert undefined or null to object")
+    if not isinstance(key, str):
+        if not _js_is_primitive_key(key):
+            raise TypeError("ts2py: Object.hasOwn of a non-primitive key is outside the subset")
+        key = _js_str(key)
+    if isinstance(obj, dict):
+        return key in obj
+    if isinstance(obj, (list, str)) and not isinstance(obj, _JsMatchArray):
+        # A match array also owns `index` and `input`; it is refused below rather than modelled.
+        if key == "length":
+            return True
+        index = _js_index_key(key)
+        return index is not None and index < _js_len(obj)
+    if isinstance(obj, (bool, int, float, _JsBigInt)):
+        return False
+    raise TypeError(f"ts2py: Object.hasOwn on {type(obj).__name__} is outside the subset")
+
+
+def _js_object_from_entries(entries):
+    """`Object.fromEntries(entries)` over an array of `[key, value]` arrays: each key an OWN data
+    property (CreateDataProperty, so `__proto__` is a key, not the prototype), a repeated key
+    keeping its first position and its last value, a missing value `undefined` (J87-3F). Any
+    other iterable or entry, whose JS answer the subset does not model, raises."""
+    if not isinstance(entries, list):
+        raise TypeError("ts2py: Object.fromEntries of anything but an array is outside the subset")
+    out = {}
+    for entry in entries:
+        if not isinstance(entry, list):
+            raise TypeError("ts2py: an Object.fromEntries entry not an array is outside the subset")
+        key = _js_get(entry, 0)
+        if not isinstance(key, str):
+            if not _js_is_primitive_key(key):
+                raise TypeError("ts2py: Object.fromEntries of an object key is outside the subset")
+            key = _js_str(key)
+        out[key] = _js_get(entry, 1)
+    return out
+
+
 def _js_spread(value):
     """`{...value}`: the own enumerable properties; `null`, `undefined` and primitives give none."""
     if value is None or value is _JS_UNDEFINED or isinstance(value, (bool, int, float, _JsBigInt)):
@@ -1752,3 +1936,175 @@ def _js_destructure(value, count):
     else:
         raise _JsTypeError("object is not iterable")
     return list(items) + [_JS_UNDEFINED] * (count - len(items))
+
+
+# ------------------------------------------------------------ J87-3 (#316 G1): pricing, jobbudget
+
+
+def _js_number_is_finite(value):
+    """`Number.isFinite`: a number that is neither NaN nor +-Infinity; no coercion, so a string or
+    a boolean is not finite. An int past the double range is Infinity in JS, so not finite."""
+    if not _js_is_number(value):
+        return False
+    value = _js_num(value)
+    return type(value) is int or _js_math.isfinite(value)
+
+
+def _js_trunc(value):
+    """`Math.trunc`: ToNumber, then toward zero; NaN, the infinities and the sign of a zero kept, so
+    `Math.trunc(-0.5)` is -0."""
+    value = _js_math_arg(value)
+    if type(value) is int or value != value or value in (_js_math.inf, -_js_math.inf):
+        return value
+    whole = float(_js_math.trunc(value))
+    if whole == 0:
+        return _js_math.copysign(0.0, value)
+    return _js_double_out(whole)
+
+
+def _js_m_splice(receiver, start, *rest):
+    """`a.splice(start, deleteCount?, ...items)`: in place; returns the removed elements. `start`
+    and `deleteCount` are ToIntegerOrInfinity, clamped as JS clamps them."""
+    items = _js_array("splice", receiver)
+    length = len(items)
+    begin = _js_to_integer(start)
+    if begin == -_js_math.inf:
+        begin = 0
+    elif begin < 0:
+        begin = max(length + begin, 0)
+    else:
+        begin = min(begin, length)
+    if not rest:
+        count = length - begin
+    else:
+        count = _js_to_integer(rest[0])
+        count = 0 if count == -_js_math.inf else count
+        count = int(min(max(count, 0), length - begin))
+    removed = items[begin : begin + count]
+    items[begin : begin + count] = list(rest[1:])
+    return removed
+
+
+def _js_m_reduce(receiver, callback, *initial):
+    """`a.reduce(cb, initial?)`: left to right over the length read once at the start (an index the
+    callback made disappear is skipped, as a hole is); with no initial value and no element, JS's
+    TypeError."""
+    items = _js_array("reduce", receiver)
+    length = len(items)
+    index = 0
+    if initial:
+        accumulator = initial[0]
+    else:
+        if length == 0:
+            raise _JsTypeError("Reduce of empty array with no initial value")
+        accumulator = items[0]
+        index = 1
+    while index < length:
+        if index < len(items):
+            accumulator = callback(accumulator, items[index], index, items)
+        index += 1
+    return accumulator
+
+
+def _js_opt_get(obj, key):
+    """`obj?.[key]` / `obj?.key`: `undefined` when `obj` is null or undefined, else the read."""
+    if obj is None or obj is _JS_UNDEFINED:
+        return _JS_UNDEFINED
+    return _js_get(obj, key)
+
+
+def _js_json_number(text):
+    """A JSON number token as the JS number `JSON.parse` reads it: the nearest double (so a long
+    integer rounds and one past the range is Infinity), spelled as an int when integral within
+    2^53 and not -0."""
+    return _js_double_out(float(text))
+
+
+class _JsJsonParseError(_JsSyntaxError):
+    """The SyntaxError `JSON.parse` throws. Its JS `message` is V8's wording, which CPython's
+    decoder does not reproduce, so generated code reading it raises instead of answering a different
+    sentence; a Python caller sees CPython's own decoder message as the exception's text."""
+
+    def __init__(self, python_message):
+        Exception.__init__(self, python_message)
+        object.__setattr__(self, "_js_python_message", python_message)
+
+    @property
+    def message(self):
+        raise TypeError("ts2py: the message of a JSON.parse SyntaxError is outside the subset")
+
+    def __str__(self):
+        return self._js_python_message
+
+
+def _js_json_reject_constant(name):
+    # CPython's decoder accepts the bare tokens NaN, Infinity and -Infinity; JSON.parse does not.
+    raise ValueError(name)
+
+
+def _js_json_parse(text):
+    """`JSON.parse(text)`: the JSON grammar exactly (CPython's decoder, strict, with the three
+    non-standard constants refused), numbers as JS numbers (`_js_json_number`), objects as dicts in
+    source order with a repeated key keeping its first position and its last value, as JS's
+    CreateDataProperty does, and `__proto__` an ordinary own key. A malformed text is a SyntaxError
+    (`_JsJsonParseError`). Nesting deeper than CPython's recursion limit is outside the subset."""
+    if not isinstance(text, str):
+        raise TypeError("ts2py: JSON.parse of anything but a string is outside the subset")
+    try:
+        return _js_jsonlib.loads(
+            text,
+            parse_int=_js_json_number,
+            parse_float=_js_json_number,
+            parse_constant=_js_json_reject_constant,
+        )
+    except RecursionError:
+        raise TypeError(
+            "ts2py: JSON.parse nested deeper than the recursion limit is outside the subset"
+        ) from None
+    except ValueError as error:
+        raise _JsJsonParseError(str(error)) from None
+
+
+def _js_catch(error):
+    """`catch`: `error` when a JS `catch` would see it, else re-raised. A JS throw is a `_JsError`,
+    an `OSError` an adapter raised where Node throws an fs Error, or the one plain `TypeError` the
+    runtime raises with JS's own sentence (`Cannot read properties of null ...`). A subset refusal
+    (`ts2py: ...`), a recursion or memory limit, and any other Python exception are not something
+    JS could have thrown, so a `catch` never swallows them."""
+    if isinstance(error, _JsError) or isinstance(error, OSError):
+        return error
+    if type(error) is TypeError and str(error).startswith("Cannot read properties of "):
+        return error
+    raise error
+
+
+def _js_py_value(value):
+    """A JS value lifted into the Python value a hand-written caller is given, as Node's `fromJs`
+    (`runtime-ts/src/pyjson.ts`) lifts it for `dumpJson`: a number that is a safe integer (and not
+    -0) is an `int`, any other number a `float`; `undefined` is `None`; lists and dicts are copied
+    through. Not used by generated code: shims call it on what a generated function returns."""
+    if value is _JS_UNDEFINED or value is None:
+        return None
+    if isinstance(value, bool) or isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        if -(2**53 - 1) <= value <= 2**53 - 1:
+            return value
+        return float(_js_num(value))
+    if isinstance(value, float):
+        if (
+            value == value
+            and _js_math.isfinite(value)
+            and value.is_integer()
+            and abs(value) <= 2**53 - 1
+            and not (value == 0 and _js_math.copysign(1.0, value) < 0)
+        ):
+            return int(value)
+        return value
+    if isinstance(value, list):
+        return [_js_py_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _js_py_value(item) for key, item in value.items()}
+    raise TypeError(
+        f"ts2py: lifting {type(value).__name__} into a Python value is outside the subset"
+    )

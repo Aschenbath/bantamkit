@@ -390,3 +390,148 @@ removes it; the error-shape contract across the pyfs seam (every `catch` over an
 the 19 import cycles #313 measured, each to be broken or moved as one unit; G11 decision 1; and
 whether the hand-written readers left on `yaml.safe_load` (`hookadapter`'s native mirror,
 `skillfile`, `divergence`) move with G7/G6/G3 under their own rulings.
+
+## #316 J87-2: type-directed lowering in ts2py (measured 2026-11-15 on `feat/316-g1`, macOS arm64, Node 26.13.0, CPython 3.12.13)
+
+The #315 read cost was carried here (the J86-5 table above: three cold paths over the 20% bar),
+with the J86-R2 finding that a data field named like a builtin method was refused by name.
+Both came from ts2py using no type information. J87-2 makes ts2py use the types the TypeScript
+declares wherever the compiler can PROVE them, and lowers to cheaper exact Python only under that
+proof (`tools/ts2py/SUBSET.md`, *Types*; ledger `tools/ts2py/RULES.md`, J87 rules).
+
+**Mechanism.** oxc gives an AST and no type checker; `tsc`'s types are not proofs of a Python
+value (`any`, `as`, `!`, `JSON.parse`, adapters). So ts2py infers facts locally from what it
+controls (literals, the operations it lowers, every assignment, every return, every call site)
+and finds them by a greatest fixpoint over the module: lower, observe, lower again until a round
+observes exactly what it assumed. A function with guardable parameter annotations gets a typed
+body; whatever can reach it with an unproven value (Python, an adapter, another module, an
+unproven call site) enters through a guard under the function's own name (`type(s) is str`,
+`_js_is_double(n)`, ...) that runs the typed body or the J86 untyped one. `const` bindings are
+narrowed by guards that exit (`if (w === undefined) throw`, `ch === "'" || ch === '"'`).
+
+**Same answers.** The generated modules changed (typed bodies and guards; 2,414 lines against
+1,558) and answer exactly as before:
+
+| Check | Result |
+|---|---|
+| `--suite ts2py` / `ts2py-codec` / `workplan` / `codec` / `store` | PASS 452 / 228 (2 ruled) / 294 / 519 (10 ruled) / 389 (10 ruled), 0 failures each |
+| workplan fuzz (`fuzz_gen.mjs` regenerated from `dist`, `fuzz_cmp.py`), seeds 1-3, 11-15 | 8 x 5,000 graphs, 0 mismatches |
+| `j86-r/readfuzz.py 1 20000`, `writefuzz.py 1 5000` | no DIFF line; stats identical to `b1a6d257` (`fallback 17142, ruled-skip 1746, gen 1112`; `gen 4981, fb 19`) |
+| `j86-r/fastpath.py` (runtime vs J86-5's original) | 44,000 calls, 0 diffs |
+| per-input differential, `b1a6d257` against this branch (readfuzz/writefuzz generators, seeds 1-3; raw generated parse, the store's load, the store's write) | 75,000 answers, byte-identical |
+| the 14 new helpers against the general helpers (any argument) | 120,000 calls, 0 diffs (cargo test runs 30,000; two mutants caught) |
+| `pytest runtime-py/tests -q` | 5,295 passed, 58 skipped, 2 deselected, 3 xfailed (414.8 s) |
+| `node tools/conformance/run.mjs --all` | PASS 22,753 cases, 198 ruled-different, 0 failures (697 s) |
+
+**Measured.** J86-5's harness unchanged (scratchpad `j86-5/bench.py` + `inproc.py`, fresh scratch
+copies of the repo store, `~/.bantamkit/memory` and this repo's Claude Code native store under a
+throwaway HOME; hooks and the CLI as process wall time with cold imports, the rest in-process;
+n = 9 runs, medians). All three trees were measured back to back in one sitting: pre-#315 is
+`f6a5b74e`, J86-5 is `b1a6d257` (both `git archive` copies of `runtime-py/src`), J87-2 is this
+branch.
+
+| Operation | pre-#315 | J86-5 (`b1a6d257`) | J87-2 | vs pre-#315 | bar (+20%) |
+|---|---|---|---|---|---|
+| hook SessionStart, index warm | 368.3 ms | 404.4 ms | 385.0 ms | +4.5% | met |
+| hook UserPromptSubmit, index warm | 380.3 ms | 375.8 ms | 380.4 ms | +0.1% | met |
+| hook SessionStart, no index (cold build) | 570.1 ms | 619.7 ms | 587.6 ms | +3.1% | met |
+| hook UserPromptSubmit, no index | 576.1 ms | 627.8 ms | 600.1 ms | +4.2% | met |
+| `python -m bantamkit.memory list` | 116.8 ms | 136.0 ms | 129.2 ms | +10.6% | met |
+| `memory_recall`, long-lived server | 2.02 ms | 2.04 ms | 2.02 ms | +0.1% | met |
+| `memory_recall`, first call in a process | 4.94 ms | 5.51 ms | 5.10 ms | +3.2% | met |
+| `memory_save`, long-lived server | 4.51 ms | 2.39 ms | 2.60 ms | -42.2% | met |
+| `memory_save`, first call in a process | 4.87 ms | 21.0 ms | 11.3 ms | +130.9% | **NOT met** |
+| hot index build from nothing (in-process) | 37.2 ms | 54.2 ms | 43.9 ms | +18.0% | met |
+| cold index build from nothing (in-process) | 31.8 ms | 40.8 ms | 35.0 ms | +10.0% | met |
+| `MemoryStore._facts()`, 91 facts, caches cold | 4.50 ms | 20.8 ms | 11.3 ms | +151.5% | **NOT met** |
+| `MemoryStore._facts()`, 91 facts, caches warm | 4.46 ms | 2.34 ms | 2.37 ms | -46.8% | met |
+| one frontmatter, first parse, caches cold | 20 µs | 144 µs | 58 µs | +189.6% | ≤ 200 µs: met |
+
+**The bar is met for every operation but the first read of a whole store in a process**:
+`memory_save`'s first call (+131%, +6.4 ms) and the `_facts()` cold parse it consists of
+(+152%). Both hot and cold index builds are now inside 20% (+18.0%, +10.0%), and a frontmatter's
+first parse is 58 µs (median, 518 files) against the 200 µs bar. The floor: `_facts()` cold over
+the repo store parses 93 frontmatters in 8.1 ms (about 87 µs each, these files carry link and
+keyword lists), against about 0.2 ms through libyaml; the rest of `_facts()` is unchanged. What is
+left after J87-2 is no longer dispatch: it is spread over the scanners' inherent per-line work (a
+regex `exec` on a slice per entry, `indexOf`/`slice`/two `replace`s per plain-scalar line,
+`resolve_implicit_tag` per scalar, a join of per-character pushes in quoted scalars), each now a
+direct helper or plain Python. Options, none taken here:
+
+1. **Flow-sensitive facts** (a binding's fact per program point rather than met over the
+   function): the one remaining unproven position is where one assignment cannot be proven;
+   small further gains, a large analysis.
+2. **Change the TypeScript scanners** (`factfile.ts`, outside this unit's layer): fewer slices and
+   per-character pushes; behaviour-neutral for Node, guarded by `ts2py-codec`/`codec`.
+3. **A persistent parse cache**: a new on-disk artifact in one runtime, so it needs a ruling under
+   the two-runtimes rule.
+4. Accept: +6.4 ms once per process for the first save.
+
+Carried, not fixed: the J85 rule that a call of a function annotated `: boolean` is a known bool
+(`bool_fns`) trusts a return annotation, which J87's own rules do not; it changes `and`/`or` and
+conditions only, and no divergence was observed, but it is not a proof.
+**Closed by J87-3:** the rule is dropped. A call now proves what every `return` of the body proved
+(the fixpoint's return facts), never the annotation; `tests/types.rs`
+(`a_boolean_return_annotation_is_not_proof`) pins a `: boolean` function that returns its `any`
+argument, lowered with JS truthiness and answering Node's `["yes","no",false,"and","or",false,1]`,
+where J87-2's compiler answered `["no","yes",true,...]`. One committed line moved
+(`factfile.py`, `py_list`: `value.truthy` is now tested with `_js_truthy`), with no answer changed.
+
+## #316 J87-3: G1 (`pricing`, `jobbudget`) generated by ts2py (measured 2026-11-15 on `feat/316-g1`, macOS arm64, Node 26.13.0, CPython 3.12.13)
+
+`runtime-ts/src/pricing.ts` and `jobbudget.ts` are compiled by `tools/ts2py` to
+`runtime-py/src/bantamkit/_generated/pricing.py` and `jobbudget.py`, committed, and
+`bantamkit.pricing` / `bantamkit.jobbudget` serve them through shims. The hand-written Python is
+retired. The shims' conveniences, the adapters, the fs error shape, the behaviour changes (all
+toward Node), one pending ruling and the retired tests are in `docs/porting.md`, *Generated
+modules* → *Pricing and the job budget*.
+
+| What | Census estimate (#315) | Actual |
+|---|---|---|
+| TypeScript lines | 551 | 560 (`jobbudget.ts` grew in J87-1F; the census rerun at this tree says 560) |
+| New syntax kinds | 5: `**`, `try` / `catch` (2), a template with no substitution, `?.` | 4 needed a rule (`**` of literals, `try`, `catch`, one optional read); the no-substitution template was already lowered. Plus 2 the census counts as known kinds: a C-style `for` with clauses, a spread argument to `Math.min` |
+| New builtin calls | 5 (6 at this tree) | 5: `JSON.parse`, `Number.isFinite`, `Math.trunc`, `.splice`, `.reduce`; plus `Number.MAX_SAFE_INTEGER` and `process.env` |
+| Rules | 9-11 (10-12 at this tree) | **17: 11 new, 6 extended** (J86 rules 2, 10, 20, 34; J85 rules 36, 52); every other rule reused unchanged (`tools/ts2py/RULES.md`, J87-3) |
+| Adapters | 3 (`path.join`, `fs.existsSync`, `fs.readFileSync`) | **9 rows**: those 3, `process.env`, and 4 where Python is the reference (`pyRepr`, `cmpCodepoint`, `assetsRoot`, `BantamError`), which the census reads as user code because they import uncompiled `src` modules |
+| Generated Python lines | 320-386 | 519 (`pricing.py` 340, `jobbudget.py` 179): J87-2's typed bodies and guarded entries write five functions twice |
+| Runtime support | — | 11 names added (`_js_catch`, `_js_json_parse`, `_js_py_value`, ...); no existing helper changed; `_ts2py_runtime.py` 1,889 → 2,062 lines, `_ts2py_adapters.py` 60 → 369 |
+| Units | 4-5 | 1 compiler-and-switch unit (J87-3), after J87-1 / J87-1F / J87-1G (the differential and its fixes) and J87-2 (type facts) |
+
+**Adapter measurements** (against Node 26.13): `path.join` 60,000 random joins equal on posix and
+41,055 on win32 (18,945 refused by the colon and device-name subset); `readFileSync(p, 'utf8')`
+30,000 byte strings and 2,000 files equal; `existsSync` 18 path shapes equal.
+
+**The #315 unknown "error shape across the pyfs seam"**, for the fs adapters G1 needed: an fs error
+reaches the Python caller as CPython's own `OSError` from `open()` (class, errno, strerror,
+filename, args, text), whether a generated `catch` rethrows it or nothing catches it; a generated
+`catch` catches only what JS could have thrown, so a subset refusal is never swallowed
+(`tools/ts2py/tests/g1.rs`, `fs_errors_reach_python_as_cpython_raises_them`).
+
+**Differential.** `--suite pricing` 84 cases (3 new `load:` cases: a directory, an invalid UTF-8
+byte, a BOM; the directory case crashes the hand-written Python with `IsADirectoryError`, the
+divergence the switch closes), `--suite jobbudget` 1,149 cases with **0 ruled** (J87-1G left 1,141
+with 8 ruled: the 4 `ruled:` budget inputs and 3 `ruled checkpoint limit:` cases went stale, 10
+failures, the moment Python switched, and are now ordinary cases pinned per side). Found and not
+fixed (`docs/porting.md`, pending a ruling): a model named like an `Object.prototype` member
+(`toString`, `constructor`, `__proto__`) is priced at $0.00 by Node; the Python shim keeps the
+hand-written refusal.
+
+**Red proofs.** A line appended to the committed `_generated/pricing.py`, then to `jobbudget.py`:
+`--suite ts2py` `committed/pricing.py` / `committed/jobbudget.py` red (1 of 454 each). One newline
+appended to `pricing.ts` and `jobbudget.ts`: `test_ts2py_fresh.py` 2 failed, 11 passed. The
+`: boolean` probe against J87-2's compiler (`e6655be7`): `a_boolean_return_annotation_is_not_proof`
+red.
+
+**Cost** (n = 9, medians; before = `e6655be7`; full numbers in `docs/porting.md`): `import
+bantamkit` 88.2 → 88.3 ms; the modules' own imports +0.09 ms (pricing) and +0.05 ms (jobbudget);
+warm `price_tokens` 1.5 → 22.3 µs, a table's decode + validate 21 → 156 µs, a 42-line budget +
+refusal 11 → 113 µs, all over 20% and all the JS-semantics runtime; `shiftwork.plan_batches` with a
+budget +2.1% (12.49 → 12.76 ms).
+
+| Gate on the switched tree | Result |
+|---|---|
+| `cargo test --release` (tools/ts2py) / clippy `-D warnings` / fmt | 55 passed, 0 failed / clean / clean |
+| `--suite ts2py` / `pricing` / `jobbudget` / `workplan` / `codec` / `ts2py-codec` | PASS 454 / 84 / 1,149 / 294 / 519 (10 ruled) / 228 (2 ruled), 0 failures each |
+| `cd runtime-ts && npm test` | 2,503 tests: 2,456 pass, 0 fail, 47 skipped |
+| `pytest runtime-py/tests -q` | 5,286 passed, 58 skipped, 2 deselected, 3 xfailed (430.1 s) |
+| `node tools/conformance/run.mjs --all` | PASS 22,766 cases: 3,734 byte-identical, 10,846 exact-string, 8,186 structural, 190 ruled-different (J87-2: 198; the 8 jobbudget rulings closed), 0 failures |
