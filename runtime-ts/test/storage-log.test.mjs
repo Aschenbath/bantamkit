@@ -340,3 +340,125 @@ test('a read-only directory fails fast (208 item 7)', { skip: process.platform =
     chmodSync(d, 0o755);
   }
 });
+
+// #316 G2 (J88-2): the crash-safe write's order, which `test_storage_log.py`'s
+// `test_write_over_and_rotate_write_temp_then_rename` pins for the generated Python: the body is
+// written to a fresh `<target>.<pid>.<hex>.tmp` opened `wx` with mode 0o666, closed, then renamed
+// over the target; a refused rename removes the temp and nothing else changes. Neither side fsyncs.
+test('write_over and rotate write a temp then rename it (J88-2, #316 G2)', async () => {
+  const { writeOver } = await import('../dist/storage/index.js');
+  const d = tmp();
+  const p = join(d, 'x.jsonl');
+  const kind = (q) => {
+    const name = q.slice(d.length + 1);
+    if (name.endsWith('.tmp')) return 'tmp';
+    if (name.endsWith('.keep')) return 'keep';
+    if (name.endsWith('.lock')) return 'lock';
+    return name;
+  };
+  const trace = [];
+  const fds = new Map();
+  const names = ['openSync', 'writeSync', 'closeSync', 'renameSync', 'rmSync', 'fsyncSync', 'fdatasyncSync'];
+  const real = Object.fromEntries(names.map((n) => [n, fs[n]]));
+  fs.openSync = (q, flags, mode) => {
+    const fd = real.openSync(q, flags, mode);
+    if (String(q).startsWith(d)) {
+      fds.set(fd, kind(String(q)));
+      trace.push(`open ${kind(String(q))} ${flags} ${mode ?? 0o666}`);
+    }
+    return fd;
+  };
+  fs.writeSync = (fd, ...rest) => {
+    if (fds.has(fd)) trace.push(`write ${fds.get(fd)}`);
+    return real.writeSync(fd, ...rest);
+  };
+  fs.closeSync = (fd) => {
+    if (fds.has(fd)) trace.push(`close ${fds.get(fd)}`);
+    fds.delete(fd);
+    return real.closeSync(fd);
+  };
+  fs.renameSync = (a, b) => {
+    trace.push(`rename ${kind(String(a))} ${kind(String(b))}`);
+    return real.renameSync(a, b);
+  };
+  fs.rmSync = (q, o) => {
+    trace.push(`rm ${kind(String(q))}`);
+    return real.rmSync(q, o);
+  };
+  fs.fsyncSync = (...a) => {
+    trace.push('fsync');
+    return real.fsyncSync(...a);
+  };
+  fs.fdatasyncSync = (...a) => {
+    trace.push('fdatasync');
+    return real.fdatasyncSync(...a);
+  };
+  syncBuiltinESMExports();
+  try {
+    writeOver(join(d, 'w.bin'), Buffer.from('x'));
+    const wrote = trace.splice(0);
+    mkdirSync(join(d, 'adir'));
+    writeFileSync(join(d, 'adir', 'f'), 'y');
+    assert.throws(() => writeOver(join(d, 'adir'), Buffer.from('x')));
+    const refused = trace.splice(0);
+    writeFileSync(p, '{"ts":"a"}\n'.repeat(4));
+    assert.equal(new LogSegment(p).rotate(1), true);
+    const rotated = trace.filter((t) => t.includes('tmp') || t.startsWith('fsync') || t.startsWith('fdatasync'));
+    assert.deepEqual(wrote, ['open tmp wx 438', 'write tmp', 'close tmp', 'rename tmp w.bin']);
+    assert.deepEqual(refused, ['open tmp wx 438', 'write tmp', 'close tmp', 'rename tmp adir', 'rm tmp']);
+    // J88-RF F1: the emptied live file is no bytes, so no write(2), as Python's buffered write
+    assert.deepEqual(rotated, ['open tmp wx 438', 'write tmp', 'close tmp', 'rename tmp x.jsonl.1.gz', 'open tmp wx 438', 'close tmp', 'rename tmp x.jsonl']);
+  } finally {
+    Object.assign(fs, real);
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(readdirSync(d).sort(), ['adir', 'w.bin', 'x.jsonl', 'x.jsonl.1.gz']);
+});
+
+// J88-RF F1: a disk that fills mid-write. Each `writeSync` writes what is left of a byte budget
+// (a short write, as write(2) answers on a full disk) and refuses with ENOSPC once it is spent.
+// A temp file that could not take every byte must never be renamed over the log: fold, rotate and
+// writeOver answer as a refused write does (the log byte-unchanged, the temp removed), and an
+// append that could not write its whole line answers `false`.
+test('a short write renames nothing over the log, and an append answers false (J88-RF F1)', async () => {
+  const { writeOver } = await import('../dist/storage/index.js');
+  const d = tmp();
+  const p = join(d, 'x.jsonl');
+  fill(p, 400);
+  const data = bytes(p);
+  const real = fs.writeSync;
+  let budget = 0;
+  fs.writeSync = (fd, buf, ...rest) => {
+    if (rest.length > 0 || !Buffer.isBuffer(buf)) return real(fd, buf, ...rest);
+    if (budget <= 0) throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC', errno: -28, syscall: 'write' });
+    const n = real(fd, buf.subarray(0, Math.min(buf.length, budget)));
+    budget -= n;
+    return n;
+  };
+  syncBuiltinESMExports();
+  const answers = [];
+  try {
+    const seg = new LogSegment(p);
+    budget = 100;
+    seg.fold('3000', (rows) => rows); // identity rewrite of every line
+    budget = 100;
+    answers.push(seg.rotate(0));
+    budget = 100;
+    try {
+      writeOver(p, Buffer.alloc(data.length, 0x61));
+      answers.push('wrote');
+    } catch (e) {
+      answers.push(e.code);
+    }
+    budget = 10;
+    answers.push(seg.append({ ts: '2026-10-01T00:00:00Z', pad: 'x'.repeat(50) }));
+  } finally {
+    fs.writeSync = real;
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(answers, [false, 'ENOSPC', false]);
+  // the append's 10 bytes are on disk, as on main's Python (its buffered write wrote them too)
+  assert.deepEqual(bytes(p).subarray(0, data.length), data);
+  assert.equal(bytes(p).length, data.length + 10);
+  assert.deepEqual(readdirSync(d), ['x.jsonl']);
+});

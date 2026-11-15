@@ -29,7 +29,6 @@ pytest.importorskip("mcp")
 from mcp import Client  # noqa: E402
 
 from bantamkit.eventlog import (  # noqa: E402
-    CAP_BYTES,
     EVENT_LOG_ENV,
     SCHEMA_VERSION,
     EventLog,
@@ -526,8 +525,8 @@ def test_a_bad_detail_is_not_swallowed(tmp_path):
 # ---- bounded ------------------------------------------------------------------------
 
 
-def test_the_cap_is_one_mebibyte_and_keeps_one_generation():
-    assert CAP_BYTES == 1048576
+# `CAP_BYTES == 1048576` is pinned per side by `--suite eventlog`'s `LITERAL: the constants are
+# what docs/eventlog.md says` (#316 G2, J88-2 retired the duplicate here).
 
 
 def test_rotation_fires_on_the_byte_that_would_cross_the_cap(tmp_path):
@@ -803,3 +802,28 @@ def test_a_literal_log_path_is_still_created_where_the_operator_named_it(tmp_pat
     log.record("work_plan", "plan")
     assert target.exists()
     assert not (tmp_path / "absent-store").exists()
+
+
+@pytest.mark.parametrize("spelled", ["/a//b.jsonl", "/a/b/", "./x", "a//b/./ev.jsonl"])
+def test_a_literal_path_keeps_its_spelling_on_every_python(tmp_path, spelled):
+    # J88-RF F3: `_SpelledPath` raised TypeError on 3.11 (and 3.10) for any spelling a plain
+    # `Path` would normalise, because `Path.__init__` there is `object.__init__`. Pinned here on
+    # whichever interpreter runs the suite, and measured on 3.11, 3.12, 3.13 and 3.14 (J88-RF).
+    from bantamkit.eventlog import EventLog, resolve_path
+
+    for p in (
+        resolve_path(Path("/s"), spelled),
+        EventLog.from_env(Path("/s"), {"BANTAMKIT_EVENT_LOG": spelled}).path,
+    ):
+        assert str(p) == os.fspath(p) == spelled
+        assert repr(p) == f"{type(Path()).__name__}({spelled!r})"
+        plain = Path(spelled)
+        assert p == plain and plain == p and hash(p) == hash(plain)
+        assert str(p.parent) == str(plain.parent) and type(p.parent)(p.parent) == plain.parent
+        assert str(p / "z") == str(plain / "z")
+        assert str(p.with_name("n")) == str(plain.with_name("n"))
+    # the spelled path is the one written, and a log made from it keeps it
+    target = str(tmp_path) + "/q//ev.jsonl"
+    log = EventLog.from_env(Path("/s"), {"BANTAMKIT_EVENT_LOG": target})
+    log.record("t", "ok", {})
+    assert str(EventLog(log.path).path) == target and os.listdir(tmp_path / "q") == ["ev.jsonl"]

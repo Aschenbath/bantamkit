@@ -92,6 +92,19 @@ export const SCHEMA_VERSION = 1;
 
 const OFF = new Set(['', '0', 'off', 'false', 'no']);
 const ON = new Set(['1', 'on', 'true', 'yes']);
+const NON_ASCII = /[^\x00-\x7f]/;
+
+/**
+ * The switch's spelling, lowercased for `OFF` / `ON`. Every token there is ASCII, and the one
+ * non-ASCII code point whose lowercase is ASCII is U+212A KELVIN SIGN, to `k`, which no token
+ * holds (measured over every code point on Node 26.13; U+0130 lowercases to `i` + U+0307). So a
+ * spelling with a non-ASCII code point matches no token, lowercased or not, and is left as it is:
+ * Node's answer is the one `toLowerCase` gave, and the generated Python never consults a Unicode
+ * table its CPython may not share (J88-RF F2: U+03A3 or U+1C89 raised there).
+ */
+function switchKey(token: string): string {
+  return NON_ASCII.test(token) ? token : token.toLowerCase();
+}
 
 /** What a `detail` object is allowed to hold: a number, a bool, or a closed-set token. */
 export type DetailValue = number | boolean | string;
@@ -158,8 +171,14 @@ function recordObject(
   outcome: string,
   detail: Readonly<Record<string, DetailValue>>,
 ): Record<string, unknown> {
-  const sorted: Record<string, DetailValue> = {};
-  for (const key of Object.keys(detail).sort(cmpCodepoint)) sorted[key] = detail[key]!;
+  // `Object.fromEntries` defines each key as an OWN data property (J88-1F, #316 G2). The
+  // assignment it replaces, `sorted[key] = ...`, is a [[Set]]: on `__proto__` it set the
+  // prototype and the key never reached the line, where Python's dict writes it.
+  const sorted: Record<string, DetailValue> = Object.fromEntries(
+    Object.keys(detail)
+      .sort(cmpCodepoint)
+      .map((key) => [key, detail[key]!]),
+  );
   return { v: SCHEMA_VERSION, ts: formatTimestamp(epochMs), tool, outcome, detail: sorted };
 }
 
@@ -192,8 +211,8 @@ export function defaultPath(storeRoot: string): string {
 export function resolvePath(storeRoot: string, raw: string | undefined | null): string | null {
   if (raw === undefined || raw === null) return null;
   const token = raw.trim();
-  if (OFF.has(token.toLowerCase())) return null;
-  if (ON.has(token.toLowerCase())) return defaultPath(storeRoot);
+  if (OFF.has(switchKey(token))) return null;
+  if (ON.has(switchKey(token))) return defaultPath(storeRoot);
   return token;
 }
 
@@ -252,7 +271,7 @@ export class EventLog {
     clock: () => number = defaultClock,
   ): EventLog {
     const raw = env[EVENT_LOG_ENV];
-    const inStore = raw !== undefined && raw !== null && ON.has(raw.trim().toLowerCase());
+    const inStore = raw !== undefined && raw !== null && ON.has(switchKey(raw.trim()));
     return new EventLog(resolvePath(storeRoot, raw), CAP_BYTES, clock, inStore ? storeRoot : null);
   }
 
