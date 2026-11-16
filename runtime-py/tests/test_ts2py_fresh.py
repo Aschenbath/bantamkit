@@ -39,6 +39,22 @@ MODULES = {
     "logsegment.py": TS / "storage" / "logsegment.ts",
     "eventlog.py": TS / "eventlog.ts",
     "tokenledger.py": TS / "tokenledger.ts",
+    # #316 G3 U1 (J89-2), compiled in the same ts2py call as G1 and G2.
+    "usage.py": TS / "memory" / "usage.ts",
+    # #316 G3 (J89-3), the same call.
+    "retrieval.py": TS / "memory" / "retrieval.ts",
+    # #316 G3 U2 (J89-4b), the same call.
+    "store.py": TS / "memory" / "store.ts",
+    # #316 G3 U3 (J89-5), the same call.
+    "native.py": TS / "memory" / "native.ts",
+    # #316 G3 U3 (J89-5a), the same call.
+    "queries.py": TS / "memory" / "queries.ts",
+    # #316 G3 U3 (J89-5b), the same call.
+    "layers.py": TS / "memory" / "layers.ts",
+    # #316 G3 U3 (J89-5c), the same call.
+    "dream.py": TS / "memory" / "dream.ts",
+    # #316 G3 U4 (J89-6), the same call.
+    "component.py": TS / "memory" / "component.ts",
 }
 # The two support modules ts2py writes from copies it embeds; and the hand-written package file.
 SUPPORT = {"_ts2py_runtime.py", "_ts2py_adapters.py"}
@@ -53,6 +69,10 @@ REGENERATE = (
     "--out-dir runtime-py/src/bantamkit/_generated --runtime-module ._ts2py_runtime\n"
     f"  {_CARGO} runtime-ts/src/pricing.ts runtime-ts/src/jobbudget.ts "
     "runtime-ts/src/storage/logsegment.ts runtime-ts/src/eventlog.ts runtime-ts/src/tokenledger.ts "
+    "runtime-ts/src/memory/usage.ts runtime-ts/src/memory/retrieval.ts "
+    "runtime-ts/src/memory/store.ts runtime-ts/src/memory/native.ts "
+    "runtime-ts/src/memory/queries.ts runtime-ts/src/memory/layers.ts "
+    "runtime-ts/src/memory/dream.ts runtime-ts/src/memory/component.ts "
     "--out-dir runtime-py/src/bantamkit/_generated --runtime-module ._ts2py_runtime\n"
     f"  {_CARGO} --emit-runtime runtime-py/src/bantamkit/_generated/_ts2py_runtime.py\n"
     f"  {_CARGO} --emit-adapters runtime-py/src/bantamkit/_generated/_ts2py_adapters.py\n"

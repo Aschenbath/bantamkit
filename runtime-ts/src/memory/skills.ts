@@ -8,10 +8,12 @@ import * as fs from 'node:fs';
 
 import { BantamError } from '../errors.js';
 import { cmpCodepoint, pyStrip } from '../pysem.js';
+import { frame } from '../replynative.js';
+import { tokenizeLabel } from '../skilllabel.js';
 import { parseSkill, readState, SKILL_FILE, SkillFileError, skillsRoot, validate } from '../skillfile.js';
 import { DUPLICATE } from '../storage/hotindex.js';
 import type { Fact } from './factfile.js';
-import { asPyOSError, pyDecodeUtf8, pyHome, pyIsFile, pyJoin, pyName, pyParent } from './pyfs.js';
+import { asPyOSError, pyDecodeUtf8, pyHome, pyIsFile, pyJoin, pyName, pyParent, pyRealpath } from './pyfs.js';
 import { oneLine, poolOf, type Pool, type SkippedFact } from './store.js';
 
 /** The label the layer's hits carry: `[skill] [name] (skill) description`. */
@@ -50,19 +52,9 @@ export function skillRoots(projectStore: string, home: string): string[] {
   return roots;
 }
 
+/** `os.path.realpath(a) == os.path.realpath(b)`: `pyRealpath`, the reference's own (J89-1F). */
 function same(a: string, b: string): boolean {
-  return realpath(a) === realpath(b);
-}
-
-/** `os.path.realpath`: the resolved path, or the longest existing prefix resolved. */
-function realpath(p: string): string {
-  try {
-    return fs.realpathSync.native(p);
-  } catch {
-    const parent = pyParent(p);
-    if (parent === p) return p;
-    return pyJoin(realpath(parent), pyName(p));
-  }
+  return pyRealpath(a) === pyRealpath(b);
 }
 
 /**
@@ -301,6 +293,25 @@ export class SkillStore {
   archivedRecall(_query: string, _k: number, _exclude: Iterable<string> = []): Fact[] {
     return [];
   }
+}
+
+/**
+ * Whether a layer is the skill layer: `component.ts`'s `instanceof SkillStore`, named here
+ * (#316 G3 U4, J89-6) so the compiled component reaches it through one adapter row (skills.ts is
+ * not compiled; the Python adapter is `isinstance` of the `SkillStore` adapter).
+ */
+export function isSkillStore(store: unknown): store is SkillStore {
+  return store instanceof SkillStore;
+}
+
+/**
+ * #301: the one skill a trigger phrase in `query` fires against `offer`, or `null` —
+ * `SkillStore.fire(tokenizeLabel(frame(query)), shown, offer)`, the three calls `Memory.fire`
+ * made, moved here unchanged (#316 G3 U4, J89-6) so the compiled component reaches them through
+ * one adapter row; the Python adapter makes the same three calls on the reference's functions.
+ */
+export function fireOn(query: string, shown: ReadonlySet<string>, offer: Offer): Fact | null {
+  return SkillStore.fire(tokenizeLabel(frame(query)), shown, offer);
 }
 
 function isDir(p: string): boolean {

@@ -36,8 +36,9 @@ from ._ts2py_runtime import (  # noqa: F401
     _JsObject,
     _JsSet,
 )
-from ._ts2py_adapters import bantamkit_dir_for, buffer_from, cmp_codepoint, ensure_bantamkit_gitignore, mkdir_sync, os_error_class_name, process_env_all, py_exists, py_is_dir, py_join, py_name, py_parent, PyOSError, rename_sync, stat_sync
+from ._ts2py_adapters import buffer_from, cmp_codepoint, mkdir_sync, os_error_class_name, process_env_all, py_exists, py_is_dir, py_join, py_name, py_parent, PyOSError, rename_sync, stat_sync
 from .logsegment import LogSegment
+from .store import bantamkit_dir_for, ensure_bantamkit_gitignore
 
 __all__ = ["CAP_BYTES", "DEFAULT_RELATIVE_PATH", "EVENT_LOG_ENV", "EventLog", "SCHEMA_VERSION", "default_path", "encode_record", "format_timestamp", "resolve_path"]
 
@@ -95,15 +96,15 @@ def encode_record(epoch_ms, tool, outcome, detail):
 
 
 def _record_object__typed(epoch_ms, tool, outcome, detail):
-    sorted = _js_object_from_entries(_js_m_map(_js_m_sort(_js_object_keys(detail), cmp_codepoint), lambda key, *_: [key, _js_get(detail, key)]))
-    return {"v": SCHEMA_VERSION, "ts": _format_timestamp__typed(epoch_ms), "tool": tool, "outcome": outcome, "detail": sorted}
+    sorted_ = _js_object_from_entries(_js_m_map(_js_m_sort(_js_object_keys(detail), cmp_codepoint), lambda key, *_: [key, _js_get(detail, key)]))
+    return {"v": SCHEMA_VERSION, "ts": _format_timestamp__typed(epoch_ms), "tool": tool, "outcome": outcome, "detail": sorted_}
 
 
 def _record_object(epoch_ms, tool, outcome, detail):
     if _js_is_double(epoch_ms) and type(tool) is str and type(outcome) is str:
         return _record_object__typed(epoch_ms, tool, outcome, detail)
-    sorted = _js_object_from_entries(_js_m_map(_js_m_sort(_js_object_keys(detail), cmp_codepoint), lambda key, *_: [key, _js_get(detail, key)]))
-    return {"v": SCHEMA_VERSION, "ts": format_timestamp(epoch_ms), "tool": tool, "outcome": outcome, "detail": sorted}
+    sorted_ = _js_object_from_entries(_js_m_map(_js_m_sort(_js_object_keys(detail), cmp_codepoint), lambda key, *_: [key, _js_get(detail, key)]))
+    return {"v": SCHEMA_VERSION, "ts": format_timestamp(epoch_ms), "tool": tool, "outcome": outcome, "detail": sorted_}
 
 
 def _default_path__typed(store_root):

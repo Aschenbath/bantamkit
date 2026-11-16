@@ -28,6 +28,7 @@ const AND: u8 = 4;
 const NOT: u8 = 5;
 const CMP: u8 = 6;
 const ADD: u8 = 11;
+const MUL: u8 = 12;
 const UNARY: u8 = 13;
 const ATOM: u8 = 16;
 
@@ -42,6 +43,8 @@ struct Py {
     is_num: bool,
     /// Always a `str`.
     is_str: bool,
+    /// J89-3: always a Python `float` (`types::Fact::f64`); set only with `is_num` and `is_double`.
+    is_f64: bool,
     /// A value a JS double holds exactly (or not a number at all), so `_js_num` would return it
     /// unchanged: a literal, a length, the result of an arithmetic lowering.
     is_double: bool,
@@ -96,6 +99,7 @@ impl Py {
         Fact {
             str_: self.is_str,
             num: self.is_num && self.is_double,
+            f64: self.is_f64 && self.is_num && self.is_double,
             bool_: self.is_bool,
             list: self.is_list,
             regex: self.is_regex,
@@ -118,6 +122,7 @@ impl Py {
                 self.top = true;
                 self.is_str = true;
                 self.is_num = true;
+                self.is_f64 = true;
                 self.is_double = true;
                 self.is_bool = true;
                 self.is_list = true;
@@ -128,6 +133,11 @@ impl Py {
                 if f.num {
                     self.is_num = true;
                     self.is_double = true;
+                }
+                if f.f64 {
+                    self.is_num = true;
+                    self.is_double = true;
+                    self.is_f64 = true;
                 }
                 self.is_bool |= f.bool_;
                 self.is_list |= f.list;
@@ -158,6 +168,7 @@ impl Py {
             is_bool: both.bool_,
             is_num: self.is_num && other.is_num,
             is_double: self.is_double && other.is_double,
+            is_f64: both.f64,
             is_str: both.str_,
             is_list: both.list,
             is_regex: both.regex,
@@ -241,6 +252,14 @@ const METHODS: &[(&str, usize, usize, Option<usize>, Ret)] = &[
     ("trim", 0, 0, None, Ret::Str),
     ("values", 0, 0, None, Ret::List),
     ("subarray", 0, 2, None, Ret::Any),
+    // J89-2 (#316 G3: memory/usage, memory/retrieval).
+    ("toFixed", 0, 1, None, Ret::Str),
+    ("match", 1, 1, None, Ret::Any),
+    ("charCodeAt", 0, 1, None, Ret::Num),
+    // J89-4a (#316 G3 U2: memory/store).
+    ("forEach", 1, 1, Some(0), Ret::Any),
+    ("keys", 0, 0, None, Ret::List),
+    ("copyWithin", 2, 3, None, Ret::List),
 ];
 
 /// J86-R finding 3: every method a builtin prototype the subset can reach carries (String, Array,
@@ -373,6 +392,12 @@ pub struct ModuleExports {
     pub py_module: String,
     /// Source name -> (Python name, is a class).
     pub names: HashMap<String, (String, bool)>,
+    /// J89-4a: the module's generator functions (`function*`), by source name.
+    pub generators: HashSet<String>,
+    /// J89-5: the data fields each named object type declares (`types::TypeDecls::fields`), so a
+    /// module that imports the type (`import { type Pool }`) reads `pool.facts` as the data field
+    /// the declaring module reads it as.
+    pub type_fields: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Everything about the other modules of a multi-module compile a module needs (J86).
@@ -454,6 +479,10 @@ pub struct Lowerer<'s> {
     sigs: HashMap<String, Sig>,
     /// J87: module-level `const` bindings of a value (not an arrow).
     module_consts: HashSet<String>,
+    /// J89-2: module-level `let` bindings (Python module globals a function may assign).
+    module_lets: HashSet<String>,
+    /// J89-2: per function being lowered, the module `let`s it assigns (`global` declarations).
+    global_writes: Vec<BTreeSet<String>>,
     /// J87: non-exported module `const`s bound to an array literal: frozen unless a use escapes.
     frozen: HashSet<String>,
     /// J87: the module's interfaces and type aliases.
@@ -462,6 +491,22 @@ pub struct Lowerer<'s> {
     declared: HashMap<(u32, String), BTreeSet<String>>,
     /// J87: the call being lowered is a whole expression statement.
     statement_call: bool,
+    /// J89-4a: a spread argument must be an array PROVEN a list (`a.splice(i, n, ...xs)`).
+    spread_list: bool,
+    /// J89-4a: lowering the body of a `function*` (a module generator function): a `yield`
+    /// statement is allowed and a `return` takes no value.
+    in_generator: bool,
+    /// J89-4a: the `yield` statements lowered in the current generator body.
+    yields: usize,
+    /// J89-4a: how many `try` statements enclose the statement being lowered.
+    try_depth: usize,
+    /// J89-4a: the methods of the `ImportedClass` adapters this module imports.
+    imported_methods: HashSet<String>,
+    /// J89-4a: the generator functions this module declares or imports, by source name.
+    generator_fns: HashSet<String>,
+    /// J89-4a: the call being lowered is a for-of's iterable or an array spread's argument, the
+    /// two places a generator function may be called.
+    generator_call_ok: bool,
     /// J87: frozen module constants bound to an object literal (read by member only).
     frozen_objects: HashSet<String>,
     /// J87: `const` bindings (never reassigned), which a guard may narrow.
@@ -478,6 +523,65 @@ pub struct Lowerer<'s> {
     cur_indent: usize,
     /// J88-2: how many callback lambdas enclose the expression being lowered.
     in_callback: usize,
+    /// J89-3: `const` bindings of a `new Float64Array(n)` (SUBSET.md, *Typed arrays*).
+    typed_arrays: HashSet<Key>,
+    /// J89-3: `const` bindings of an array literal: a fresh array no parameter can alias.
+    fresh_arrays: HashSet<Key>,
+    /// J89-3: the proven copy of a counted loop being lowered (`fast_loop`).
+    fast: Option<FastLoop>,
+    /// J89-3: `fast_loop` emitted the loop's init already; `c_for_loop` skips it once.
+    fast_init_done: bool,
+    /// J89-3: an assignment in the proven copy gave a carried `let` a value not proven a number.
+    fast_carry_failed: bool,
+}
+
+/// J89-3: what `fast_loop_plan` found in a counted loop's body.
+#[derive(Default)]
+struct LoopScan {
+    var: String,
+    assigned: HashSet<String>,
+    declared: HashSet<String>,
+    typed: HashSet<String>,
+    plain: HashSet<String>,
+    numeric: BTreeSet<String>,
+    pushed: HashSet<String>,
+    filled: HashSet<String>,
+}
+
+/// J89-3: a counted loop `fast_loop` versions: the bound's Python code, and the guard's parts.
+struct LoopPlan {
+    var: String,
+    bound: String,
+    bound_name: Option<String>,
+    typed: BTreeSet<String>,
+    plain: BTreeSet<String>,
+    filled: BTreeSet<String>,
+    speculated: Vec<String>,
+    carried: Vec<String>,
+    declared: HashSet<String>,
+}
+
+/// J89-3: what the proven copy of a counted loop `for (let i = a; i < b; i += 1)` may assume: `i`
+/// is an int with `0 <= i < b`, `b` is at most the length of every array the body indexes by `i`,
+/// each plain array so indexed holds only proven numbers in that range, and nothing in the body
+/// can change any of it (`Lowerer::fast_loop_plan`).
+#[derive(Clone)]
+struct FastLoop {
+    /// The loop's span start (the `ver` of the keys the copy declares).
+    span: u32,
+    /// Names the body declares.
+    declared: HashSet<String>,
+    /// The loop variable (source name).
+    var: String,
+    /// Float64Arrays the body indexes by `i` (source names).
+    typed: HashSet<String>,
+    /// Plain arrays the body reads by `i`, checked by `_js_doubles` (source names).
+    plain: HashSet<String>,
+    /// Fresh local arrays (`fresh_arrays`) the body writes at `i`, checked a list long enough.
+    filled: HashSet<String>,
+    /// Outer `let`s the body assigns and uses as operands, checked a number before the loop and
+    /// proven one throughout it when every assignment in the copy assigns a proven number.
+    carried: HashSet<String>,
 }
 
 /// J87: a module function's signature, as the fixpoint and its call sites need it.
@@ -541,10 +645,19 @@ impl<'s> Lowerer<'s> {
             rets: Vec::new(),
             sigs: HashMap::new(),
             module_consts: HashSet::new(),
+            module_lets: HashSet::new(),
+            global_writes: Vec::new(),
             frozen: HashSet::new(),
             types: TypeDecls::default(),
             declared: HashMap::new(),
             statement_call: false,
+            spread_list: false,
+            in_generator: false,
+            yields: 0,
+            try_depth: 0,
+            imported_methods: HashSet::new(),
+            generator_fns: HashSet::new(),
+            generator_call_ok: false,
             frozen_objects: HashSet::new(),
             consts: HashSet::new(),
             narrow: Vec::new(),
@@ -553,6 +666,11 @@ impl<'s> Lowerer<'s> {
             pre: Vec::new(),
             cur_indent: 0,
             in_callback: 0,
+            typed_arrays: HashSet::new(),
+            fresh_arrays: HashSet::new(),
+            fast: None,
+            fast_init_done: false,
+            fast_carry_failed: false,
         }
     }
 
@@ -579,10 +697,18 @@ impl<'s> Lowerer<'s> {
     /// J87: the key a binding's facts are kept under, if it is a local or a module value `const`.
     fn var_key(&self, name: &str) -> Option<Key> {
         if let Some(i) = self.scopes.iter().rposition(|s| s.contains(name)) {
+            // J89-3: a binding the proven copy of a counted loop declares is its own key there.
+            let ver = match &self.fast {
+                Some(fast) if i + 1 == self.scopes.len() && fast.declared.contains(name) => {
+                    fast.span
+                }
+                _ => 0,
+            };
             return Some(Key::Var {
                 typed: self.typed,
                 owner: self.scope_owner[i],
                 name: name.to_string(),
+                ver,
             });
         }
         if self.module_consts.contains(name) {
@@ -590,6 +716,7 @@ impl<'s> Lowerer<'s> {
                 typed: false,
                 owner: MODULE,
                 name: name.to_string(),
+                ver: 0,
             });
         }
         None
@@ -930,6 +1057,14 @@ impl<'s> Lowerer<'s> {
                         self.declare_global(id.name.as_str(), exported, id.span);
                         let public = exported || listed.contains(id.name.as_str());
                         self.add_sig(id.name.as_str(), public, &f.params, id.span);
+                        // J89-4a: a generator has one body, untyped (a guarded entry would have
+                        // to `yield from` its typed twin), and its call answers a generator.
+                        if f.generator
+                            && let Some(sig) = self.sigs.get_mut(id.name.as_str())
+                        {
+                            sig.params.iter_mut().for_each(|p| *p = None);
+                            self.generator_fns.insert(id.name.to_string());
+                        }
                     }
                 }
                 Declaration::VariableDeclaration(v) => {
@@ -942,6 +1077,9 @@ impl<'s> Lowerer<'s> {
                                     self.add_sig(id.name.as_str(), public, &a.params, id.span);
                                 }
                                 init => {
+                                    if v.kind == VariableDeclarationKind::Let {
+                                        self.module_lets.insert(id.name.to_string());
+                                    }
                                     if v.kind == VariableDeclarationKind::Const {
                                         self.module_consts.insert(id.name.to_string());
                                         if !public
@@ -1045,6 +1183,29 @@ impl<'s> Lowerer<'s> {
                 }
             }
             Declaration::VariableDeclaration(v) => {
+                // J89-2: a module-level `let` is a Python module global. Every function reads it
+                // at call time (as JS reads the live binding); a function that assigns it declares
+                // it `global` (`local_target`). It holds no facts: anything may be assigned to it.
+                if v.kind == VariableDeclarationKind::Let {
+                    for d in &v.declarations {
+                        let BindingPattern::BindingIdentifier(id) = &d.id else {
+                            self.refuse(d.span, "destructuring declaration");
+                            continue;
+                        };
+                        let name = self.globals[id.name.as_str()].clone();
+                        let Some(init) = &d.init else {
+                            self.refuse(d.span, "module-level let without initializer");
+                            continue;
+                        };
+                        if matches!(init, Expression::ArrowFunctionExpression(_)) {
+                            self.refuse(d.span, "module-level let bound to a function");
+                            continue;
+                        }
+                        let value = self.expr(init);
+                        out.push(format!("{name} = {}", value.code));
+                    }
+                    return;
+                }
                 if v.kind != VariableDeclarationKind::Const {
                     self.refuse(v.span, "module-level let/var");
                     return;
@@ -1081,6 +1242,7 @@ impl<'s> Lowerer<'s> {
                                     typed: false,
                                     owner: MODULE,
                                     name: source.to_string(),
+                                    ver: 0,
                                 },
                                 fact,
                             );
@@ -1190,9 +1352,7 @@ impl<'s> Lowerer<'s> {
     ) {
         let (params, owner, statements) = match source {
             FnSource::Decl(f) => {
-                if f.generator {
-                    self.refuse(f.span, "generator function");
-                }
+                // J89-4a: a module `function*` lowers to a Python generator function.
                 if f.r#async {
                     self.refuse(f.span, "async function");
                 }
@@ -1216,10 +1376,20 @@ impl<'s> Lowerer<'s> {
             let mut stack = vec![locals.clone()];
             self.collect_block(statements, &mut stack, &mut locals);
         }
+        let generator = matches!(source, FnSource::Decl(f) if f.generator);
+        let saved_generator = std::mem::replace(&mut self.in_generator, generator);
+        let saved_yields = std::mem::replace(&mut self.yields, 0);
+        let saved_try = std::mem::replace(&mut self.try_depth, 0);
+        if generator {
+            // Its call answers a generator object, of which nothing is proven.
+            self.observed.observe(ret.clone(), Fact::default());
+        }
         self.push_scope(locals, owner);
         self.rets.push(Some(ret.clone()));
         self.bind_params(params, facts);
         out.push(format!("def {name}({}):", join_params(&names)));
+        let def_at = out.len();
+        self.global_writes.push(BTreeSet::new());
         if let Some((typed, admitted)) = guard {
             let bare: Vec<&str> = names
                 .iter()
@@ -1238,9 +1408,17 @@ impl<'s> Lowerer<'s> {
         match (source, statements) {
             (_, Some(statements)) => {
                 self.block(statements, 1, out);
-                // J86: a body that can run off its end returns `undefined`, as JS does (Python:
-                // `None`).
-                if !ends_in_exit(statements) {
+                if generator {
+                    // J89-4a: a body with no `yield` is still a generator, as `function*` is.
+                    if self.yields == 0 {
+                        if !ends_in_exit(statements) {
+                            out.push("    return".to_string());
+                        }
+                        out.push("    yield  # a function* is a generator".to_string());
+                    }
+                } else if !ends_in_exit(statements) {
+                    // J86: a body that can run off its end returns `undefined`, as JS does
+                    // (Python: `None`).
                     out.push("    return _JS_UNDEFINED".to_string());
                 }
                 if types::completes(statements) {
@@ -1258,8 +1436,16 @@ impl<'s> Lowerer<'s> {
             }
             (FnSource::Decl(_), None) => {}
         }
+        let writes = self.global_writes.pop().unwrap_or_default();
+        if !writes.is_empty() {
+            let names: Vec<String> = writes.iter().map(|n| self.globals[n].clone()).collect();
+            out.insert(def_at, format!("    global {}", names.join(", ")));
+        }
         self.rets.pop();
         self.pop_scope();
+        self.in_generator = saved_generator;
+        self.yields = saved_yields;
+        self.try_depth = saved_try;
     }
 
     /// J87: bind each parameter to what the body may assume of it: its annotation's fact in the
@@ -1481,6 +1667,17 @@ impl<'s> Lowerer<'s> {
             return Py::atom(caught.clone());
         }
         if self.scopes.iter().rev().any(|scope| scope.contains(name)) {
+            // J89-3: a Float64Array is only indexed, written by index and measured; any other
+            // read would hand its list of floats to code that takes it for a plain array.
+            if self
+                .var_key(name)
+                .is_some_and(|key| self.typed_arrays.contains(&key))
+            {
+                return self.refuse(
+                    span,
+                    "a Float64Array used as a value (only t[i], t[i] = v and t.length are accepted)",
+                );
+            }
             // J87: a `const` read anywhere its value can escape keeps no array contents.
             if !peeked
                 && let Some(key) = self.var_key(name)
@@ -1576,6 +1773,24 @@ impl<'s> Lowerer<'s> {
         }
     }
 
+    /// J89-3: the source name of the Float64Array binding `e` names, if it names one.
+    fn typed_array(&self, e: &Expression<'_>) -> Option<String> {
+        let Expression::Identifier(id) = strip(e) else {
+            return None;
+        };
+        let name = id.name.as_str();
+        if !self.is_scoped(name) {
+            return None;
+        }
+        let key = self.var_key(name)?;
+        self.typed_arrays.contains(&key).then(|| name.to_string())
+    }
+
+    /// J89-3: in the proven copy of a counted loop, `e` is its loop variable.
+    fn is_fast_index(&self, e: &Expression<'_>) -> bool {
+        matches!((strip(e), &self.fast), (Expression::Identifier(id), Some(fast)) if id.name == fast.var.as_str())
+    }
+
     fn is_scoped(&self, name: &str) -> bool {
         self.scopes.iter().any(|scope| scope.contains(name))
     }
@@ -1633,6 +1848,22 @@ impl<'s> Lowerer<'s> {
         match s {
             Statement::ExpressionStatement(e) => match &e.expression {
                 Expression::AssignmentExpression(a) => self.assignment(a, indent, out),
+                // J89-4a: `yield <value>;` in a module generator: Python's `yield`, whose value
+                // (what a `next(v)` would send) is discarded as the statement discards it.
+                // Not inside a `try`: a `break` out of a JS `for-of` closes the generator at once
+                // (its `finally` runs, no `catch` sees it), where Python closes it when it is
+                // collected, with a GeneratorExit raised at the `yield`.
+                Expression::YieldExpression(y)
+                    if self.in_generator
+                        && !y.delegate
+                        && y.argument.is_some()
+                        && self.try_depth == 0 =>
+                {
+                    let arg = y.argument.as_ref().expect("checked above");
+                    let value = self.expr(arg);
+                    self.yields += 1;
+                    out.push(format!("{p}yield {}", value.code));
+                }
                 Expression::UpdateExpression(u) => {
                     self.refuse(u.span, "update expression (++/--)");
                 }
@@ -1644,6 +1875,15 @@ impl<'s> Lowerer<'s> {
                 }
             },
             Statement::VariableDeclaration(v) => self.var_decl(v, indent, out),
+            // J89-4a: in a generator, `return;` ends it; a value it would return is refused (no
+            // compiled consumer reads it).
+            Statement::ReturnStatement(r) if self.in_generator => {
+                if r.argument.is_some() {
+                    self.refuse(r.span, "return with a value in a generator function");
+                } else {
+                    out.push(format!("{p}return"));
+                }
+            }
             Statement::ReturnStatement(r) => match &r.argument {
                 Some(arg) => {
                     let value = self.expr(arg);
@@ -1765,11 +2005,54 @@ impl<'s> Lowerer<'s> {
         }
     }
 
+    /// J89-2: `x++`, `++x`, `x--` or `--x` whose value is unused, `x` a local name: `x` becomes
+    /// `_js_inc(x)` / `_js_dec(x)` (ToNumeric, then plus or minus one: a string `"1"` becomes 2,
+    /// where `x += 1` would concatenate), or `_js_num(x + 1)` when `x` is proven a number.
+    fn update_stmt(&mut self, u: &UpdateExpression<'_>, indent: usize, out: &mut Vec<String>) {
+        let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &u.argument else {
+            self.refuse(u.span, "update of anything but a local name");
+            return;
+        };
+        let target = self.local_target(id.name.as_str(), id.span);
+        if !target.is_num {
+            self.check_carried(id.name.as_str(), &target);
+        }
+        let plus = u.operator == UpdateOperator::Increment;
+        let code = if target.is_num {
+            format!(
+                "_js_num({} {} 1)",
+                target.code,
+                if plus { "+" } else { "-" }
+            )
+        } else {
+            format!(
+                "{}({})",
+                if plus { "_js_inc" } else { "_js_dec" },
+                target.code
+            )
+        };
+        out.push(format!("{}{} = {code}", pad(indent), target.code));
+    }
+
     /// J87-3: `for (let i = a; test; i -= 1) body` -> `i = a` / `while test:` / body / update. The
     /// init must be a `let` declaration (or absent), the update an assignment (or absent). A
     /// `continue` that would leave the body is refused: in JS it runs the update, and a Python
     /// `continue` would skip it. Closures in the body are refused as in any loop.
     fn c_for(&mut self, f: &ForStatement<'_>, indent: usize, out: &mut Vec<String>) {
+        // J89-3: a counted loop over arrays it indexes by its variable gets a proven copy.
+        if let Some(plan) = self.fast_loop_plan(f) {
+            let Some(ForStatementInit::VariableDeclaration(v)) = &f.init else {
+                unreachable!("fast_loop_plan matched a let init")
+            };
+            self.var_decl(v, indent, out);
+            self.fast_loop(f, plan, indent, out);
+            return;
+        }
+        self.c_for_loop(f, indent, out);
+    }
+
+    /// `c_for` after its init: the loop itself.
+    fn c_for_loop(&mut self, f: &ForStatement<'_>, indent: usize, out: &mut Vec<String>) {
         let p = pad(indent);
         if f.init.is_none() && f.test.is_none() && f.update.is_none() {
             out.push(format!("{p}while True:"));
@@ -1780,6 +2063,9 @@ impl<'s> Lowerer<'s> {
         }
         match &f.init {
             None => {}
+            Some(ForStatementInit::VariableDeclaration(_)) if self.fast_init_done => {
+                self.fast_init_done = false;
+            }
             Some(ForStatementInit::VariableDeclaration(v))
                 if v.kind == VariableDeclarationKind::Let =>
             {
@@ -1793,9 +2079,16 @@ impl<'s> Lowerer<'s> {
                 return;
             }
         }
+        // J89-2: `i++` / `++i` / `i--` / `--i` as the update (its value unused): `i` becomes
+        // ToNumeric(i) + 1 (- 1), never a string concatenation (`_js_inc`).
+        enum Update<'b, 'a> {
+            Inc(&'b UpdateExpression<'a>),
+            Assign(&'b AssignmentExpression<'a>),
+        }
         let update = match &f.update {
             None => None,
-            Some(Expression::AssignmentExpression(a)) => Some(a),
+            Some(Expression::UpdateExpression(u)) => Some(Update::Inc(u)),
+            Some(Expression::AssignmentExpression(a)) => Some(Update::Assign(a)),
             Some(other) => {
                 self.refuse(
                     other.span(),
@@ -1804,20 +2097,524 @@ impl<'s> Lowerer<'s> {
                 return;
             }
         };
-        if continues_out(&f.body) {
-            self.refuse(f.span, "continue in a C-style for loop");
-            return;
-        }
         let test = match &f.test {
             Some(test) => self.condition(test),
             None => "True".to_string(),
         };
-        out.push(format!("{p}while {test}:"));
+        if !continues_out(&f.body) {
+            out.push(format!("{p}while {test}:"));
+            self.breaks.push(BreakTarget::Loop);
+            self.body(&f.body, indent + 1, out);
+            self.breaks.pop();
+            match update {
+                Some(Update::Inc(u)) => self.update_stmt(u, indent + 1, out),
+                Some(Update::Assign(a)) => self.assignment(a, indent + 1, out),
+                None => {}
+            }
+            return;
+        }
+        // J89-4a: a `continue` that leaves the body runs the update and then the test, as JS's
+        // `for` does. The update moves to the top of every iteration but the first, so a Python
+        // `continue` reaches it: `first = True` / `while True:` / `if first: first = False` /
+        // `else: <update>` / `if not (<test>): break` / the body.
+        let first = format!("_js_first{}", self.tmp);
+        self.tmp += 1;
+        let (inner, deep) = (pad(indent + 1), pad(indent + 2));
+        let mut body = Vec::new();
         self.breaks.push(BreakTarget::Loop);
-        self.body(&f.body, indent + 1, out);
+        self.body(&f.body, indent + 1, &mut body);
         self.breaks.pop();
-        if let Some(a) = update {
-            self.assignment(a, indent + 1, out);
+        let mut step = Vec::new();
+        match update {
+            Some(Update::Inc(u)) => self.update_stmt(u, indent + 2, &mut step),
+            Some(Update::Assign(a)) => self.assignment(a, indent + 2, &mut step),
+            None => {}
+        }
+        if step.is_empty() {
+            step.push(format!("{deep}pass"));
+        }
+        out.push(format!("{p}{first} = True"));
+        out.push(format!("{p}while True:"));
+        out.push(format!("{inner}if {first}:"));
+        out.push(format!("{deep}{first} = False"));
+        out.push(format!("{inner}else:"));
+        out.extend(step);
+        if test != "True" {
+            out.push(format!("{inner}if not ({test}):"));
+            out.push(format!("{deep}break"));
+        }
+        out.extend(body);
+    }
+
+    /// J89-3: `for (let i = a; i < b; i += 1) body` (or `i++` / `++i`) whose body can be proven
+    /// to index arrays only in range and read only numbers from them, given a check made once
+    /// before the loop: `i` is an int with `0 <= i`, `b` an int no larger than the length of every
+    /// array the body indexes by `i`, each plain array so read holds proven numbers over `[i, b)`
+    /// (`_js_doubles`), and each `const` or parameter the body uses as an operand of arithmetic or a
+    /// comparison is a proven number. Nothing in the body may change any of that: it assigns
+    /// neither `i`, nor `b`, nor those arrays, writes only Float64Array elements at `i` and locals,
+    /// pushes only onto fresh local arrays, and calls only adapters and `Math` functions (so no
+    /// compiled or caller code runs while it loops); no closure, no other member read, no nested
+    /// loop. `None`: the loop is lowered once, as before.
+    fn fast_loop_plan(&mut self, f: &ForStatement<'_>) -> Option<LoopPlan> {
+        let Some(ForStatementInit::VariableDeclaration(v)) = &f.init else {
+            return None;
+        };
+        if v.kind != VariableDeclarationKind::Let || v.declarations.len() != 1 {
+            return None;
+        }
+        let d = &v.declarations[0];
+        let BindingPattern::BindingIdentifier(id) = &d.id else {
+            return None;
+        };
+        d.init.as_ref()?;
+        let var = id.name.to_string();
+        // The test: `i < b`.
+        let Some(Expression::BinaryExpression(test)) = f.test.as_ref().map(strip) else {
+            return None;
+        };
+        if test.operator != BinaryOperator::LessThan
+            || !matches!(strip(&test.left), Expression::Identifier(l) if l.name == var.as_str())
+        {
+            return None;
+        }
+        // The update: `i += 1`, `i = i + 1`, `i++`, `++i`.
+        let one = |e: &Expression<'_>| matches!(strip(e), Expression::NumericLiteral(n) if n.value == 1.0);
+        let is_var = |e: &Expression<'_>| matches!(strip(e), Expression::Identifier(x) if x.name == var.as_str());
+        let update_ok = match f.update.as_ref() {
+            Some(Expression::UpdateExpression(u)) => {
+                u.operator == UpdateOperator::Increment
+                    && matches!(&u.argument, SimpleAssignmentTarget::AssignmentTargetIdentifier(x) if x.name == var.as_str())
+            }
+            Some(Expression::AssignmentExpression(a)) => {
+                let target = matches!(&a.left, AssignmentTarget::AssignmentTargetIdentifier(x) if x.name == var.as_str());
+                target
+                    && match a.operator {
+                        AssignmentOperator::Addition => one(&a.right),
+                        AssignmentOperator::Assign => {
+                            matches!(strip(&a.right), Expression::BinaryExpression(b) if b.operator == BinaryOperator::Addition && is_var(&b.left) && one(&b.right))
+                        }
+                        _ => false,
+                    }
+            }
+            _ => false,
+        };
+        if !update_ok {
+            return None;
+        }
+        let mut scan = LoopScan {
+            var: var.clone(),
+            ..LoopScan::default()
+        };
+        if !self.scan_stmt(&f.body, &mut scan) || scan.assigned.contains(&var) {
+            return None;
+        }
+        // The bound: a name the body does not assign, a literal, or a Float64Array's length.
+        let (bound, bound_name) = match strip(&test.right) {
+            Expression::Identifier(b) => {
+                let name = b.name.to_string();
+                if name == var
+                    || scan.assigned.contains(&name)
+                    || scan.declared.contains(&name)
+                    || !(self.is_scoped(&name) || self.module_consts.contains(&name))
+                    || self.typed_array(&test.right).is_some()
+                {
+                    return None;
+                }
+                let py = if self.is_scoped(&name) {
+                    py_name(&name, false, false)
+                } else {
+                    self.globals.get(&name)?.clone()
+                };
+                (py, Some(py_name(&name, false, false)))
+            }
+            Expression::NumericLiteral(n) if n.value >= 0.0 && n.value.fract() == 0.0 => {
+                (py_number(n.value)?, None)
+            }
+            Expression::StaticMemberExpression(m) if m.property.name == "length" => {
+                let name = self.typed_array(&m.object)?;
+                (format!("len({})", py_name(&name, false, false)), None)
+            }
+            _ => return None,
+        };
+        for x in &scan.plain {
+            if scan.assigned.contains(x)
+                || scan.declared.contains(x)
+                || scan.pushed.contains(x)
+                || scan.filled.contains(x)
+                || !self.is_scoped(x)
+            {
+                return None;
+            }
+        }
+        for x in &scan.filled {
+            if scan.assigned.contains(x) || scan.declared.contains(x) || scan.pushed.contains(x) {
+                return None;
+            }
+        }
+        // Each operand name the body neither declares nor assigns is checked a number before the
+        // loop, unless it is one already.
+        let mut speculated = Vec::new();
+        let mut carried = Vec::new();
+        for name in &scan.numeric {
+            if *name == var || scan.declared.contains(name) || !self.is_scoped(name) {
+                continue;
+            }
+            if scan.assigned.contains(name) {
+                carried.push(name.clone());
+                continue;
+            }
+            let key = self.var_key(name)?;
+            let proven = self.current(&key).is_some_and(|f| f.num && !f.top);
+            if !proven {
+                speculated.push(name.clone());
+            }
+        }
+        if scan.typed.is_empty()
+            && scan.plain.is_empty()
+            && scan.filled.is_empty()
+            && speculated.is_empty()
+        {
+            return None;
+        }
+        Some(LoopPlan {
+            var,
+            bound,
+            bound_name,
+            typed: scan.typed.into_iter().collect(),
+            plain: scan.plain.into_iter().collect(),
+            filled: scan.filled.into_iter().collect(),
+            speculated,
+            carried,
+            declared: scan.declared,
+        })
+    }
+
+    /// J89-3: the counted loop `plan` describes, twice: under its guard, as a Python `for` over a
+    /// `range` whose body reads and writes the arrays directly (the proven copy, lowered under the
+    /// facts the guard checked); otherwise the general loop `c_for_loop` lowers, unchanged. The
+    /// init is already emitted.
+    fn fast_loop(
+        &mut self,
+        f: &ForStatement<'_>,
+        plan: LoopPlan,
+        indent: usize,
+        out: &mut Vec<String>,
+    ) {
+        let start = out.len();
+        let refusals = self.refusals.len();
+        if plan.carried.is_empty() || !self.fast_copy(f, &plan, true, indent, out) {
+            out.truncate(start);
+            self.fast_copy(f, &plan, false, indent, out);
+        }
+        // A refusal in the copy is one the general loop below records too.
+        self.refusals.truncate(refusals);
+        out.push(format!("{}else:", pad(indent)));
+        self.fast_init_done = true;
+        self.c_for_loop(f, indent + 1, out);
+        self.fast_init_done = false;
+    }
+
+    /// J89-3: the guard and the proven copy of `fast_loop`. With `carry`, the outer `let`s the body
+    /// assigns are checked numbers before the loop too and read as numbers inside it; false when an
+    /// assignment in the copy then gives one a value not proven a number (the caller lowers the
+    /// copy again without them).
+    fn fast_copy(
+        &mut self,
+        f: &ForStatement<'_>,
+        plan: &LoopPlan,
+        carry: bool,
+        indent: usize,
+        out: &mut Vec<String>,
+    ) -> bool {
+        let p = pad(indent);
+        let i = py_name(&plan.var, false, false);
+        let b = plan.bound.clone();
+        let mut guard = vec![format!("type({i}) is int"), format!("0 <= {i}")];
+        if plan.bound_name.is_some() {
+            guard.push(format!("type({b}) is int"));
+        }
+        for t in &plan.typed {
+            guard.push(format!("{b} <= len({})", py_name(t, false, false)));
+        }
+        for x in &plan.plain {
+            let x = py_name(x, false, false);
+            guard.push(format!("type({x}) is list"));
+            guard.push(format!("{b} <= len({x})"));
+            guard.push(format!("_js_doubles({x}, {i}, {b})"));
+        }
+        for x in &plan.filled {
+            let x = py_name(x, false, false);
+            guard.push(format!("type({x}) is list"));
+            guard.push(format!("{b} <= len({x})"));
+        }
+        let carried: Vec<String> = if carry {
+            plan.carried.clone()
+        } else {
+            Vec::new()
+        };
+        for v in plan.speculated.iter().chain(&carried) {
+            guard.push(format!("_js_is_double({})", py_name(v, false, false)));
+        }
+        out.push(format!("{p}if {}:", guard.join(" and ")));
+        // The loop starts at the value the init gave `i` (a Python `range` reads it once).
+        out.push(format!(
+            "{}for {i} in range({i}, {b}):  # noqa: B020",
+            pad(indent + 1)
+        ));
+        let saved = self.fast.replace(FastLoop {
+            span: f.span.start,
+            declared: plan.declared.clone(),
+            var: plan.var.clone(),
+            typed: plan.typed.iter().cloned().collect(),
+            plain: plan.plain.iter().cloned().collect(),
+            filled: plan.filled.iter().cloned().collect(),
+            carried: carried.iter().cloned().collect(),
+        });
+        let depth = self.narrow.len();
+        let mut narrowed = vec![plan.var.clone()];
+        narrowed.extend(plan.speculated.iter().cloned());
+        narrowed.extend(carried.iter().cloned());
+        for name in &narrowed {
+            if let Some(key) = self.var_key(name) {
+                self.narrow.push((key, Fact::num()));
+            }
+        }
+        let failed = std::mem::replace(&mut self.fast_carry_failed, false);
+        self.breaks.push(BreakTarget::Loop);
+        self.body(&f.body, indent + 2, out);
+        self.breaks.pop();
+        let ok = !std::mem::replace(&mut self.fast_carry_failed, failed);
+        self.narrow.truncate(depth);
+        self.fast = saved;
+        ok
+    }
+
+    /// J89-3: in the proven copy of a counted loop, `name` (assigned `value`) is a carried `let`:
+    /// the copy holds only if `value` is a proven number.
+    fn check_carried(&mut self, name: &str, value: &Py) {
+        if self.fast.as_ref().is_some_and(|f| f.carried.contains(name))
+            && !(value.is_num && value.is_double)
+        {
+            self.fast_carry_failed = true;
+        }
+    }
+
+    /// J89-3: `fast_loop_plan`'s walk of a statement of the loop body; false for anything outside
+    /// what a proven copy may hold.
+    fn scan_stmt(&self, s: &Statement<'_>, sc: &mut LoopScan) -> bool {
+        match s {
+            Statement::BlockStatement(b) => b.body.iter().all(|s| self.scan_stmt(s, sc)),
+            Statement::EmptyStatement(_) => true,
+            Statement::BreakStatement(b) => b.label.is_none(),
+            Statement::ReturnStatement(r) => r
+                .argument
+                .as_ref()
+                .is_none_or(|e| self.scan_expr(e, sc, false)),
+            Statement::IfStatement(i) => {
+                self.scan_expr(&i.test, sc, false)
+                    && self.scan_stmt(&i.consequent, sc)
+                    && i.alternate.as_ref().is_none_or(|a| self.scan_stmt(a, sc))
+            }
+            Statement::VariableDeclaration(v) => {
+                matches!(
+                    v.kind,
+                    VariableDeclarationKind::Let | VariableDeclarationKind::Const
+                ) && v.declarations.iter().all(|d| {
+                    let BindingPattern::BindingIdentifier(id) = &d.id else {
+                        return false;
+                    };
+                    if id.name.as_str() == sc.var {
+                        return false;
+                    }
+                    sc.declared.insert(id.name.to_string());
+                    d.init.as_ref().is_none_or(|e| self.scan_expr(e, sc, false))
+                })
+            }
+            Statement::ExpressionStatement(x) => match strip(&x.expression) {
+                Expression::AssignmentExpression(a) => self.scan_assign(a, sc),
+                Expression::UpdateExpression(u) => match &u.argument {
+                    SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                        sc.assigned.insert(id.name.to_string());
+                        true
+                    }
+                    _ => false,
+                },
+                Expression::CallExpression(c) => self.scan_call(c, sc),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    fn scan_assign(&self, a: &AssignmentExpression<'_>, sc: &mut LoopScan) -> bool {
+        let numeric = a.operator != AssignmentOperator::Assign;
+        match &a.left {
+            AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                if !matches!(
+                    a.operator,
+                    AssignmentOperator::Assign
+                        | AssignmentOperator::Addition
+                        | AssignmentOperator::Subtraction
+                        | AssignmentOperator::Multiplication
+                ) {
+                    return false;
+                }
+                sc.assigned.insert(id.name.to_string());
+                self.scan_expr(&a.right, sc, numeric)
+            }
+            AssignmentTarget::ComputedMemberExpression(m) => {
+                let at_var = matches!(strip(&m.expression), Expression::Identifier(x) if x.name == sc.var.as_str());
+                if a.operator != AssignmentOperator::Assign || !at_var {
+                    return false;
+                }
+                if let Some(name) = self.typed_array(&m.object) {
+                    sc.typed.insert(name);
+                    return self.scan_expr(&a.right, sc, true);
+                }
+                // A fresh local array's element at `i`, in range: a plain store.
+                let Expression::Identifier(object) = strip(&m.object) else {
+                    return false;
+                };
+                let name = object.name.as_str();
+                if !self.is_scoped(name)
+                    || !self
+                        .var_key(name)
+                        .is_some_and(|k| self.fresh_arrays.contains(&k))
+                {
+                    return false;
+                }
+                sc.filled.insert(name.to_string());
+                self.scan_expr(&a.right, sc, false)
+            }
+            _ => false,
+        }
+    }
+
+    fn scan_call(&self, c: &CallExpression<'_>, sc: &mut LoopScan) -> bool {
+        if c.optional {
+            return false;
+        }
+        let args_ok = |this: &Self, sc: &mut LoopScan, numeric: bool| {
+            c.arguments.iter().all(|a| match a.as_expression() {
+                Some(e) => this.scan_expr(e, sc, numeric),
+                None => false,
+            })
+        };
+        match strip(&c.callee) {
+            Expression::Identifier(id)
+                if self.adapter_fns.contains(id.name.as_str())
+                    && !self.is_scoped(id.name.as_str()) =>
+            {
+                args_ok(self, sc, false)
+            }
+            Expression::StaticMemberExpression(m) => {
+                let Expression::Identifier(object) = strip(&m.object) else {
+                    return false;
+                };
+                let name = object.name.as_str();
+                if name == "Math" && !self.is_local("Math") {
+                    let pure = [
+                        "max", "min", "abs", "floor", "ceil", "trunc", "round", "sign", "sqrt",
+                    ];
+                    return pure.contains(&m.property.name.as_str()) && args_ok(self, sc, true);
+                }
+                if m.property.name == "push"
+                    && c.arguments.len() == 1
+                    && self.is_scoped(name)
+                    && self
+                        .var_key(name)
+                        .is_some_and(|k| self.fresh_arrays.contains(&k))
+                {
+                    sc.pushed.insert(name.to_string());
+                    return args_ok(self, sc, false);
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// `numeric`: `e` is an operand of arithmetic or a comparison (or a value stored into a
+    /// Float64Array), so a name there is checked a number before the loop.
+    fn scan_expr(&self, e: &Expression<'_>, sc: &mut LoopScan, numeric: bool) -> bool {
+        use BinaryOperator as Op;
+        match e {
+            Expression::NumericLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::StringLiteral(_) => true,
+            Expression::Identifier(id) => {
+                let name = id.name.as_str();
+                if self.typed_array(e).is_some() {
+                    return false;
+                }
+                if numeric {
+                    sc.numeric.insert(name.to_string());
+                }
+                true
+            }
+            Expression::ParenthesizedExpression(x) => self.scan_expr(&x.expression, sc, numeric),
+            Expression::TSNonNullExpression(x) => self.scan_expr(&x.expression, sc, numeric),
+            Expression::TSAsExpression(x) => self.scan_expr(&x.expression, sc, numeric),
+            Expression::TSSatisfiesExpression(x) => self.scan_expr(&x.expression, sc, numeric),
+            Expression::BinaryExpression(b) => {
+                let numeric_op = matches!(
+                    b.operator,
+                    Op::Addition
+                        | Op::Subtraction
+                        | Op::Multiplication
+                        | Op::Division
+                        | Op::Remainder
+                        | Op::LessThan
+                        | Op::LessEqualThan
+                        | Op::GreaterThan
+                        | Op::GreaterEqualThan
+                );
+                let eq = matches!(b.operator, Op::StrictEquality | Op::StrictInequality);
+                (numeric_op || eq)
+                    && self.scan_expr(&b.left, sc, numeric_op)
+                    && self.scan_expr(&b.right, sc, numeric_op)
+            }
+            Expression::LogicalExpression(l) => {
+                self.scan_expr(&l.left, sc, false) && self.scan_expr(&l.right, sc, false)
+            }
+            Expression::UnaryExpression(u) => match u.operator {
+                UnaryOperator::LogicalNot => self.scan_expr(&u.argument, sc, false),
+                UnaryOperator::UnaryNegation => self.scan_expr(&u.argument, sc, true),
+                _ => false,
+            },
+            Expression::ConditionalExpression(c) => {
+                self.scan_expr(&c.test, sc, false)
+                    && self.scan_expr(&c.consequent, sc, numeric)
+                    && self.scan_expr(&c.alternate, sc, numeric)
+            }
+            Expression::ComputedMemberExpression(m) => {
+                if m.optional {
+                    return false;
+                }
+                let at_var = matches!(strip(&m.expression), Expression::Identifier(x) if x.name == sc.var.as_str());
+                if let Some(name) = self.typed_array(&m.object) {
+                    if at_var {
+                        sc.typed.insert(name);
+                        return true;
+                    }
+                    return self.scan_expr(&m.expression, sc, false);
+                }
+                let Expression::Identifier(object) = strip(&m.object) else {
+                    return false;
+                };
+                if !at_var {
+                    return false;
+                }
+                sc.plain.insert(object.name.to_string());
+                true
+            }
+            Expression::StaticMemberExpression(m) => {
+                !m.optional && m.property.name == "length" && self.typed_array(&m.object).is_some()
+            }
+            Expression::CallExpression(c) => self.scan_call(c, sc),
+            _ => false,
         }
     }
 
@@ -1827,6 +2624,12 @@ impl<'s> Lowerer<'s> {
     /// the `try` statement, outside the `except`, so nothing it raises is chained to what was
     /// caught: a JS throw carries no implicit cause. `finally` is refused.
     fn try_stmt(&mut self, t: &TryStatement<'_>, indent: usize, out: &mut Vec<String>) {
+        self.try_depth += 1;
+        self.try_stmt_inner(t, indent, out);
+        self.try_depth -= 1;
+    }
+
+    fn try_stmt_inner(&mut self, t: &TryStatement<'_>, indent: usize, out: &mut Vec<String>) {
         // J88-2: `finally` is Python's own: the try (and its catch) inside `try:`, the finalizer
         // under `finally:`. Both run it on a normal end, a return, a break and a throw, and a
         // `return` inside the finalizer replaces the completion in both.
@@ -1934,6 +2737,50 @@ impl<'s> Lowerer<'s> {
             {
                 self.consts.insert(key);
             }
+            // J89-3: `const t = new Float64Array(n)`: a list of floats (SUBSET.md, *Typed arrays*).
+            if let Some(Expression::NewExpression(n)) = d.init.as_ref().map(strip)
+                && matches!(strip(&n.callee), Expression::Identifier(c) if c.name == "Float64Array")
+                && !self.is_local("Float64Array")
+            {
+                if v.kind != VariableDeclarationKind::Const {
+                    self.refuse(d.span, "a Float64Array bound by anything but a const");
+                    continue;
+                }
+                let length = match n.arguments.as_slice() {
+                    [arg] => match arg.as_expression() {
+                        Some(e) => self.expr(e),
+                        None => {
+                            self.refuse(n.span, "new Float64Array of a spread");
+                            continue;
+                        }
+                    },
+                    _ => {
+                        self.refuse(n.span, "argument count for new Float64Array");
+                        continue;
+                    }
+                };
+                if let Some(key) = self.var_key(id.name.as_str()) {
+                    self.typed_arrays.insert(key);
+                }
+                self.bind_decl(id.name.as_str(), Fact::default());
+                out.push(format!("{p}{name} = _js_f64_new({})", length.code));
+                continue;
+            }
+            // J89-3: a `const` of an array literal or of `.slice(...)`'s answer holds an array (or,
+            // from `.slice`, a string) that no parameter can alias.
+            let fresh = match d.init.as_ref().map(strip) {
+                Some(Expression::ArrayExpression(_)) => true,
+                Some(Expression::CallExpression(c)) => {
+                    matches!(strip(&c.callee), Expression::StaticMemberExpression(m) if m.property.name == "slice")
+                }
+                _ => false,
+            };
+            if fresh
+                && v.kind == VariableDeclarationKind::Const
+                && let Some(key) = self.var_key(id.name.as_str())
+            {
+                self.fresh_arrays.insert(key);
+            }
             // J86: `const f = (...) => ...` inside a function is a nested `def` (a closure).
             if let (Some(Expression::ArrowFunctionExpression(a)), VariableDeclarationKind::Const) =
                 (&d.init, v.kind)
@@ -1998,6 +2845,7 @@ impl<'s> Lowerer<'s> {
             let mut names = Vec::new();
             for id in targets {
                 names.push(self.local_target(id.name.as_str(), id.span).code);
+                self.check_carried(id.name.as_str(), &value);
                 self.bind(id.name.as_str(), value.fact());
             }
             out.push(format!("{p}{} = {}", names.join(" = "), value.code));
@@ -2017,6 +2865,7 @@ impl<'s> Lowerer<'s> {
             AssignmentTarget::AssignmentTargetIdentifier(id) => {
                 let target = self.local_target(id.name.as_str(), id.span);
                 let value = self.assigned_value(op, target.clone(), &a.right);
+                self.check_carried(id.name.as_str(), &value);
                 self.bind(id.name.as_str(), value.fact());
                 out.push(format!("{p}{} = {}", target.code, value.code));
             }
@@ -2026,6 +2875,12 @@ impl<'s> Lowerer<'s> {
                 let target = self.this_member(m.property.name.as_str(), m.span);
                 let value = self.assigned_value(op, target.clone(), &a.right);
                 out.push(format!("{p}{} = {}", target.code, value.code));
+            }
+            // J89-4a: `re.lastIndex = n` (a `g` regex's position): the subset models no
+            // `lastIndex` (`.test` / `.exec` on a `g` regex raise at run time), so the write that
+            // would set one is refused where it is written.
+            AssignmentTarget::StaticMemberExpression(m) if m.property.name == "lastIndex" => {
+                self.refuse(a.span, "assignment to lastIndex");
             }
             AssignmentTarget::StaticMemberExpression(m) => {
                 if op.is_some() {
@@ -2057,6 +2912,41 @@ impl<'s> Lowerer<'s> {
                     value.code
                 ));
             }
+            AssignmentTarget::ComputedMemberExpression(m)
+                if self.typed_array(&m.object).is_some() =>
+            {
+                // J89-3: a Float64Array element stores ToNumber of the value, as a float, and only
+                // at a valid index (`_js_ta_put`); in the proven copy of a counted loop, at the loop
+                // variable, the store itself.
+                let name = self.typed_array(&m.object).unwrap();
+                let py = py_name(&name, false, false);
+                if op.is_some() {
+                    self.refuse(a.span, "compound assignment to a Float64Array element");
+                    return;
+                }
+                if self.is_fast_index(&m.expression)
+                    && self.fast.as_ref().is_some_and(|f| f.typed.contains(&name))
+                {
+                    let var = py_name(&self.fast.as_ref().unwrap().var, false, false);
+                    let value = self.expr(&a.right);
+                    if value.is_f64 && !value.top {
+                        out.push(format!("{p}{py}[{var}] = {}", value.code));
+                    } else if value.is_num && value.is_double && !value.top {
+                        out.push(format!("{p}{py}[{var}] = float({})", value.code));
+                    } else {
+                        self.tmp += 1;
+                        let t = format!("_js_t{}", self.tmp);
+                        out.push(format!("{p}{t} = {}", value.code));
+                        out.push(format!(
+                            "{p}{py}[{var}] = {t} if type({t}) is float else _js_to_f64({t})"
+                        ));
+                    }
+                    return;
+                }
+                let key = self.expr(&m.expression);
+                let value = self.expr(&a.right);
+                out.push(format!("{p}_js_ta_put({py}, {}, {})", key.code, value.code));
+            }
             AssignmentTarget::ComputedMemberExpression(m) => {
                 if op.is_some() {
                     // J88-2: `o[k] op= v` with a local object and a local or literal key.
@@ -2081,6 +2971,21 @@ impl<'s> Lowerer<'s> {
                         "{p}_js_put({}, {}, {})",
                         object.code, key.code, value.code
                     ));
+                    return;
+                }
+                // J89-3: in the proven copy of a counted loop, a fresh array its guard checked long
+                // enough, at the loop variable: the store itself.
+                if self.is_fast_index(&m.expression)
+                    && let Expression::Identifier(id) = strip(&m.object)
+                    && self
+                        .fast
+                        .as_ref()
+                        .is_some_and(|f| f.filled.contains(id.name.as_str()))
+                {
+                    let py = py_name(id.name.as_str(), false, false);
+                    let var = py_name(&self.fast.as_ref().unwrap().var, false, false);
+                    let value = self.expr(&a.right);
+                    out.push(format!("{p}{py}[{var}] = {}", value.code));
                     return;
                 }
                 let object = self.expr(&m.object);
@@ -2126,7 +3031,12 @@ impl<'s> Lowerer<'s> {
         };
         let right = match frozen {
             Some(id) => self.global_read(id.name.as_str(), id.span, false),
-            None => self.expr(&f.right),
+            None => {
+                self.generator_call_ok = matches!(strip(&f.right), Expression::CallExpression(_));
+                let value = self.expr(&f.right);
+                self.generator_call_ok = false;
+                value
+            }
         };
         // J87: what each element is: a string iterates by code point (each a `str`).
         let element = if right.top {
@@ -2149,6 +3059,9 @@ impl<'s> Lowerer<'s> {
                         Some(BindingPattern::BindingIdentifier(id)) => {
                             names.push(py_name(id.name.as_str(), false, false))
                         }
+                        // J89-4a: a hole (`[, p]`) binds nothing (each named element is read by
+                        // its index, as before).
+                        None => names.push("_js_hole".to_string()),
                         _ => {
                             self.refuse(a.span, "destructuring pattern");
                             return;
@@ -2189,7 +3102,9 @@ impl<'s> Lowerer<'s> {
                     self.tmp += 1;
                     out.push(format!("{p}for {item} in {}:", right.code));
                     for (i, name) in names.iter().enumerate() {
-                        out.push(format!("{}{name} = _js_get({item}, {i})", pad(indent + 1)));
+                        if name != "_js_hole" {
+                            out.push(format!("{}{name} = _js_get({item}, {i})", pad(indent + 1)));
+                        }
                     }
                 }
             }
@@ -2225,9 +3140,12 @@ impl<'s> Lowerer<'s> {
             Expression::NumericLiteral(n) => match py_number(n.value) {
                 Some(code) => {
                     let prec = if code.starts_with('-') { UNARY } else { ATOM };
+                    // J89-3: a literal Python spells as a float (`0.75`, `-0.0`, `1e+21`).
+                    let is_f64 = code.contains(['.', 'e']);
                     Py {
                         is_num: true,
                         is_double: true,
+                        is_f64,
                         pure: true,
                         ..Py::new(code, prec)
                     }
@@ -2284,6 +3202,18 @@ impl<'s> Lowerer<'s> {
                 if self.is_process_env(&m.object) {
                     let key = py_str(m.property.name.as_str());
                     return self.process_env_read(key);
+                }
+                // J89-3: a Float64Array's `.length` (fixed when it is made); nothing else of it.
+                if let Some(name) = self.typed_array(&m.object) {
+                    if m.property.name != "length" {
+                        let construct = format!("a Float64Array's .{}", m.property.name);
+                        return self.refuse(m.span, construct);
+                    }
+                    let py = py_name(&name, false, false);
+                    return Py {
+                        pure: true,
+                        ..returned(Ret::Num, format!("len({py})"))
+                    };
                 }
                 // J88-2: `process.env` itself as a value (a default parameter): a snapshot of the
                 // environment taken where it is read (`process_env_all`), which a read-only use
@@ -2384,6 +3314,40 @@ impl<'s> Lowerer<'s> {
                 if self.is_process_env(&m.object) {
                     let key = self.expr(&m.expression);
                     return self.process_env_read(key.code);
+                }
+                // J89-3: an element of a Float64Array: a float, or `undefined` for a key that is
+                // not a valid index (`_js_ta_get`); in the proven copy of a counted loop, at the
+                // loop variable, the element itself.
+                if let Some(name) = self.typed_array(&m.object) {
+                    let py = py_name(&name, false, false);
+                    if self.is_fast_index(&m.expression)
+                        && self.fast.as_ref().is_some_and(|f| f.typed.contains(&name))
+                    {
+                        let var = py_name(&self.fast.as_ref().unwrap().var, false, false);
+                        return Py {
+                            pure: true,
+                            ..Py::atom(format!("{py}[{var}]")).with_fact(Some(&Fact::f64()))
+                        };
+                    }
+                    let key = self.expr(&m.expression);
+                    return Py::atom(format!("_js_ta_get({py}, {})", key.code))
+                        .with_fact(Some(&Fact::or_undefined(Fact::f64())));
+                }
+                // J89-3: in the proven copy of a counted loop, an element of a plain array its guard
+                // checked (`_js_doubles`): a proven number.
+                if self.is_fast_index(&m.expression)
+                    && let Expression::Identifier(id) = strip(&m.object)
+                    && self
+                        .fast
+                        .as_ref()
+                        .is_some_and(|f| f.plain.contains(id.name.as_str()))
+                {
+                    let py = py_name(id.name.as_str(), false, false);
+                    let var = py_name(&self.fast.as_ref().unwrap().var, false, false);
+                    return Py {
+                        pure: true,
+                        ..Py::atom(format!("{py}[{var}]")).with_fact(Some(&Fact::num()))
+                    };
                 }
                 // A literal key is a name (`xs['map']`); a computed one is checked at run time
                 // (`_js_get` raises on a method name the receiver's JS type carries).
@@ -2688,7 +3652,10 @@ impl<'s> Lowerer<'s> {
         for element in &a.elements {
             match element {
                 ArrayExpressionElement::SpreadElement(s) => {
+                    self.generator_call_ok =
+                        matches!(strip(&s.argument), Expression::CallExpression(_));
                     let value = self.expr(&s.argument);
+                    self.generator_call_ok = false;
                     items.push(format!("*{}", value.at(ATOM)));
                     spread = true;
                 }
@@ -2857,6 +3824,13 @@ impl<'s> Lowerer<'s> {
                 let left = self.expr(&b.left);
                 let right = self.expr(&b.right);
                 returned(Ret::Num, format!("_js_shl({}, {})", left.code, right.code))
+            }
+            // J89-4a: `a >> b`, the sign-propagating shift (`_js_sar`: ToInt32 of the left, the
+            // count mod 32; a Python `>>` of an int in Int32 range is the same arithmetic shift).
+            Op::ShiftRight => {
+                let left = self.expr(&b.left);
+                let right = self.expr(&b.right);
+                returned(Ret::Num, format!("_js_sar({}, {})", left.code, right.code))
             }
             // J86: `key in obj`, own keys plus what Object.prototype supplies.
             Op::In => {
@@ -3049,6 +4023,7 @@ impl<'s> Lowerer<'s> {
         callback: Option<usize>,
         spread_ok: bool,
     ) -> Option<Vec<Py>> {
+        let spread_list = std::mem::take(&mut self.spread_list);
         let mut out = Vec::new();
         for (i, arg) in args.iter().enumerate() {
             let Some(e) = arg.as_expression() else {
@@ -3057,6 +4032,10 @@ impl<'s> Lowerer<'s> {
                 {
                     // J86: `a.push(...xs)` spreads any iterable, as a Python `*xs` does.
                     let value = self.expr(&spread.argument);
+                    if spread_list && !value.is_list {
+                        self.refuse(spread.span, "spread of a value not proven an array");
+                        return None;
+                    }
                     out.push(Py::atom(format!("*{}", value.at(ATOM))));
                     continue;
                 }
@@ -3071,7 +4050,8 @@ impl<'s> Lowerer<'s> {
                     // them (the rest JS passes are ignored by a function that declares none).
                     Expression::Identifier(id)
                         if !self.is_scoped(id.name.as_str())
-                            && self.sigs.contains_key(id.name.as_str()) =>
+                            && self.sigs.contains_key(id.name.as_str())
+                            && !self.generator_fns.contains(id.name.as_str()) =>
                     {
                         let n = self.sigs[id.name.as_str()].params.len();
                         let callee = self.resolve(id.name.as_str(), id.span);
@@ -3170,6 +4150,13 @@ impl<'s> Lowerer<'s> {
         self.push_scope(scope, a.span.start);
         for name in callback_params {
             self.bind(&name, Fact::default());
+        }
+        // J89-5: an annotated parameter declares its data fields (`(o: Omission) => o.count`), as
+        // a function's parameter does (`bind_params`).
+        for p in &a.params.items {
+            if let BindingPattern::BindingIdentifier(id) = &p.pattern {
+                self.declare_annotation(id.name.as_str(), p.type_annotation.as_deref());
+            }
         }
         self.rets.push(None);
         self.in_callback += 1;
@@ -3356,12 +4343,21 @@ impl<'s> Lowerer<'s> {
     fn call(&mut self, c: &CallExpression<'_>) -> Py {
         // J87: the call is a whole expression statement (its value is discarded).
         let as_statement = std::mem::take(&mut self.statement_call);
+        let generator_ok = std::mem::take(&mut self.generator_call_ok);
         if c.optional {
             return self.refuse(c.span, "optional call");
         }
         match strip(&c.callee) {
             Expression::Identifier(id) => {
                 let name = id.name.as_str();
+                // J89-4a: a generator's object is iterated where it is made, so it is never held
+                // (a JS `break` closes it; a Python one leaves it open to be iterated again).
+                if !generator_ok && !self.is_scoped(name) && self.generator_fns.contains(name) {
+                    return self.refuse(
+                        c.span,
+                        "generator function called anywhere but as a for-of's iterable or an array spread",
+                    );
+                }
                 if !self.is_local(name)
                     && let Some(&(_, helper, min, max, ret)) =
                         GLOBAL_CALLS.iter().find(|(n, ..)| *n == name)
@@ -3459,6 +4455,16 @@ impl<'s> Lowerer<'s> {
                     && let Expression::NewExpression(n) = strip(&m.object)
                     && matches!(strip(&n.callee), Expression::Identifier(d) if d.name == "Date")
                     && !self.is_local("Date")
+                    && n.arguments.is_empty()
+                {
+                    // J89-4a: `new Date().toISOString()` is the clock now: `new Date(Date.now())`.
+                    return returned(Ret::Str, "_js_date_to_iso(_js_now())".to_string());
+                }
+                if method == "toISOString"
+                    && c.arguments.is_empty()
+                    && let Expression::NewExpression(n) = strip(&m.object)
+                    && matches!(strip(&n.callee), Expression::Identifier(d) if d.name == "Date")
+                    && !self.is_local("Date")
                     && n.arguments.len() == 1
                 {
                     let Some(args) = self.args(&n.arguments, None, false) else {
@@ -3483,7 +4489,8 @@ impl<'s> Lowerer<'s> {
                     return Py::atom(format!("{py}.{method}({})", args.join(", ")));
                 }
                 let builtin = METHODS.iter().find(|(name, ..)| *name == method);
-                let class_method = self.ctx.class_methods.contains(method);
+                let class_method = self.ctx.class_methods.contains(method)
+                    || self.imported_methods.contains(method);
                 let Some(&(_, min, max, callback, ret)) = builtin else {
                     if class_method {
                         // J86: a method a compiled class (or an adapter class) declares.
@@ -3516,12 +4523,47 @@ impl<'s> Lowerer<'s> {
                     }
                     _ => callback,
                 };
+                // J89-3: `xs.sort((a, b) => t[b] - t[a] || a - b)` (or `t[a] - t[b]`) for `t` a
+                // Float64Array: a key sort when the items allow it (`_js_sort_by_f64`), else the
+                // general sort with the same comparator.
+                let by_key = if method == "sort" && c.arguments.len() == 1 {
+                    c.arguments[0]
+                        .as_expression()
+                        .and_then(|e| self.key_comparator(e))
+                } else {
+                    None
+                };
                 let receiver = self.expr(&m.object);
-                let Some(args) = self.args_py(&c.arguments, callback, method == "push") else {
+                // J89-4a: `a.splice(start, count, ...xs)`, `xs` proven a list.
+                let splice_spread = method == "splice";
+                self.spread_list = splice_spread;
+                let lowered =
+                    self.args_py(&c.arguments, callback, method == "push" || splice_spread);
+                let Some(args) = lowered else {
                     return Py::atom("None");
                 };
+                let spread = c
+                    .arguments
+                    .iter()
+                    .any(|a| matches!(a, Argument::SpreadElement(_)));
+                if let Some((keys, descending)) = by_key {
+                    let code = format!(
+                        "_js_sort_by_f64({}, {}, {}, {})",
+                        receiver.code,
+                        py_name(&keys, false, false),
+                        if descending { "True" } else { "False" },
+                        args[0].code
+                    );
+                    let result = returned(Ret::List, code);
+                    return if receiver.top {
+                        result.with_fact(None)
+                    } else {
+                        result
+                    };
+                }
                 let optimistic = receiver.top || args.iter().any(|a| a.top);
                 if !optimistic
+                    && !spread
                     && (class_method || (args.len() >= min && args.len() <= max))
                     && let Some(fast) =
                         self.fast_method(method, &receiver, &args, as_statement, c, &m.object)
@@ -3546,6 +4588,71 @@ impl<'s> Lowerer<'s> {
                 result
             }
             other => self.refuse(other.span(), "call of a computed callee"),
+        }
+    }
+
+    /// J89-3: `(a, b) => t[b] - t[a] || a - b` (descending, `true`) or `(a, b) => t[a] - t[b] ||
+    /// a - b` for `t` a Float64Array in scope (non-null assertions and parentheses allowed): the
+    /// array's name and the direction. Any other comparator is not a key sort.
+    fn key_comparator(&self, e: &Expression<'_>) -> Option<(String, bool)> {
+        let Expression::ArrowFunctionExpression(arrow) = strip(e) else {
+            return None;
+        };
+        if arrow.r#async || arrow.params.items.len() != 2 || arrow.params.rest.is_some() {
+            return None;
+        }
+        let param = |k: usize| match &arrow.params.items[k].pattern {
+            BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+            _ => None,
+        };
+        let (a, b) = (param(0)?, param(1)?);
+        if a == b {
+            return None;
+        }
+        let body = arrow.body.as_expression()?;
+        let Expression::LogicalExpression(or) = strip(body) else {
+            return None;
+        };
+        if or.operator != LogicalOperator::Or {
+            return None;
+        }
+        let name = |e: &Expression<'_>| match strip(e) {
+            Expression::Identifier(id) => Some(id.name.to_string()),
+            _ => None,
+        };
+        fn difference<'b, 'a>(
+            e: &'b Expression<'a>,
+        ) -> Option<(&'b Expression<'a>, &'b Expression<'a>)> {
+            match strip(e) {
+                Expression::BinaryExpression(d) if d.operator == BinaryOperator::Subtraction => {
+                    Some((&d.left, &d.right))
+                }
+                _ => None,
+            }
+        }
+        // The tie-break: `a - b`.
+        let (l, r) = difference(&or.right)?;
+        if name(l)? != a || name(r)? != b {
+            return None;
+        }
+        // The key: `t[x] - t[y]` with {x, y} = {a, b}.
+        let (l, r) = difference(&or.left)?;
+        let element = |e: &Expression<'_>| match strip(e) {
+            Expression::ComputedMemberExpression(m) if !m.optional => {
+                Some((self.typed_array(&m.object)?, name(&m.expression)?))
+            }
+            _ => None,
+        };
+        let ((t1, x), (t2, y)) = (element(l)?, element(r)?);
+        if t1 != t2 || a == t1 || b == t1 {
+            return None;
+        }
+        if x == b && y == a {
+            Some((t1, true))
+        } else if x == a && y == b {
+            Some((t1, false))
+        } else {
+            None
         }
     }
 
@@ -3645,6 +4752,12 @@ impl<'s> Lowerer<'s> {
             return self.refuse(n.span, construct);
         };
         let name = id.name.as_str();
+        if name == "Float64Array" && !self.is_local(name) {
+            return self.refuse(
+                n.span,
+                "new Float64Array anywhere but a const's initializer",
+            );
+        }
         let shadowed = self.scopes.iter().any(|s| s.contains(name));
         let class: Option<String> = if let Some(py) = self.classes.get(name).filter(|_| !shadowed) {
             Some(py.clone())
@@ -3767,6 +4880,7 @@ impl<'s> Lowerer<'s> {
     /// A value import: from a compiled module (`from .<module> import <names>`), or through the
     /// adapter seam (`adapters.rs`). Anything else is refused, naming the import.
     fn import(&mut self, i: &ImportDeclaration<'_>) {
+        self.import_type_fields(i);
         if i.import_kind.is_type() {
             return;
         }
@@ -3819,6 +4933,9 @@ impl<'s> Lowerer<'s> {
                     .or_default()
                     .insert(py.clone());
                 self.globals.insert(local.to_string(), py.clone());
+                if module.generators.contains(local) {
+                    self.generator_fns.insert(local.to_string());
+                }
                 if is_class {
                     self.classes.insert(local.to_string(), py);
                 }
@@ -3849,6 +4966,12 @@ impl<'s> Lowerer<'s> {
                             self.adapter_fns.insert(local.to_string());
                         }
                         AdapterKind::Constant => {}
+                        // J89-4a: its methods dispatch in this module only.
+                        AdapterKind::ImportedClass(methods) => {
+                            self.classes.insert(local.to_string(), py);
+                            self.imported_methods
+                                .extend(methods.iter().map(|m| m.to_string()));
+                        }
                     }
                 }
                 None => {
@@ -3860,6 +4983,41 @@ impl<'s> Lowerer<'s> {
                     self.globals
                         .insert(local.to_string(), py_name(local, true, false));
                 }
+            }
+        }
+    }
+
+    /// J89-5: a type imported from a compiled module of the call (`import type { Fact }`,
+    /// `import { type Pool }`) declares the data fields it declares there, under the local name. A
+    /// type the module itself declares under that name keeps its own (TypeScript refuses both).
+    fn import_type_fields(&mut self, i: &ImportDeclaration<'_>) {
+        let Some(spec) = i.source.value.as_str() else {
+            return;
+        };
+        let Some(specifiers) = &i.specifiers else {
+            return;
+        };
+        let Some(module) = resolve_specifier(&self.ctx.path, spec)
+            .as_ref()
+            .and_then(|path| self.ctx.modules.get(path))
+        else {
+            return;
+        };
+        for specifier in specifiers {
+            let ImportDeclarationSpecifier::ImportSpecifier(s) = specifier else {
+                continue;
+            };
+            if !(i.import_kind.is_type() || s.import_kind.is_type()) {
+                continue;
+            }
+            let imported = s.imported.name();
+            let Some(fields) = module.type_fields.get(imported.as_str()) else {
+                continue;
+            };
+            let local = s.local.name.to_string();
+            if !self.types.fields.contains_key(&local) {
+                self.types.fields.insert(local.clone(), fields.clone());
+                self.types.data.insert(local);
             }
         }
     }
@@ -4296,6 +5454,7 @@ impl<'s> Lowerer<'s> {
         self.bind_params(&a.params, &[]);
         self.defs.push((self.scopes.len() - 1, BTreeSet::new()));
         let saved_breaks = std::mem::take(&mut self.breaks);
+        let saved_generator = std::mem::replace(&mut self.in_generator, false);
         let mut body_out = Vec::new();
         self.param_defaults(&a.params, indent + 1, &mut body_out);
         self.hoist_params(&a.params, indent + 1, &mut body_out);
@@ -4315,6 +5474,7 @@ impl<'s> Lowerer<'s> {
             }
         }
         self.breaks = saved_breaks;
+        self.in_generator = saved_generator;
         let (_, nonlocals) = self.defs.pop().expect("pushed above");
         self.rets.pop();
         self.pop_scope();
@@ -4339,6 +5499,16 @@ impl<'s> Lowerer<'s> {
     /// noted for `nonlocal`.
     fn local_target(&mut self, name: &str, span: Span) -> Py {
         let Some(index) = self.scopes.iter().rposition(|s| s.contains(name)) else {
+            // J89-2: a module-level `let`, assigned from a module function: declared `global`
+            // there. From a nested function it is refused (it would need `global` in a closure,
+            // which is not worth a rule while no source does it).
+            if self.module_lets.contains(name)
+                && self.defs.is_empty()
+                && let Some(writes) = self.global_writes.last_mut()
+            {
+                writes.insert(name.to_string());
+                return Py::atom(self.globals[name].clone());
+            }
             return self.refuse(span, "assignment to a module-level name");
         };
         if let Some((start, nonlocals)) = self.defs.last_mut()
@@ -4683,9 +5853,36 @@ pub fn resolve_specifier(importer: &str, spec: &str) -> Option<String> {
 
 /// What one module exports (source name -> (Python name, is a class)) and the method names its
 /// classes declare, read off the AST before anything is lowered, so another module can import it.
-pub fn scan_module(program: &Program<'_>) -> (HashMap<String, (String, bool)>, HashSet<String>) {
+/// J89-4a: the names of a module's top-level generator functions (`function*`), exported or not.
+pub fn generator_names(program: &Program<'_>) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for stmt in &program.body {
+        let decl = match stmt {
+            Statement::ExportDeclaration(e) => Some(&e.declaration),
+            _ => stmt.as_declaration(),
+        };
+        if let Some(Declaration::FunctionDeclaration(f)) = decl
+            && f.generator
+            && let Some(id) = &f.id
+        {
+            out.insert(id.name.to_string());
+        }
+    }
+    out
+}
+
+/// What a module offers the others of its call: its exports, the method names its EXPORTED
+/// classes declare (they reach every module of the call), and the method names its other classes
+/// declare (J89-5a: they dispatch in this module only, as an `ImportedClass` adapter's do).
+pub type ModuleScan = (
+    HashMap<String, (String, bool)>,
+    HashSet<String>,
+    HashSet<String>,
+);
+
+pub fn scan_module(program: &Program<'_>) -> ModuleScan {
     let mut exports = HashMap::new();
-    let mut methods = HashSet::new();
+    let mut class_methods: Vec<(String, Vec<String>)> = Vec::new();
     let mut locals: HashMap<String, (String, bool)> = HashMap::new();
     for stmt in &program.body {
         let (decl, exported) = match stmt {
@@ -4709,6 +5906,12 @@ pub fn scan_module(program: &Program<'_>) -> (HashMap<String, (String, bool)>, H
                 }
             }
             Declaration::VariableDeclaration(v) => {
+                // J89-2: a module-level `let` is a live binding another compiled module would
+                // import as a snapshot (`from .m import X` copies the value once), so it is not
+                // offered to them: such an import is refused as one the module does not export.
+                if v.kind != VariableDeclarationKind::Const {
+                    continue;
+                }
                 for d in &v.declarations {
                     if let BindingPattern::BindingIdentifier(id) = &d.id {
                         bind(
@@ -4725,14 +5928,20 @@ pub fn scan_module(program: &Program<'_>) -> (HashMap<String, (String, bool)>, H
                         (class_py_name(id.name.as_str(), exported), true),
                     );
                 }
+                let mut declared = Vec::new();
                 for element in &c.body.body {
                     if let ClassElement::MethodDefinition(m) = element
                         && m.kind == MethodDefinitionKind::Method
                         && let Some(name) = property_key_name(&m.key)
                     {
-                        methods.insert(name);
+                        declared.push(name);
                     }
                 }
+                // An anonymous class cannot be named by an export (and is refused when lowered).
+                let name =
+                    c.id.as_ref()
+                        .map_or(String::new(), |id| id.name.to_string());
+                class_methods.push((name, declared));
             }
             _ => {}
         }
@@ -4747,7 +5956,22 @@ pub fn scan_module(program: &Program<'_>) -> (HashMap<String, (String, bool)>, H
             }
         }
     }
-    (exports, methods)
+    // J89-5a: a class no export names is reachable from another module only as a value a function
+    // returned. There a call of one of its methods that a builtin shares (`row.get(t)`) is the
+    // builtin's helper, which refuses an instance at run time (`_js_outside`), and a read of one as
+    // a value is refused by `_js_object_get`: never a different answer. So its method names stay
+    // in its own module, and the other modules' builtin calls are not dispatched for it.
+    let mut methods = HashSet::new();
+    let mut private = HashSet::new();
+    for (name, declared) in class_methods {
+        let exported = exports.get(&name).is_some_and(|(_, is_class)| *is_class);
+        if exported {
+            methods.extend(declared);
+        } else {
+            private.extend(declared);
+        }
+    }
+    (exports, methods, private)
 }
 
 // -------------------------------------------------------------------- helpers
@@ -4802,6 +6026,9 @@ fn arith(op: BinaryOperator, left: Py, right: Py) -> Py {
 
 fn arith_of(op: BinaryOperator, left: Py, right: Py) -> Py {
     use BinaryOperator as Op;
+    if let Some(fast) = f64_arith(op, &left, &right) {
+        return fast;
+    }
     match op {
         Op::Subtraction => {
             let (left, right) = (js_num(left), js_num(right));
@@ -4849,6 +6076,60 @@ fn arith_of(op: BinaryOperator, left: Py, right: Py) -> Py {
             }
         }
     }
+}
+
+/// J89-3: `left <op> right` for `+ - * /` when both are proven numbers and at least one is a
+/// proven float. Python's float arithmetic is IEEE-754's, and an int within 2**53 (all a proven
+/// number can be) converts to the double it is exactly, so `+`, `-` and `*` are the native
+/// operators and the result is a float. Division is native too, except that a zero divisor
+/// (`0.0`, `-0.0`, or an int 0), where Python raises ZeroDivisionError, takes `_js_div`'s answer (a
+/// signed Infinity or NaN, a float either way): inline when the divisor is a name or a literal (read
+/// twice; both operands are side-effect free there), else through `_js_fdiv`. `%` keeps its helper.
+/// Where the general helpers spell an integral product or quotient as an int, this spells it as a
+/// float: the same JS value, which every runtime helper reads either way (`+` of two floats was
+/// already one, J89-2).
+fn f64_arith(op: BinaryOperator, left: &Py, right: &Py) -> Option<Py> {
+    use BinaryOperator as Op;
+    let num = |p: &Py| p.is_num && p.is_double && !p.top;
+    if !(num(left) && num(right) && (left.is_f64 || right.is_f64)) {
+        return None;
+    }
+    let simple = |p: &Py| {
+        let c = p.code.as_str();
+        p.pure
+            && !c.is_empty()
+            && (c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                && !c.starts_with(|ch: char| ch.is_ascii_digit())
+                || c.parse::<f64>().is_ok())
+    };
+    let (code, prec) = match op {
+        Op::Addition => (format!("{} + {}", left.at(ADD), right.at(ADD + 1)), ADD),
+        Op::Subtraction => (format!("{} - {}", left.at(ADD), right.at(ADD + 1)), ADD),
+        Op::Multiplication => (format!("{} * {}", left.at(MUL), right.at(MUL + 1)), MUL),
+        Op::Division => match right.code.parse::<f64>() {
+            Ok(divisor) if divisor != 0.0 => {
+                (format!("{} / {}", left.at(MUL), right.at(MUL + 1)), MUL)
+            }
+            _ if simple(right) && left.pure => (
+                format!(
+                    "{l} / {r} if {r} else _js_div({lc}, {r})",
+                    l = left.at(MUL),
+                    r = right.code,
+                    lc = left.code
+                ),
+                TERNARY,
+            ),
+            _ => (format!("_js_fdiv({}, {})", left.code, right.code), ATOM),
+        },
+        _ => return None,
+    };
+    Some(Py {
+        is_num: true,
+        is_double: true,
+        is_f64: true,
+        pure: left.pure && right.pure,
+        ..Py::new(code, prec)
+    })
 }
 
 fn is_lead(unit: u16) -> bool {
@@ -5010,6 +6291,10 @@ fn statement_kind(s: &Statement<'_>) -> &'static str {
 
 /// Why a regex is refused: the text after `unsupported ` in the diagnostic.
 const REGEX_SYNTAX: &str = "regex syntax";
+/// J89-4a: JS's `\s`, every code unit `/\s/` matches (pinned against Node in `tests/g3.rs`).
+const JS_SPACE_CLASS: &str = "[\\t\\n\\u000b\\u000c\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]";
+/// J89-4a: JS's `\S`, the complement of `JS_SPACE_CLASS`.
+const JS_NON_SPACE_CLASS: &str = "[^\\t\\n\\u000b\\u000c\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]";
 
 /// Deepest group nesting accepted: Python's `re` parser recurses per group, so a deep enough
 /// nesting is a `RecursionError` at import rather than a pattern.
@@ -5077,6 +6362,10 @@ pub fn translate_regex(pattern: &str) -> Result<String, String> {
                     'w' => out.push_str("[A-Za-z0-9_]"),
                     'D' => out.push_str("[^0-9]"),
                     'W' => out.push_str("[^A-Za-z0-9_]"),
+                    // J89-4a: JS's `\s` (WhiteSpace and LineTerminator), spelled out: Python's
+                    // `\s` adds U+001C-U+001F and U+0085 and leaves out U+FEFF.
+                    's' => out.push_str(JS_SPACE_CLASS),
+                    'S' => out.push_str(JS_NON_SPACE_CLASS),
                     'b' => {
                         out.push_str("\\b");
                         quantifiable = false;
@@ -5374,7 +6663,12 @@ mod tests {
         assert_eq!(translate_regex("^[A-Za-z]:").unwrap(), "^[A-Za-z]:");
         assert_eq!(translate_regex("a$").unwrap(), "a\\Z");
         assert_eq!(translate_regex("\\d+").unwrap(), "[0-9]+");
-        assert!(translate_regex("\\s").is_err());
+        // J89-4a: `\s` is JS's set spelled out; inside a class it stays refused.
+        assert_eq!(
+            translate_regex("\\s").unwrap(),
+            "[\\t\\n\\u000b\\u000c\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]"
+        );
+        assert!(translate_regex("[\\s]").is_err());
         assert!(translate_regex("(?<n>a)").is_err());
         // J85-R F3: an astral literal is its two UTF-16 code units, in and out of a class.
         assert_eq!(

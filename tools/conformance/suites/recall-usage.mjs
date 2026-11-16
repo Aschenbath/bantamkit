@@ -34,6 +34,7 @@ import { appendFileSync, mkdirSync, readFileSync, readdirSync, symlinkSync } fro
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { gunzipSync } from 'node:zlib';
+import { g3Cases } from '../lib/g3pure.mjs';
 
 export const name = 'recall-usage';
 export const summary = 'the usage ledger: bytes, decayed weights, keyword copies, skipped lines, fold';
@@ -236,6 +237,35 @@ function scenarios() {
         { op: 'weights', now: NOW },
       ],
     },
+    // J89-2 (#316 G3): a folded weight on a TIE at the tenth decimal. A use exactly 140 days
+    // (ten half-lives) before the fold weighs 0.5 ** 10 = 0.0009765625, whose binary value IS
+    // that decimal, so nine places is a tie: `toFixed(9)` takes the larger (0.000976563), where
+    // the hand-written reference's `f"{w:.9f}"` rounded half to even (0.000976562). The ledger
+    // is shared on disk, so one fold wrote bytes the other runtime's fold would not. Python
+    // moved to node's answer when the ledger was generated (docs/porting.md, moved answers).
+    {
+      label: 'tie: a folded weight with a five at the tenth decimal',
+      fold_lines: null,
+      ops: [
+        append('t', 'recall_hit', '2026-05-28T00:00:00Z'),
+        { op: 'fold', now: '2026-10-15T00:00:00Z' },
+        { op: 'bytes' },
+      ],
+    },
+    // J89-2 found it, J89-3 closed it toward node: a folded line dated far past `now` (a hand
+    // edit, a clock that ran ahead) decays by `0.5 ** (age / 14)` with a huge NEGATIVE age.
+    // CPython's float `**` raises OverflowError there, so python's `weights` (and the recall that
+    // reads it) used to raise; node's `Math.pow` answers Infinity and the fact weighs Infinity.
+    // Since J89-3 `pysem.pyPow`'s adapter answers Infinity where `**` overflows (and nowhere
+    // else), so the two agree; each side's answer is also a literal below.
+    {
+      label: 'future: a folded line dated far past now',
+      fold_lines: null,
+      ops: [
+        { op: 'raw', b64: rawB64('{"ts":"9999-12-31T00:00:00Z","fact":"f","kind":"folded","weight":1.0}\n') },
+        { op: 'weights_or_error', now: '2026-10-01T00:00:00Z' },
+      ],
+    },
     // #204 Task 4 (J69-4): the ledger is a LogSegment. Past `rotate_bytes` the live file is
     // gzipped into `<id>.jsonl.<n>.gz`, every read spans the segments, and a fold folds the
     // live file only. ROTATE_SCRIPT crosses 200 B more than once.
@@ -286,6 +316,13 @@ function runNode(usage, bed) {
         break;
       case 'weights':
         out.push([...led.weights(op.now)].map(([k, v]) => [k, v.toFixed(9)]));
+        break;
+      case 'weights_or_error':
+        try {
+          out.push({ weights: [...led.weights(op.now)].map(([k, v]) => [k, v.toFixed(9)]) });
+        } catch (e) {
+          out.push({ error: e.name });
+        }
         break;
       case 'last_used':
         out.push(led.lastUsed(op.fact));
@@ -392,6 +429,71 @@ export async function run(ctx) {
     });
   });
 
+  // #316 G3 (J89-1, settled J89-1F): `storeId`, the key of the usage ledger (and of the hot
+  // index's directory), over four paths J89-1 found the runtimes disagreeing on.
+  // - A dangling symlink, and a path below one: WAS a difference, FIXED IN NODE. Python's
+  //   `os.path.realpath` follows the link to its target text; the port's parent fallback over
+  //   `realpathSync.native` kept the link's own name, so one store got two ledgers. Node now
+  //   resolves with `pyfs.pyRealpath`, the port of `os.path.realpath`.
+  // - A lone surrogate (U+D800): WAS a difference, FIXED IN PYTHON. `.encode("utf-8")` raised
+  //   UnicodeEncodeError; `usage.os_realpath` now hands the path over as Node's fs does (the G2
+  //   path policy, `_os_char`), so both hash U+FFFD.
+  // - A POSIX surrogateescape code point (U+DC80): RULED, target-specific (the G2 policy row,
+  //   docs/porting.md). Python hashes the real byte 0x80 it stands for; Node, which has no such
+  //   string from its own fs, hashes U+FFFD. The companion compares what both still agree on:
+  //   both answer, neither raises. Python's literal shows U+D800 and U+DC80 no longer collide.
+  {
+    const g3ref = join(ctx.repoRoot, 'tools', 'conformance', 'ref', 'g3_ref.py');
+    const dangling = join(ctx.scratch, 'usage-store', 'dangling');
+    symlinkSync(join(ctx.scratch, 'usage-store', 'no-such-target'), dangling, 'dir');
+    const lone = join(ctx.scratch, 'usage-store', 's\ud800x');
+    const escaped = join(ctx.scratch, 'usage-store', 's\udc80x');
+    const odd = [
+      [dangling, 'a dangling symlink'],
+      [join(dangling, 'below'), 'a path below a dangling symlink'],
+      [lone, 'a lone surrogate'],
+      [escaped, 'a surrogateescape code point'],
+    ];
+    const pyIds = ctx.runPython(g3ref, { op: 'store_id', paths: [...odd.map(([p]) => p), join(ctx.scratch, 'usage-store', 'no-such-target'), join(ctx.scratch, 'usage-store', 'no-such-target', 'below')] }).out;
+    const nodeId = (p) => {
+      try {
+        return { ok: usage.storeId(p) };
+      } catch (e) {
+        return { err: e?.name ?? 'Error' };
+      }
+    };
+    const ndIds = odd.map(([p]) => nodeId(p));
+    odd.forEach(([, label], i) => {
+      if (label === 'a surrogateescape code point' && process.platform !== 'win32') {
+        cases.push({
+          name: `ruling: storeId — ${label} (U+DC80) hashes as the real byte on POSIX python, U+FFFD on node`,
+          kind: 'json',
+          expected: pyIds[i],
+          actual: ndIds[i],
+          ruling: 'G2 target-specific I/O (docs/porting.md, J88-RF F4b; applied to storeId by J89-1F): a POSIX python str holding U+DC80..U+DCFF names the undecodable byte of a real name, and python hashes that byte; node has no such string from its own fs and hashes the U+FFFD its UTF-8 encoder writes',
+        });
+        cases.push({ name: `J89-1F storeId — ${label}: both answer, neither raises`, kind: 'json', expected: Object.keys(pyIds[i]), actual: Object.keys(ndIds[i]) });
+      } else {
+        cases.push({ name: `J89-1F storeId — ${label}`, kind: 'json', expected: pyIds[i], actual: ndIds[i] });
+      }
+    });
+    // Per side: a dangling link hashes as its target (the link's own name would be a second
+    // ledger), and the path below it as the target's child. Each side against its own target id.
+    cases.push({ name: 'LITERAL: J89-1F python storeId of a dangling symlink and a path below it are its target\'s', kind: 'json', expected: [pyIds[4], pyIds[5]], actual: [pyIds[0], pyIds[1]] });
+    cases.push({
+      name: 'LITERAL: J89-1F node storeId of a dangling symlink and a path below it are its target\'s',
+      kind: 'json',
+      expected: [nodeId(join(ctx.scratch, 'usage-store', 'no-such-target')), nodeId(join(ctx.scratch, 'usage-store', 'no-such-target', 'below'))],
+      actual: [ndIds[0], ndIds[1]],
+    });
+    // Python, on POSIX: U+D800 (no encoding takes it: U+FFFD) and U+DC80 (the byte 0x80) are two
+    // directories and two ledgers; both used to raise. Node's two strings name ONE directory
+    // (its fs writes U+FFFD for both), so one id there is the right answer, not a collision.
+    if (process.platform !== 'win32') {
+      cases.push({ name: 'LITERAL: J89-1F python storeId of U+D800 and U+DC80 — both answer and differ', kind: 'json', expected: [true, true, true], actual: [Boolean(pyIds[2].ok), Boolean(pyIds[3].ok), pyIds[2].ok !== pyIds[3].ok] });
+    }
+  }
+
   all.forEach((s, i) => {
     s.ops.forEach((op, j) => {
       const what = op.op === 'append' ? `append ${op.kind} ${op.fact}` : `${op.op}${op.n ? ` ${op.n} (decompressed)` : ''}${op.fact ? ` ${op.fact}` : ''}${op.now ? ` @${op.now}` : ''}`;
@@ -414,6 +516,20 @@ export async function run(ctx) {
       ['a', '1.500000000'],
     ]),
   );
+  // J89-2: the tie's spelling, per side (a symmetric respelling would leave the bed green).
+  const tieAt = all.findIndex((s) => s.label.startsWith('tie:'));
+  const tieLine = (side) => {
+    const b64 = (side === 'py' ? py : nd).beds[tieAt].at(-1);
+    return b64 === null ? null : Buffer.from(b64, 'base64').toString('utf8');
+  };
+  cases.push(
+    ...literalCases(tieLine('py'), tieLine('node'), 'LITERAL: J89-2 a folded weight of 0.5 ** 10 is written 0.000976563', '{"ts":"2026-10-15T00:00:00Z","fact":"t","kind":"folded","last":"2026-05-28T00:00:00Z","weight":0.000976563}\n'),
+  );
+  // J89-3: the future-dated folded line, each side's own answer (a symmetric regression back to
+  // a raise would leave the differential green).
+  const futureAt = all.findIndex((s) => s.label.startsWith('future:'));
+  cases.push({ name: 'LITERAL: J89-3 python weighs a folded line dated far past now Infinity', kind: 'json', expected: { weights: [['f', 'Infinity']] }, actual: py.beds[futureAt].at(-1) });
+  cases.push({ name: 'LITERAL: J89-2 node weighs a folded line dated far past now Infinity', kind: 'json', expected: { weights: [['f', 'Infinity']] }, actual: nd.beds[futureAt].at(-1) });
   // J68-5: `last_used` across two folds, per side — a fold that went back to reading its own
   // `ts` on BOTH sides leaves every differential green and reddens this.
   const lastAt = all.findIndex((s) => s.label.startsWith('last:'));
@@ -483,6 +599,12 @@ export async function run(ctx) {
     }),
   );
 
+  {
+    // #316 G3 (J89-1): memory/usage's constants and pure functions, compared directly.
+    const g3 = await g3Cases(ctx, 'usage');
+    cases.push(...g3.cases);
+    notes.push(...g3.notes);
+  }
   return { cases, notes };
 }
 

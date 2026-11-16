@@ -44,17 +44,19 @@ fn class() {
     );
 }
 
+/// J89-4a lowers a module `function*` and its `yield` statements (`tests/g3_store.rs`); a delegating
+/// `yield*` and a `yield` whose value is read stay refused.
 #[test]
 fn generator_and_yield() {
-    let source = "export const k = 1;\n\n\nfunction* h() {\n  yield 2;\n}\n";
+    let source =
+        "export const k = 1;\n\n\nfunction* h() {\n  yield* [2];\n  const v = yield 2;\n}\n";
     let lines = refusals(source);
     assert!(
-        lines
-            .contains(&"t.ts:4:1: unsupported generator function: function* h() { ...".to_string()),
+        lines.contains(&"t.ts:5:3: unsupported yield: yield* [2]".to_string()),
         "{lines:?}"
     );
     assert!(
-        lines.contains(&"t.ts:5:3: unsupported yield: yield 2".to_string()),
+        lines.contains(&"t.ts:6:13: unsupported yield: yield 2".to_string()),
         "{lines:?}"
     );
 }
@@ -164,9 +166,10 @@ fn other_refusals() {
         "export function f(x: number): number {\n  if (x) {\n    const x = 2;\n  }\n  return x;\n}\n",
         "t.ts:3:11: unsupported shadowed binding: x",
     );
+    // J89-4a spells `\s` out (JS's set); `\B` is still refused.
     assert_refused(
-        "export function f(): unknown {\n  return /\\s+/;\n}\n",
-        "t.ts:2:10: unsupported regex syntax: /\\s+/",
+        "export function f(): unknown {\n  return /\\B/;\n}\n",
+        "t.ts:2:10: unsupported regex \\B, which Python's re does not match in an empty string: /\\B/",
     );
     assert_refused(
         "export function f(): unknown {\n  return window;\n}\n",
@@ -344,10 +347,11 @@ fn method_called_directly_still_compiles() {
 fn g1_refusals() {
     // J88-2 lowered `finally` and reading a catch binding (the runtime answers only what JS
     // would read of a Python exception, `code`, and refuses the rest; tests/g2.rs).
-    // A `continue` in a C-style loop would skip the update in Python.
+    // J89-4a lowered a `continue` in a C-style loop (the update runs at the top of the next
+    // iteration, `tests/g3_store.rs`); a labelled one stays refused.
     assert_refused(
-        "export function f(n: number): number {\n  let s = 0;\n  for (let i = 0; i < n; i += 1) {\n    if (i === 2) continue;\n    s += i;\n  }\n  return s;\n}\n",
-        "t.ts:3:3: unsupported continue in a C-style for loop: for (let i = 0; i < n; i += 1) { ...",
+        "export function f(n: number): number {\n  let s = 0;\n  for (let i = 0; i < n; i += 1) {\n    if (i === 2) continue x;\n    s += i;\n  }\n  return s;\n}\n",
+        "t.ts:4:18: unsupported labelled continue: continue x;",
     );
     assert_refused(
         "export function f(n: number): number {\n  let i = 0;\n  for (i = 1; i < n; i += 1) {}\n  return i;\n}\n",
@@ -391,9 +395,28 @@ fn g2_refusals() {
         "export function f(o: { a: { n: number } }): void {\n  o.a.n += 1;\n}\n",
         "t.ts:2:3: unsupported compound assignment to a property of anything but a local: o.a.n += 1",
     );
-    // `<<` is lowered; `>>` and `>>>` are not.
+    // `<<` is lowered, and since J89-4a `>>` (`_js_sar`); `>>>` is not.
     assert_refused(
-        "export function f(a: number): number {\n  return a >> 1;\n}\n",
-        "t.ts:2:10: unsupported operator >>: a >> 1",
+        "export function f(a: number): number {\n  return a >>> 1;\n}\n",
+        "t.ts:2:10: unsupported operator >>>: a >>> 1",
+    );
+}
+
+#[test]
+fn g3_refusals() {
+    // J89-2: a module-level `let` needs an initializer, and only a module function may assign it
+    // (a closure would need `global` inside a nested def).
+    assert_refused(
+        "export let n: number;\nexport function f(): number {\n  return 1;\n}\n",
+        "t.ts:1:12: unsupported module-level let without initializer: n: number",
+    );
+    assert_refused(
+        "export let n = 0;\nexport function f(): void {\n  const g = (): void => {\n    n = 1;\n  };\n  g();\n}\n",
+        "t.ts:4:5: unsupported assignment to a module-level name: n",
+    );
+    // `x++` as a loop update is lowered for a local name only.
+    assert_refused(
+        "export function f(o: { n: number }): void {\n  for (; o.n < 3; o.n++) {}\n}\n",
+        "t.ts:2:19: unsupported update of anything but a local name: o.n++",
     );
 }

@@ -24,6 +24,8 @@ survive byte-exactly travels as base64.
     {"op": "absolutise", "cases": [[body_b64, basis, name_b64, layer], ...]}
       -> {"out": [{"body": b64, "hits": [...], "unresolved": [...]}, ...]}
 
+    {"op": "int_digits"} -> {"digits": [[codepoint, int(chr(codepoint))], ...],
+                             "unidata_version": str} (J89-5d; the version since J89-7)
     {"op": "outcome", "start": b64, "bed": path, "today": "YYYY-MM-DD", "dry_run": bool}
       -> {"labels": [b64], "store_root": b64, "outcome": {...}} | {..., "error": {...}}
 
@@ -45,6 +47,7 @@ from __future__ import annotations
 import base64
 import json
 import sys
+import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "runtime-py" / "src"))
@@ -246,6 +249,17 @@ def main() -> None:
             except BaseException as e:  # noqa: BLE001 — a raise here is the whole finding
                 rows.append({"error": {"type": type(e).__name__, "message": b64(str(e))}})
         out = {"out": rows}
+    elif op == "int_digits":
+        # J89-5d: every codepoint CPython's `int()` accepts alone, with the value it gives.
+        digits = []
+        for cp in range(0x110000):
+            if 0xD800 <= cp <= 0xDFFF:
+                continue
+            try:
+                digits.append([cp, int(chr(cp))])
+            except ValueError:
+                continue
+        out = {"digits": digits, "unidata_version": unicodedata.unidata_version}
     else:
         raise SystemExit(f"unknown op {op!r}")
     json.dump(out, sys.stdout)

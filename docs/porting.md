@@ -300,6 +300,15 @@ Every other indicator at the start of a value (`` & * ! % @ ` { } ] , ``, `? `, 
 multi-line flow sequence, and a tab in a plain scalar RAISE a named `FactParseError`. Where
 PyYAML reads one of those (an anchor, `!!str`, a flow mapping, `[a, [b]]`, `[a: b]`, a flow
 sequence over two lines) the port refusing is the deliberate difference in the row below.
+**Corrected J89-1F:** the tab is refused by PyYAML's PURE-PYTHON scanner (`yaml.SafeLoader`),
+which is what "PyYAML rejects it too" in the codec's sentence means; **libyaml does not refuse
+it** (`CSafeLoader` reads `a\tb` as `'a\tb'` and a trailing tab as nothing, PyYAML 6.0.3), and
+runtime-py's fact read falls back to libyaml when it is installed (`factcodec._pyyaml_load`), so
+there a fact holding one is READ by the reference and refused by the port. Measured J89-1F on
+this machine (libyaml present). **J89-2 (the orchestrator's ruling): the refusal is the owner-ruled
+`node-refuses` class and stays; only the false clause of its sentence changed**, to `… PyYAML's
+pure-Python scanner rejects it too: <line>` (`factfile.ts`, `_generated/factfile.py` regenerated;
+no case pinned the old words).
 
 Surprises worth keeping: `1e+17` is a **`str`**, not a float — PyYAML's float regex needs a
 `.` before the exponent. So are `00:00` and `y`.
@@ -347,7 +356,12 @@ Surprises worth keeping: `1e+17` is a **`str`**, not a float — PyYAML's float 
 | `build_id` | hashes the executing tree; two runtimes, two trees. `assets_digest` **is** identical (read it off `build_identity` on either server, or `_assets_fingerprint()`; this row no longer quotes a digest, because each of the three it carried — `sha256:b03141bf…` at #75, `d47dcf4b…` over 87 files, `9e66e89a…` over 93 — went stale by the same route: the pack changed and the row did not; job67 J67-9) and that is the one that matters — but only because both walks now EXCLUDE `__pycache__`. That is a precondition, not a given: the pack ships eleven `.py` fixtures, `pip install` byte-compiles them, and on the published 0.27.0 artifacts the wheel answered `sha256:fa8372f6…` over 98 files against npm's `sha256:d47dcf4b…` over 87 while this row already claimed they were identical. Gated per side by `build_identity: a __pycache__ does not move assets_digest` in `tools/conformance/suites/wire.mjs` — per side, because pointed at one polluted pack both runtimes moved together and the cross-runtime comparison stayed green. |
 | the event log's build identity | **not a difference — an omission, for this reason.** A `build_id` hashes the executing tree and the two runtimes are two trees (row above), so no build identity is a field in an event-log record at all; the `build_identity` record carries the COUNT of underivable fields instead. Same for `sessionId` (the server cannot observe it), pids and absolute paths. See [eventlog.md](eventlog.md). |
 | the YAML scanner cases | the codec has no scanner; 5 shapes ruled, `!` filed alone. **#120 adds 8:** an anchor, `!!str`, a flow mapping, an empty flow mapping, a nested flow sequence, a flow-sequence pair, a flow sequence over two lines and an anchored sequence item are READ by PyYAML and REFUSED by the port with a named `FactParseError` — reading them means porting the scanner, anchors and the composer. A refusal names the file and writes nothing, which is the point: the plain-text guess it replaced was stamped back to disk. Ruled in `tools/conformance/suites/codec.mjs` as `ruling: #120 node refuses where python reads: …`, with the refusal-bit companions as per-side literals (`#120 per side: the ruled inputs — python reads every one` / `— node refuses every one, with a named FactParseError`), because the two bits DIFFER and a side-to-side bit could never be green. Teeth: forcing the ruled answers equal reddened all 8 as `STALE RULING`; dropping `&` from the refused set left every ruling green and reddened the node literal (1 failure). **job67 (J67-3), user ruling 2026-10-15 on #120's remainder: these eight are the FINAL answer** — the PyYAML scanner is not ported, and the refusal is by name. What the ruling changed is what a refusal COSTS: a `memory_save` on Node no longer refuses the whole store because one fact file is one of these shapes. Both runtimes' `save` now skip any fact file they cannot read, name it (`SaveResult.skipped`, and a closing paragraph on the reply: `N fact file(s) could not be read and was/were skipped; the duplicate check read every other fact:` + `[project] <the store's sentence>`), and land; the one file a save never skips is the one it would WRITE (`<sentence>; saving '<name>' would overwrite that file, so nothing was saved -- repair it or move it out of facts/ first`). So over a store holding an anchored fact the save lands on both sides, Python reads the fact and Node names it skipped, and the `index.md` each rebuilds differs by that one line — ruled in `tools/conformance/suites/store.mjs` as `ruling: #120 save past a file only python reads — the answers`, with the refusal bit (`— the save lands on both sides`) and the written fact's bytes compared unruled and each side's skip pinned as a literal. Blank lines, lines of spaces and comment lines inside a block sequence — and `links: ` / `links: # c` before one — were NOT a ruled shape to keep: they are READ now, as PyYAML reads them, compared in `codec.mjs` as read-alike cases and a second 1500-frontmatter seeded corpus where node must neither guess nor refuse. **Since #315 (J86-3) runtime-py's store reads through the code compiled from the port's own `factfile.ts` first** (*Generated modules*), and that code refuses these eight shapes by the same names; `memory/factcodec.py` then reads the file with `yaml.safe_load`, exactly as before, so python still reads every one and this row's answers are unchanged (`ts2py-codec`'s `node-refuses` class: runtime-py reads each, `py=before` holds it equal to the pre-#315 read). |
+| the grants config (`config.yaml`) over a document outside the port reader's language (J89-5b) | **Python reads it with PyYAML; Node with its own reduced reader, and the two may grant and refuse differently.** The orchestrator's ruling on J89-5's stop (option b), after the owner's #315 ruling for fact files: `memory/layers` is generated, and the config read stays on `yaml.safe_load` on the Python side (the `firstTokenTab` / `parseConfigDocument` adapters; Node's reader is `runtime-ts/src/memory/grantconfig.ts`). That reader implements no tag, anchor, alias, merge key, directive, second document, document end, flow mapping, escape, block scalar or flow sequence over lines, and refuses (or reads literally) what it does not implement; matching would mean porting PyYAML's scanner and composer. J89-5 found the first: `extra_stores: &a [g]` is a grant on Python and `extra_stores must be a list of paths` on Node. J89-5b's scan found 41 in the family (28 where Python grants and Node refuses, 13 where both refuse in different sentences). Each: a `RULED: config outside the reader's language — <document>` case in `tools/conformance/suites/recall-strings.mjs`, a non-ruled `J89-5b outcome bit per side: <document>` companion (the grant/refuse bit of each side against a literal, since a ruling only proves the two still differ) and the per-side literals `LITERAL: J89-5b python|node: load_grants over the config family, every answer`. The older `RULED: a config outside the reader's language, and PyYAML's scanner diagnostics` (the wording after the identical prefix) stands. **J89-5d added seven** (the orchestrator: a crash is a bug), documents where CPython raised out of `load_grants` what it never caught: an impossible implicit timestamp as a value, a key or a grant (`2001-02-30`, `25:00:00`), a 5,000-digit int, a decoded NUL in a grant and a flow sequence 1,000 deep. Python now refuses each with `invalid memory config <path>: <reason>`: CPython's own `str(e)` for a scalar PyYAML resolves but cannot construct, `the document is nested too deeply to read` past CPython's limit, and `extra_stores must be a list of paths` for a NUL (it names no path). Where Node grants (four) the outcome differs; where Node also refuses (the timestamp grant, the NUL, the deep sequence) the outcome bit agrees and the sentence differs. All seven carry the family's three pins (48 documents); see *The layers* and *J89-5d* under *Generated modules*. |
+| the queries sidecar nested between Python's fixed limit of 512 and Node's stack (J89-5d, J89-5e) | **Node reads its well-formed entries; Python reads it as malformed.** `readSidecar` / `read_sidecar` (the `memory_queries` coverage, its missing list and write, `bantamkit_status`, recall's term rows) read through `parseJson`, the port of `json.loads`. Node's is a recursive descent whose limit is its stack: measured on macOS arm64, Node v26.13.0, past 1,562 nested lists cold and past 6,902 once V8 has optimised `parseJson` (binary searches over 40 warm-up rounds; it moves with tiering). CPython's `json.loads` has no one limit either (J89-5e, measured in Docker, `python:3.1x-slim`, default recursion limit 1,000): 3.11's C scanner is bounded by `sys.getrecursionlimit()` less the caller's frames (991 at the top level, 978-979 inside `parse_json` on the real MCP path, `memory_queries` / `memory_recall` / `bantamkit_status` in the AnyIO worker thread, 981 on the hook path), 3.12 reads to 9,997 (9,993 on the MCP path), 3.13 to 9,998 (9,994), and 3.14 has no fixed limit (20,000, the probe's ceiling). So J89-5d's answer, ruled at 8,500 on 3.12, was `[]` on 3.11 (the ruling went stale) and the band ran the other way between ~980 and 1,562. The orchestrator's rulings: Node's limit is an implementation limit, not a contract (J89-5d); a crash is a bug (J89-5d); Python's answer must not depend on the CPython version or its recursion limit (J89-5e). So the `parse_json` adapter reads at most **512** deep, a depth of its own below every supported CPython's on every user path, counted as `JSON.parse` nests (each array or object one level, the outermost included), and past it throws the RangeError `Maximum call stack size exceeded` Node throws past its stack, which the compiled `catch` sees (the depth is found by a non-recursive scan, `_json_too_deep`: the 513th opener counts only when the text before it is a well-formed prefix wanting a value there, so a text malformed earlier keeps `json.loads`'s own refusal; `RecursionError` stays mapped the same way as the backstop; the recursion limit is not raised). Between 512 and Node's cold limit the sides differ by ruling: Node reads and Python does not. From Node's stack on, both answer as no sidecar. Pinned in `--suite recall-queries`: `ruling: sidecar/nested — read of a sidecar nested 513 deep (between python's limit of 512 and node's stack)` (lists and objects) with a per-side literal each; the agreeing `sidecar/nested: J89-5e … nested 512 deep in lists|objects (python's limit)` cases, both reading, with per-side literals; and the agreeing `sidecar/nested: J89-5d …` cases at 8,500, 20,000 and 100,000 deep (read; coverage, the missing list and a write over a project sidecar 20,000 deep), each with per-side literals. The suite passes with a 3.11, a 3.12 and a 3.13 reference interpreter (`--python`). |
+| a relative date counted in a Unicode 15.0 digit, on CPython 3.11 (J89-7, #316 G3) | **the interpreter's table, not the code.** CPython 3.11 reads UCD 14.0, so the 20 digits Unicode 15.0 added (Kawi U+11F50..U+11F59, Nag Mundari U+1E4F0..U+1E4F9) are not `\d` to its `re` and not digits to its `int()`; node's `pyRelativeScan` / `pyIntDigits` reproduce CPython 3.12's 15.0 table. `It landed 𑽓 days ago.` is unresolved on 3.11 and dated 2026-09-03 on node and on CPython 3.12-3.14, as main's hand-written dream did. Not lifted: matching would mean carrying a 15.0 table for `\d`, `\b` and `\w` in the adapter. Ruled in `--suite dream` as `J89-7 absolutise: a count in a Unicode 15.0 digit, python against node (UCD 14.0.0)` (an agreeing case from UCD 15.0), with a literal per side; the digit-count literal is keyed on the reported UCD version. See *Lowercase and digits on every supported CPython (#316 G3, J89-7)*. |
 | the native memory mirror over a frontmatter only PyYAML reads (#228) | **the reference mirrors the file; the port skips it as `frontmatter`.** The mirror (job74) parses a native fact file with each runtime's own frontmatter reader: `yaml.safe_load` on the reference, `parseFrontmatter` on the port. The port reads the language the store emits plus the hand-written shapes #120 and #219 added, and refuses everything else by name — the eight #120 shapes (a flow mapping such as `metadata: {type: user}`, an anchor, …), a block sequence indented under its key (`links:\n  - a`), and any list or mapping two levels down (the memory-keeper shape `metadata:\n  links:\n    - a`, measured in 2 of 460 real native files on this machine, 2026-10-22). PyYAML reads all of them, so the reference saves a fact the port logs as `mirror-skipped` / `frontmatter`. Agreeing would mean porting the scanner, which the user's #120 ruling of 2026-10-15 declines, or making the reference drop a fact it can read. Nothing is written into the native directory on either side and both exit 0 with nothing printed. Ruled in `tools/conformance/suites/hooks.mjs` as `native-mirror-ruled: a frontmatter only PyYAML reads — the outcomes` over three files (flow mapping, indented list, keeper shape); each side's answer is pinned as a literal (`— the reference mirrors every ruled shape` / `— the port skips every ruled shape as frontmatter`), because the two bits DIFFER and a side-to-side bit could never be green; and the half the ruling does not license — exit 0, nothing printed, the native directory untouched — is compared side to side and pinned per side. Every other mirror outcome J74-4 found different by running both hooks (CRLF, a `{}` frontmatter, a falsy or non-scalar description, realpath of a missing tail or another-case spelling) was FIXED to agree, not ruled. **#315 (J86-3) leaves the mirror on `yaml.safe_load`:** the store now reads generated-first with a PyYAML fallback (*Generated modules*), and over these shapes the fallback answers, so the store and the mirror on the reference both read them as before; the mirror itself was not routed through the generated codec, because generated-first would also move the two classes #315's ruling licenses for the store (`yaml11-breaks`, `pyyaml-refuses`) into the mirror's outcomes, which this row pins. |
+| `MemoryStore.snapshot()` (Python only; J89-4b, #316 G3 U2) | **a Python-only API, kept by the shim, not a difference in any answer.** The pinned read set exists for ONE caller, `component.Memory.batch`, which `agent.py`'s loop (the Python eval agent, an unported module: no Node counterpart) enters around each assistant turn (RB-P1: a speculative save between two reads of one turn). `store.ts` deliberately omits it: the Node MCP server has no turn to pin. Since store.ts is generated it is hand-written in the shim (`bantamkit.memory.store`), built on the generated store: the pin is the generated `facts()` at entry, and while it holds the generated `candidates` answers it and `indexed` answers `null` (so `recall`, `lookup` and `pool` read the pin and `save` stays live), the same three moments `test_memory.py`'s snapshot cases pin. No `ruling:` case: no MCP tool, CLI or hook reaches it, so there is no Node answer to compare. |
+| `Memory.setup()` and `Memory.batch()` (Python only; J89-6, #316 G3 U4) | **a Python-only API, kept by the shim, not a difference in any answer.** They are the only two consumers of `agent.py` (Layer 1, a Python-only library by the owner's ruling "keep it as Python"): `setup` registers `memory_save` / `memory_recall` / `memory_compact` on an `Agent`, adds `batch` as its batch scope and the `memory` skill as a system block; `batch` pins every WRITABLE layer's store with `snapshot()` (row above) for one assistant turn. `component.ts` deliberately omits both (its header says so: no MCP tool, CLI or hook reaches them), so since component.ts is generated they are hand-written in the shim (`bantamkit.memory.component`), on the generated facade: `batch` walks `_layers`, which are the shims of the very cores the generated component reads, so a pinned store pins what `recall` reads. Their callers (`agent.py`, `test_memory_component.py`'s agent cases, `tools/eval`) are unchanged. No `ruling:` case: there is no Node answer to compare. |
 | `checkSchema` wording | 50 cases; both sides refuse, the sentences differ |
 | accounting via `fromJs` | an integral float; the `parseJson` route is byte-identical |
 | on Windows, CRLF | **no longer a difference.** N11 reversed it: the emitter builds LF text, the WRITER translates, and the budget still counts the LF text — which is what CPython does. See [conformance.md](conformance.md). |
@@ -405,8 +419,16 @@ Surprises worth keeping: `1e+17` is a **`str`**, not a float — PyYAML's float 
 | G2 as Node: a transcript subdirectory that lists but does not search (J88-1 #26; J88-1F, #316 G2) | **CLOSED BY G2 (J88-2): Python is generated from the TypeScript and answers Node's; the suite case is an ordinary agreeing case with a per-side literal.** Was RULED AS NODE until J88-2. A directory under `root` with read but no execute permission. Python before: `Path.is_dir()` raises `PermissionError(EACCES)` out of `_walk`, so `read` raises. Node (and Python after): `statSync`'s throw is caught, the child is taken for a file, and its read fails as one `undecodable-file` omission — the ledger's rule that nothing about the tree's content refuses (`docs/ledger.md`). The two refusal bits DIFFER (one side raises), so no side-to-side bit can be green; Node's answer is pinned per side instead. Built only off Windows and not as root. Cases: `ruling: G2 as Node — read: a subdirectory that can be listed but not searched` and `LITERAL: G2 ruled as Node — node's counts over the ruled inputs`. **J88-2 makes it agree**: Python is then compiled from the TypeScript and inherits Node's answer, the `ruling:` case goes STALE by design and J88-2 turns it into an ordinary case and closes this row. |
 | G2 as Node: fold timestamp order (J88-1 #28; J88-1F, #316 G2) | **CLOSED BY G2 (J88-2): Python is generated from the TypeScript and answers Node's; the suite case is an ordinary agreeing case with a per-side literal.** Was RULED AS NODE until J88-2. `LogSegment.fold` keeps a row older than `older_than` by comparing `ts` strings. Python before: `_is_old` is `str <`, code-point order. Node (and Python after): `isOld` is JS `<`, UTF-16 code-unit order. They part only when one `ts` holds a character above U+FFFF and the other one in U+E000–U+FFFF: folding at U+1F600 reduces 2 lines on Python (U+FFFF and `a`) and 1 on Node (`a`). Every `ts` bantamkit writes is an ASCII ISO stamp. No earlier row rules this order (`tokenledger`'s code-point stamp order, `docs/ledger.md`, is another module and is unaffected). Cases: `storage-log`'s `ruling: G2 as Node — J88-1 fold compares ts by code point or by UTF-16 unit — every op`, its three unruled appends, and Node's bytes in `LITERAL: G2 ruled as Node — node's ops over the ruled scenarios`. **J88-2 makes it agree**: Python is then compiled from the TypeScript and inherits Node's answer, the `ruling:` case goes STALE by design and J88-2 turns it into an ordinary case and closes this row. |
 | G2 as Node: an integer past 2**53 in a folded row (J88-1 #29; J88-1F, #316 G2) | **CLOSED BY G2 (J88-2): Python is generated from the TypeScript and answers Node's; the suite case is an ordinary agreeing case with a per-side literal.** Was RULED AS NODE until J88-2. A row read off disk and re-serialised by `fold`. Python before: `18446744073709551616`, exact. Node (and Python after): a JS number, `18446744073709552000` (the J87-1F rule: a figure is a double). Not the J69-4 caller-float class: the integer was read off disk, not handed in by a caller. Cases: `storage-log`'s `ruling: G2 as Node — J88-1 a folded row holding an integer past 2**53 — every op`, its unruled ops, and Node's bytes in `LITERAL: G2 ruled as Node — node's ops over the ruled scenarios`. **J88-2 makes it agree**: Python is then compiled from the TypeScript and inherits Node's answer, the `ruling:` case goes STALE by design and J88-2 turns it into an ordinary case and closes this row. |
-| G2 target-specific I/O: a Python `str` path holding U+DC80..U+DCFF (J88-RF F4b, #316 G2) | **the Python side hands a path to the OS as Python's own `os` functions encode it; ruled (J88-RR R1): `--suite eventlog` `ruling: bed: a surrogateescape code point in the directory (U+DCFF)` pins the difference on POSIX, and its companion `... — both stay enabled and neither raises` compares what both still agree on. On macOS APFS refuses the byte, so the Python record is lost (write_failed true) where Node writes a U+FFFD directory.** A POSIX Python caller meets these code points in a path as the surrogateescape stand-ins for the undecodable bytes of a real name (`os.getcwd`, `os.listdir`, `os.fsdecode`): `/x/\udcff` IS the directory `b"/x/\xff"`. The generated log segment and event log reach the OS through `_ts2py_adapters._node_path`, which keeps every code point `os.fsencode` accepts and turns only the rest (a lone surrogate no encoding takes: U+D800..U+DC7F, U+DD00..U+DFFF on POSIX) into the U+FFFD Node's UTF-8 encoding writes. So the log, its `.lock` (the `exclusive` adapter maps its target the same way since J88-RF F4a) and the hand-written store all land in the one real directory, as on main; at `eb929048` the data went to a new U+FFFD directory while the lock stayed in the real one. Node has no such string from its own fs (its names decode to U+FFFD), so a Node caller handing `\udcff` writes a `\ufffd` name where a Python caller writes the byte `0xff`. Windows has no surrogateescape names (`os.fsencode` there takes every lone surrogate, UTF-16 `surrogatepass`), so on Windows `_os_char` maps every lone surrogate to Node's U+FFFD and the two sides agree; measured on POSIX only (no Windows run). Pinned by `test_storage_log.py::test_a_surrogateescape_directory_holds_the_log_and_its_lock` (Linux; APFS refuses the name and the test skips) and, for the lone surrogates both sides map to U+FFFD, `--suite eventlog`'s two `a lone surrogate in the ... is written under U+FFFD` beds. |
+| G2 target-specific I/O: a Python `str` path holding U+DC80..U+DCFF (J88-RF F4b, #316 G2) | **the Python side hands a path to the OS as Python's own `os` functions encode it; ruled (J88-RR R1): `--suite eventlog` `ruling: bed: a surrogateescape code point in the directory (U+DCFF)` pins the difference on POSIX, and its companion `... — both stay enabled and neither raises` compares what both still agree on. On macOS APFS refuses the byte, so the Python record is lost (write_failed true) where Node writes a U+FFFD directory.** A POSIX Python caller meets these code points in a path as the surrogateescape stand-ins for the undecodable bytes of a real name (`os.getcwd`, `os.listdir`, `os.fsdecode`): `/x/\udcff` IS the directory `b"/x/\xff"`. The generated log segment and event log reach the OS through `_ts2py_adapters._node_path`, which keeps every code point `os.fsencode` accepts and turns only the rest (a lone surrogate no encoding takes: U+D800..U+DC7F, U+DD00..U+DFFF on POSIX) into the U+FFFD Node's UTF-8 encoding writes. So the log, its `.lock` (the `exclusive` adapter maps its target the same way since J88-RF F4a) and the hand-written store all land in the one real directory, as on main; at `eb929048` the data went to a new U+FFFD directory while the lock stayed in the real one. Node has no such string from its own fs (its names decode to U+FFFD), so a Node caller handing `\udcff` writes a `\ufffd` name where a Python caller writes the byte `0xff`. Windows has no surrogateescape names (`os.fsencode` there takes every lone surrogate, UTF-16 `surrogatepass`), so on Windows `_os_char` maps every lone surrogate to Node's U+FFFD and the two sides agree; measured on POSIX only (no Windows run). Pinned by `test_storage_log.py::test_a_surrogateescape_directory_holds_the_log_and_its_lock` (Linux; APFS refuses the name and the test skips) and, for the lone surrogates both sides map to U+FFFD, `--suite eventlog`'s two `a lone surrogate in the ... is written under U+FFFD` beds. **Applied by J89-1F (#316 G3) to two more surfaces, the same policy and not a second one:** a STORE ROOT holding U+DC80 (Python hands the OS byte 0x80 — APFS refuses it, `MemoryValidationError`, ext4 creates it — where Node saves into `s\ufffdx`; `--suite store` `ruling: G2 target-specific — a store root holding U+DC80 (a surrogateescape byte)`, with the unruled companion `… — a store answer, and only the directory each side names` and Node's answer as a per-side literal), and `storeId` of such a path (Python hashes the real byte, `usage.os_realpath` + `surrogateescape`; Node hashes U+FFFD; `--suite recall-usage` `ruling: storeId — a surrogateescape code point (U+DC80) …` with the companion `… both answer, neither raises`). On POSIX Python's `storeId` of `s\ud800x` and `s\udc80x` now differ (two directories, two ledgers; both raised before) — `LITERAL: J89-1F python storeId of U+D800 and U+DC80 — both answer and differ`. |
 | G2 adapters: two hand-crafted `.gz` segments (J88-RF F5, #316 G2) | **pre-existing, and neither runtime writes such a file; documented, not changed.** `gunzipSync` and the `gunzip_sync` adapter (`gzip.decompress` with Node's refusals) agree on the nine shapes `RULES.md` lists, but not on two: a member followed by zero bytes and then a non-zero byte (`m + b"\0\x01"`) is read by Node as that one member (Node's gunzip ends the input at a zero byte after a member) and refused by Python (`skipped` 1: `gzip.decompress` skips the zero padding and refuses the byte after it as a header), and a member, a zero byte, a second member (`m + b"\0" + m`) is ONE member to Node and both to Python. The hand-written module at main used `gzip.decompress` too, so this is not a G2 change. Rotation writes one `gzip` member and nothing after it on both sides. Measured by the J88-R reviewer's `gz.py` over 13 shapes, 11 equal. |
+| `factfile` — a `__proto__` key in a fact's frontmatter, top-level or nested (J87-R F1, J89-1 D1; J89-1F, #316 G3) | **WAS a difference — fixed in Node; now agreeing, so no ruling.** Before: `parseFrontmatter` assigned `meta[key] = value` and `scanNestedMapping` built its mapping the same way, so on Node a top-level `__proto__: polluted` was a [[Set]] of the prototype (a string is ignored, the key vanished) and a nested `  __proto__: inner` vanished too; CPython's dict keeps both as keys. A save that UPDATES the fact writes `Fact.extra` back, so Node dropped both lines from a hand-edited file — data loss. After: both mappings (and `wellFormedMeta`'s rebuild) are made by `Object.fromEntries` over the entries in file order (own data properties; a repeated key keeps its first place and last value, as assignment did), which ts2py lowers as `_js_object_from_entries`, so the generated Python (`_generated/factfile.py`, regenerated) answers as before. Pinned by `--suite store`: `J89-1F a save over a fact with __proto__ keys — the tree` and the per-side `LITERAL: J89-1F <side>'s updated fact keeps the top-level and the nested __proto__ lines`; red at 64a69df8 (the J89-1 case was ruled-different there). |
+| `candidates_done` and dream's `absolutise` — a word next to U+0345 COMBINING GREEK YPOGEGRAMMENI (J89-1 D2; J89-1F, #316 G3) | **WAS a difference — fixed in Node; now agreeing, so no ruling.** Before: Node spelled CPython's `\b` as `(?<![\p{L}\p{N}_])` / `(?![\p{L}\p{N}_])` in regexes compiled with `iu`; under `i` a class matches every code point whose simple case fold is in it, and U+0345 folds to iota, so `doneͅ` and `yesterdayͅ` had no boundary on Node (no done-word, no annotation) where CPython's `\w` (never case-folded; U+0345 is Mn) keeps it. After: both patterns (`store.ts` `DONE_WORD_RE`, `dream.ts` `RELATIVE` and `UNRESOLVED`) are compiled with `u` and WITHOUT `i`; the word class is `pysem.PY_WORD_CLASS` and the words are spelled by `pysem.pyCaseless`, which reproduces exactly what `iu` matched for each letter (swept: U+212A for `k`, U+017F for `s`). Swept over 0..0x10FFFF against CPython 3.12 (UCD 15.0): the class disagrees with `\w` on no code point CPython assigns (it did on one, U+0345); the 9,661 left are code points UCD 15.0 leaves unassigned and Node's ICU assigns. **Found while sweeping, then FIXED IN NODE by J89-2 (the orchestrator's ruling: Python is the reference for its own regex semantics):** CPython's `re.IGNORECASE` also matches U+0130 and U+0131 for `i` (JS `iu` does not), so `shıpped` was a done-word to Python only; `pysem.pyCaseless` now spells `i` as `[iIİı]` (swept: every code point 0..0x10FFFF for all 26 letters against CPython 3.12, no other letter has a partner JS's `iu` lacks). Pinned by `--suite store` `J89-2 candidates_done: "shipped" spelled with U+0131 / U+0130` and their node literals, and `--suite dream` `J89-2 absolutise: …` (`rıght now`, `next tİme`); red at b3e570be. **It exposed one more difference, pinned UNRULED (J89-2):** `tonight` spelled with U+0131 or U+0130 is now matched by both, and the reference then raises `KeyError` from its day table (`'tonıght'` is not a key), where node reports the term unresolved (`--suite dream` `ruling: UNRULED DIVERGENCE absolutise: \`tonight\` spelled with U+0131 (dotless i)` and two per-side literals); python raised there before J89-2 as well. **RULED on J89-5 (node is right) and FIXED BY GENERATION in J89-5c:** the generated dream runs dream.ts's lookup, so python reports the term unresolved too; the case is an agreeing `J89-5c absolutise: …` case with per-side literals, joined by U+0130 and by `yeſterday` (U+017F, the same lookup, never pinned before). Pinned by `--suite store` (`J89-1F candidates_done: "done" followed by U+0345`, its node literal, and `J89-1F the word class over every code point CPython assigns`) and `--suite dream` (three `J89-1F absolutise: …` and six per-side `LITERAL: J89-1F <side> finds the term …`); U+0345 is back in `g3pure.mjs`'s fuzz alphabet. |
+| a fact write cut short (EFBIG, ENOSPC) — the sentence raised (J89-1; J89-1F, #316 G3) | **WAS a difference — fixed in Node; now agreeing, so no ruling.** Before: Node wrote the temp with one `writeFileSync`, and `asPyOSError` over its error kept libuv's text (EFBIG was not in the strerror table) and the temp's path: `[Errno 27] EFBIG: EFBIG: file too large, write: '<temp>'`. CPython's buffered `write` raises with no filename: `[Errno 27] File too large`. After: `pyfs.pyWriteTextAtomic` opens (`wx`), writes and closes as three steps, as CPython does; only the open's error names the temp, and EFBIG is in the table (`File too large`, the same on the UCRT). An `index.md` write cut short by ENOSPC said `[Errno 28] No space left on device: '<root>/index.md'` on Node and no filename on Python; it now says the latter on both (tmpfs probe below). Pinned by `--suite store` `J89-1F a fact write cut short by EFBIG — the sentence raised` and `LITERAL: J89-1F node raises a fact write cut short by EFBIG as CPython does`. |
+| `index.md` and `save`'s budget rollback rewritten in place (J89-1 shared weakness; J89-1F, #316 G3) | **WAS the same weakness on both sides — fixed in both; agreeing before and after.** Before: `_rebuild_index` / `rebuildIndex` wrote `index.md` with `write_text` / `pyWriteText`, and `save`'s rollback after `MemoryBudgetExceeded` rewrote the fact the same way: truncate, then write. A write cut short left a PREFIX: measured at 64a69df8 under `ulimit -f 4`, `index.md` went from 3,800 bytes to the first 4,096 of the new index and the 6,000-byte fact the rollback was restoring to its first 4,096 bytes, on both sides. After: both go through a per-writer temp and a rename, exactly as the fact write does (`<path>.<pid>.<8 hex>.tmp`, `O_EXCL`, every byte written — Node loops over `writeSync`, G2's `writeAll` lesson; CPython's buffered writer loops itself — unlink on any failure): Python `store._write_text_atomic`, Node `pyfs.pyWriteTextAtomic`, and `_write_fact` / `writeFact` now call the same helper. A failed `index.md` write leaves the old file byte for byte; a failed rollback leaves the whole updated fact (never a prefix) and raises the write's `OSError`. Measured under ENOSPC too, in a 1 MiB tmpfs (Docker, CPython 3.13 and Node 22): at 64a69df8 `index.md` 3,800 -> 4,096 bytes on both; now unchanged on both, no temp left. Pinned by `--suite store`: `J89-1F a save whose index.md write is cut short — answer and tree`, `J89-1F a budget rollback whose fact write is cut short — answer and tree`, and four per-side `LITERAL: J89-1F <side>: …`. **Residual, not measured:** on Windows a rename onto a file another process holds open without `FILE_SHARE_DELETE` fails, so `index.md` now shares the fact write's exposure there (no Windows run). |
+| `storeId`, `skills._same`, `component._same_directory` — a dangling symlink, and a path below one (J89-1; J89-1F, #316 G3) | **WAS a difference — fixed in Node; now agreeing, so no ruling.** Before: Node resolved with `fs.realpathSync.native` and, on a throw, the parent resolved plus the name (`usage.ts`, `skills.ts`), or a lexical `path.resolve` (`component.ts`); the native call is strict, so a dangling symlink kept the LINK's own name where `os.path.realpath` follows it to the target text: one store had two usage ledgers, and a project under a dangling link to the home was two skill roots on Node, one on Python. After: all three call `pyfs.pyRealpath`, the port of `os.path.realpath(strict=False)` written once (`posixpath._joinrealpath` + `abspath` on POSIX; the `ntpath` non-strict arm `pyResolve` already used on Windows, unmeasured there), meant to be the `realpathSync.native` adapter's contract when these modules are generated. It also keeps the caller's spelling of a case-folded macOS name, as CPython does, where `realpath(3)` answered the filesystem's. Pinned by `--suite recall-usage` (`J89-1F storeId — a dangling symlink`, `— a path below a dangling symlink`, and per-side literals against each side's own target id) and `--suite skill-layer` (`J89-1F skill_roots: a project under a dangling symlink to the home` and its per-side literals). |
+| `storeId`, `skills._same`, `component._same_directory` — a lone surrogate outside U+DC80..U+DCFF (J89-1; J89-1F, #316 G3) | **WAS a difference — fixed in Python; now agreeing, so no ruling.** Before: `os.path.realpath` (or the `.encode("utf-8")` after it) raised `UnicodeEncodeError` for `s\ud800x`, out of `store_id` and out of `skill_roots`; Node answered, hashing and comparing the U+FFFD its fs writes. After: Python hands the path over through `usage.os_realpath`, which applies the G2 path policy (`_ts2py_adapters._os_char`: a code point `os.fsencode` cannot take is U+FFFD) before `os.path.realpath`, and hashes `encode("utf-8", "surrogateescape")`; so both hash U+FFFD. Pinned by `--suite recall-usage` `J89-1F storeId — a lone surrogate` and `--suite skill-layer` `J89-1F skill_roots: a home holding a lone U+D800`. The surrogateescape range is the target-specific row below. |
+| ~~G3 as Node~~: a store root holding a lone surrogate outside U+DC80..U+DCFF (J89-1; J89-1F; **closed by J89-4b**, #316 G3 U2) | **WAS RULED AS NODE — now agreeing, so no ruling.** Before generation Python raised `UnicodeEncodeError` (`surrogates not allowed`) from the first `mkdir` and wrote nothing, where Node's fs wrote U+FFFD and saved at `<base>/s�x`. Since J89-4b the generated store reaches the OS through the `pyfs` adapters, which take the G2 path policy (`_store_path` in `tools/ts2py/src/adapters.py`: a lone surrogate CPython cannot encode is U+FFFD), and the hot index adapter hands the hand-written index the same path, so both save at `s�x` and recall it (`saved`, recall 1). The `ruling:` case went STALE as designed (`--suite store`, 2 stale, 0 other failures) and is now `J89-4b a store root holding a lone U+D800 — both answer as node (was ruled G3 as Node)` with `LITERAL: J89-4b python's / node's answer for a store root holding a lone U+D800`. |
+| ~~G3 as Node~~: a store root holding a NUL (J89-1; J89-1F; **closed by J89-4b**, #316 G3 U2) | **WAS RULED AS NODE — now agreeing, so no ruling.** Before generation Python raised `ValueError: mkdir: embedded null character in path`; Node answered `MemoryValidationError: memory store could not be created: <root>; the directory is not there and this filesystem would not make it, so nothing was written`; both wrote nothing. Since J89-4b a `pyfs` adapter handed a NUL raises the `OSError` `asPyOSError` makes of Node's `ERR_INVALID_ARG_VALUE` (errno 0; `g3_store.rs` `j89_4b_store_os_seam_answers_like_node` pins its text to Node's), so the generated `ensureDirs` answers the store's own sentence on both sides. Cases: `J89-4b a store root holding a NUL — both answer as node (was ruled G3 as Node)` (the whole answer and the directory listing, which replaces the old refusal-bit companion) and a `LITERAL: J89-4b <side>'s answer …` per side. |
 
 **#200 (job70, the touch graph) adds no row to the table above.** Every touch surface is
 compared by `touch-log`, `touch-refs`, `touch-turn`, `touch-graph`, `touch-context`, `touch-bound`,
@@ -990,7 +1012,7 @@ user-facing call on either side that this ending could make diverge. `agent`, `b
 no observable behaviour on either side for it to hold constant — so adding one would be a case
 that can never fail, which is worse than no case.
 
-## Generated modules: `workplan`, the fact-file codec, `pricing`, `jobbudget`, the event log, the token ledger and the log segment are compiled from TypeScript (#314, #315, #316 G1, G2)
+## Generated modules: `workplan`, the fact-file codec, `pricing`, `jobbudget`, the event log, the token ledger, the log segment, the usage ledger, retrieval, the memory store, the native layer, the queries sidecar, the layers, the dream and the component are compiled from TypeScript (#314, #315, #316 G1, G2, G3)
 
 Since #314 (J85-3) the Python work planner is not a port. `runtime-ts/src/workplan.ts` is the
 one source; `tools/ts2py` (Rust, `tools/ts2py/SUBSET.md`) compiles it to
@@ -1002,7 +1024,7 @@ generated code.
 
 **Every generated file is committed**, so `pip install`, `python -m build` and the wheel need no
 Rust. After any edit to `workplan.ts`, `memory/pyyaml.ts`, `memory/factfile.ts`, `pricing.ts`,
-`jobbudget.ts` or `tools/ts2py`, regenerate from the repository root (all five; each is
+`jobbudget.ts`, a G2/G3 module (`memory/store.ts`, `memory/native.ts`, `memory/queries.ts`, `memory/layers.ts`, `memory/dream.ts` and `memory/component.ts` among them) or `tools/ts2py`, regenerate from the repository root (all five; each is
 deterministic, so an unchanged input rewrites the same bytes):
 
 ```
@@ -1012,7 +1034,11 @@ cargo run --release --manifest-path tools/ts2py/Cargo.toml -- \
   runtime-ts/src/memory/pyyaml.ts runtime-ts/src/memory/factfile.ts \
   --out-dir runtime-py/src/bantamkit/_generated --runtime-module ._ts2py_runtime
 cargo run --release --manifest-path tools/ts2py/Cargo.toml -- \
-  runtime-ts/src/pricing.ts runtime-ts/src/jobbudget.ts \
+  runtime-ts/src/pricing.ts runtime-ts/src/jobbudget.ts runtime-ts/src/storage/logsegment.ts \
+  runtime-ts/src/eventlog.ts runtime-ts/src/tokenledger.ts runtime-ts/src/memory/usage.ts \
+  runtime-ts/src/memory/retrieval.ts runtime-ts/src/memory/store.ts runtime-ts/src/memory/native.ts \
+  runtime-ts/src/memory/queries.ts runtime-ts/src/memory/layers.ts runtime-ts/src/memory/dream.ts \
+  runtime-ts/src/memory/component.ts \
   --out-dir runtime-py/src/bantamkit/_generated --runtime-module ._ts2py_runtime
 cargo run --release --manifest-path tools/ts2py/Cargo.toml -- \
   --emit-runtime runtime-py/src/bantamkit/_generated/_ts2py_runtime.py
@@ -1476,6 +1502,995 @@ generated `JSON.stringify` / `JSON.parse`, the UTF-16 split), as #315 and G1 fou
 (a hook process, a server's event-log write, a module import) is within 2%. `token_ledger` over a
 large real corpus is the one surface that pays the multiple (≈3.2x on the read); it is an
 on-demand report, not a per-call path.
+
+### The usage ledger (#316 G3 U1, J89-2); retrieval stays hand-written
+
+Since J89-2 `bantamkit.memory.usage` runs code compiled from `runtime-ts/src/memory/usage.ts`:
+`_generated/usage.py` (495 lines), from the same ts2py call as G1 and G2 (the ledger imports the
+compiled log segment; G1 and G2's output is unchanged but for G3-10's local renames,
+`tools/ts2py/RULES.md`). The hand-written module (364 lines) is retired; `memory/usage.py` is a
+shim (203 lines). `pyfs.pyRealpath`, `pysem.pyPow` and `node:crypto`'s hash reach Python through
+the adapter seam (RULES.md, *Adapters (J89-2)*): `pyRealpath` and `pyPow` onto the CPython function
+each ports (`usage.os_realpath`'s `os.path.realpath` under the G2 path policy; `float ** float`),
+`createHash('sha256').update(s, 'utf8')` onto `hashlib` over Node's UTF-8 with the G2 path policy
+for a surrogateescape code point, so J89-1F's `storeId` cases (dangling symlink, a path below one,
+a lone surrogate) and the ruled U+DC80 case are answered by the adapters unchanged.
+
+**What the shim keeps (Python-only conveniences).**
+
+- *Paths are `Path`s*: `UsageLedger(home, store_root, fold_lines=None, rotate_bytes=None)`,
+  `store_id`, `os_realpath`, `missed_writes` and `status_line` take a `Path` or a string;
+  `UsageLedger.path` is a `Path`.
+- *Python shapes*: `weights` and `last_used_map` answer `dict`s (weights as `float`), `census` a
+  tuple, `last_used` / `keywords_copy` `None` for nothing; `reduce_usage` takes `(row, line)`
+  tuples (`storage/retention.py`).
+- *Call-time constants*: `LEDGER_FOLD_LINES`, `LOCK_WAIT_MS` (this module) and
+  `logsegment.ROTATE_BYTES` are read each time a ledger is used, as the hand-written ledger read
+  them; `LOCK_STALE_MS`, `LOCK_POLL_MS`, `USAGE_HALF_LIFE_DAYS` and `WEIGHT_MAX` assigned on the
+  shim (or by `monkeypatch`) are assigned on the generated module, which reads them at call time.
+  `USAGE_HALF_LIFE_DAYS` and `WEIGHT_MAX` stay floats.
+- *`_parse(ts)` answers seconds or raises `ValueError(f"not a ledger timestamp: {ts!r}")`* (it is
+  `touch/*`'s and `skillmine`'s timestamp reader), and `weights` / `fold` raise that same
+  `ValueError` for a bad `now`, as before (the generated ledger would raise node's `Error`).
+
+**TypeScript refactors, each pure (Node's answers unchanged; `npm test` and `--suite recall-usage`
+green):** `parseTs` counts days with Hinnant's `days_from_civil` instead of `new Date(0)` +
+`setUTCFullYear` + `setUTCHours` (`usage.test.mjs` holds the two equal on all 3,652,059 days of years
+1..9999) and keeps its answers in a bounded memo (a read parses each `ts` twice); `export { reduce as
+reduceUsage }` became the function's own name; `Math.pow` became `pysem.pyPow`; the newline count is
+a `latin1` split (Node measured faster: 72 µs against 91 µs over a 5,000-line ledger); `weightsOf`
+and `valid` read each field once.
+
+**Python-side behaviour changes, all toward Node** (`before` is the hand-written module at
+`b3e570be`):
+
+| Input | Python before | Python now = Node |
+|---|---|---|
+| a folded weight on a tie at the tenth decimal (a use 140 days before the fold: `0.5 ** 10` = 0.0009765625) | `"weight":0.000976562` (`f"{w:.9f}"`, half to even) | `"weight":0.000976563` (`toFixed(9)`, the larger) — a different ledger byte on disk; `--suite recall-usage` `tie: …` and `LITERAL: J89-2 a folded weight of 0.5 ** 10 is written 0.000976563` (red at b3e570be) |
+| `append` past the fold threshold with a `ts` the fold cannot parse | the event written, then `ValueError` out of `append` | the event written, `False` |
+| `UsageLedger(home, ...)` with `..`, `.` or a doubled separator in `home` | `.path` kept them (`Path(home) / ...`) | `path.join` normalises them (the same file); `missed_writes` / `status_line` key on that spelling |
+
+**Found by J89-2, pinned UNRULED; CLOSED toward Node by J89-3**: a folded line dated far past `now`
+(`9999-12-31`) decays by `0.5 ** (age / 14)` with a huge negative age; CPython's `**` raises
+`OverflowError`, so the reference's `weights` and the recall that reads them raised, where node's
+`Math.pow` answers Infinity and the fact weighs Infinity. Since J89-3 the `pyPow` adapter answers
+Infinity where `**` overflows, and nowhere else (*Retrieval* below). (The dotless-i `tonight`
+difference is in the D2 row above.)
+
+**No `ruling: G3 as Node` case closed.** The two `G3 as Node` rows (a store root holding a NUL or a
+lone U+D800) belong to `store.ts` (U2); `--suite store` still has its 13 ruled cases, none stale,
+and the ruled U+DC80 `storeId` case stays (`--suite recall-usage`, 2 ruled: it and the new unruled
+one).
+
+**`memory/retrieval.ts` compiled, answered every case, and was NOT shipped generated.** J89-2
+lowered everything it needs (G3-1 to G3-7 in RULES.md; `pysem` adapters for `round(x, 9)`,
+`math.log`, `math.log1p`, NFKC + `lower` and the word-character test; `Float64Array` as arrays of
+doubles) and `--suite recall-retrieval` (156), `recall-strings`, `recall-queries` and `recall-gate`
+were green against it. Then `runtime-py/tests/test_storage_bar.py`, the #204 bar declared before any
+number existed (a 5,000-fact recall at most 15 ms at p50), went red: **78.15 ms** against 6.1 ms for
+the hand-written module (same machine, `before` tree). Warm calls, n = 9 medians (µs):
+`bm25_segments` over 5,000 docs and 4 terms 1,366 -> 31,901 (+2,236%), `rank_columns` over 5,000
+1,132 -> 26,662 (+2,256%), 5,000 `weight_of` 421 -> 17,065 (+3,956%), 5,000 `stale` 1,134 -> 6,548
+(+478%), `tokenize_v2` of mixed-script text 37 -> 47 (+25%), `bm25_scores` over 200 docs +5.5%.
+The cause is structural, not a missing helper: the hot loops do arithmetic on array elements and
+Map values, which the fact system (SUBSET.md, *Types*) cannot prove numeric, so every `+`, `/`,
+index read and write is a JS-semantics call, and `rank_columns`'s comparator sort calls Python once
+per comparison where the hand-written module sorted by key at C speed. What generating it needs:
+typed arrays whose elements are proven doubles (`Float64Array` as `array('d')`), number facts that
+flow from such arrays and from a `typeof x === 'number'` narrowing, and a comparator-to-key lowering
+for `(a, b) => f[b] - f[a] || a - b`. Until then `bantamkit.memory.retrieval` stays the hand-written
+reference, `retrieval.ts` stays as it was, and the J89-2 rules it would use are pinned by
+`tools/ts2py/tests/g3.rs`'s probe.
+
+**Cost, measured (J89-2, macOS arm64, CPython 3.12.13; n = 9, medians; before = `b3e570be`, after =
+this tree).** Over 20% is flagged. The user paths run over a 307-fact store whose usage ledger holds
+3,000 recall events at distinct second-resolution times (a heavy user), rebuilt fresh for each run.
+
+| Path | Before | After | |
+|---|---|---|---|
+| cold `import bantamkit.memory.usage` (fresh process) | 88.5 ms | 89.6 ms | +1.2% |
+| cold `import bantamkit.memory.store` | 89.6 ms | 89.5 ms | -0.1% |
+| `UsageLedger.weights` over 200 events (warm) | 654 µs | 755 µs | +15.4% |
+| `UsageLedger.append` (warm, 200-line ledger) | 122 µs | 124 µs | +1.4% |
+| `store_id` (warm) | 14.9 µs | 16.7 µs | +12.2% |
+| `UsageLedger.fold` of 300 events (warm) | 782 µs | 1,177 µs | **+50.6% (over)** |
+| `recall` over the store, warm, unstamped | 10.04 / 10.16 ms | 11.55 / 11.55 ms | +14.4% |
+| `recall` over the store, warm, stamped (`memory_recall`) | 10.73 / 11.07 ms | 12.44 / 12.27 ms | +13.3% |
+| `recall` in a fresh process (import included) | 102.7 / 102.8 ms | 116.3 / 118.4 ms | +14.2% |
+| `--hook` UserPromptSubmit over the store, a process | 367.8 / 368.7 ms | 378.5 / 377.5 ms | +2.6% |
+| `test_storage_bar` 5,000-fact recall p50 (usage generated, retrieval hand-written) | 6.1 ms | passes (<= 15 ms) | |
+
+The fold is the one path over the bar; it runs once per 5,000 appended lines (and at Retention), not
+per recall. Before J89-2's runtime fast paths (RULES.md G3-11), the memo and the `latin1` count, the
+same tree measured `weights` +1,023%, `append` +198%, warm recall +1,040% and the hook +28%: the
+JS-semantics runtime's per-operation cost, which G2 met in warm loops too.
+
+**Tests.** Added (`test_memory_usage.py`): the ledger is the generated class; lock constants set on
+the shim reach the generated module; the tie; the bad-`ts` auto-fold; the joined path. None retired.
+
+### Retrieval (#316 G3, J89-3): generated, after numeric lowering in ts2py
+
+Since J89-3 `bantamkit.memory.retrieval` runs code compiled from `runtime-ts/src/memory/retrieval.ts`:
+`_generated/retrieval.py` (888 lines), from the same ts2py call as G1, G2 and the usage ledger. The
+hand-written module (476 lines at `b3e570be`) is retired; `memory/retrieval.py` is a shim (419
+lines). J89-2 had compiled the module and kept it hand-written because a 5,000-fact recall took
+78 ms against the #204 bar of 15 ms; J89-3 gave ts2py what that code needed, and only where the
+TypeScript proves it (`tools/ts2py/SUBSET.md`, *Typed arrays and counted loops*; `RULES.md`, J89-3):
+a `Float64Array` whose elements are proven floats, native IEEE arithmetic on proven floats, counted
+loops whose array bounds and element numbers are checked once before they run, and the key sort
+`(a, b) => t[b] - t[a] || a - b`. The bar now measures **7.0 ms** (`test_storage_bar.py` passes).
+
+**What the shim keeps (Python-only conveniences).**
+
+- *Python shapes in*: a `Doc` (frozen dataclass), a `Candidate` (`NamedTuple`, `layer_order`),
+  `Columns` (`NamedTuple`), dicts for `df`, `segs`, `postings` and usage, and `(weights, length)`
+  rows are handed over as the objects, Maps and arrays the TypeScript reads. `doc_terms` answers
+  `(dict, float)`, `weight` / `weight_of` / `length_of` a float, as before.
+- *Constants*: `FIELD_BOOST` and `STALE_WORDS` stay tuples and every numeric constant a float.
+  `W_TYPE` is a dict whose every write rebuilds the generated `Map` (`tune.py` assigns
+  `W_TYPE["feedback"]`). `GATE_FLOOR`, `GATE_RATIO`, `W_TYPE_OTHER`, `W_FRESH_DEMOTE`, `W_USAGE`,
+  `W_CONTEXT`, `W_FLOOR` and `QUERY_WEIGHT` assigned on the shim (or by `monkeypatch`) are assigned,
+  as floats, on the generated module, which reads them at call time.
+- *Scorers*: `BM25F`, `Bm25fScorer` and `QueryScorer` are Python classes over the generated ones
+  (`column(cols, vecs)` takes `Columns`; `fallback` is settable; `QueryScorer.column` can be patched
+  on the class, as `queries_ref.py` does). `Scorer` stays the `Protocol`.
+- *The skill miner's names*: `_nospace(cp)` is the generated `nospace`, `_wordchar(ch)` the
+  `pyWordchar` adapter.
+
+**TypeScript refactors, each pure (Node's answers unchanged; `npm test` and every `recall-*` suite
+green).** From J89-2's attempt: CPython's `round(x, 9)` (with the J68-5 fast path), `math.log`,
+`math.log1p`, NFKC + `lower` and the word-character test moved into `pysem.ts` as `pyRoundFloat9`,
+`pyLog`, `pyLog1p`, `pyNfkcLower`, `pyWordchar` (`roundHalfEven` is `pysem.pyRoundFloat`, `WORDCHAR`
+moved there too; `skilllabel.ts` imports it from `pysem`), each mapped onto the CPython function it
+ports; `forEach` loops became counted loops; `context?.get(...)` an explicit test; `rank` collects
+its order in an array; `bm25Rows` asks `'scan' in row`; parameter properties became fields. New in
+J89-3: `bm25Segments` and `rankColumns` keep their `Float64Array`s (J89-2 had turned them into plain
+arrays) with the division's denominator in a `const`, the scores are written into `lengths.slice()`
+(as fast in V8 as the `new Array(m)` it replaces, which ts2py would have to hold holes for: a `push`
+loop measured 13% slower), and `rankColumns` takes its maximum in a counted loop. Node, interleaved
+medians against `b3e570be`'s build (25 rounds; `bm25Segments` over one run per term 37.7 against
+36.5 us in three more runs of 2,500): every function within 5% (`bm25Segments` +3.3%, `weightOf`
++2.3% / +3.9%, `stale` +4.1% / -5.2%, the rest within 2.5%).
+
+**Python-side behaviour changes, all toward Node** (`before` is the hand-written module at
+`b3e570be`. A differential of the two Python modules, 27,000 calls over edge inputs (NaN, ±0,
+±Infinity, 5e-324, mixed scripts, U+0130 / U+0131, lone surrogates) to `tokenize_v2`,
+`strip_nospace`, `stale`, `query_terms`, `weight_of`, `gate`, `rank_columns`, `length_of`,
+`bm25_segments` and `bm25_scores`, values compared as doubles, found only `rank_columns`, 415 times;
+the last two rows are by reading the code):
+
+| Input | Python before | Python now = Node |
+|---|---|---|
+| `rank_columns` with a NaN weight (`[3, 1, 2, 5, 4]`, weights `[NaN, 1, NaN, 1, 1]`) | `sorted(admitted, key=final, reverse=True)` over NaN keys: `[0, 1, 2, 3, 4]` | V8's sort with the comparator a NaN makes inconsistent: `[0, 3, 4, 1, 2]` |
+| `rank_columns` whose best score is Infinity or NaN at ratio 0 (`ratio * best` is NaN) | `max(floor, NaN)` is `floor`, so every positive score was admitted | `Math.max(floor, NaN)` is NaN, so nothing is admitted: `[]` |
+| `gate(scores)` / `rank(...)` after `GATE_FLOOR` was reassigned | the default floor bound when the module was imported | the default read when called (a JS default parameter) |
+| a score list that is all zeros (no query term, `n <= 0`) | `[0.0, ...]` | `[0, ...]`: the same numbers, spelled as ints |
+
+`--suite recall-retrieval` `J89-3 rankColumns on raw columns (NaN, infinities, -0, ties): node
+against python, 125 runs` and two per-side literals pin the first two (3 cases red against the
+hand-written module, green now).
+
+**The usage ledger's far-future line (J89-2's UNRULED pin), closed toward Node.** `pyPow`'s adapter
+answers Infinity where CPython's `**` raises OverflowError, and changes no other result (a
+ZeroDivisionError stays one). `--suite recall-usage`'s `future:` case is an agreeing case now (red
+before the adapter changed: 2 failures) with a per-side literal for each runtime;
+`test_memory_usage.py` pins the Python side.
+
+**Cost, measured (J89-3, macOS arm64, CPython 3.12.13; n = 9 medians; before = `b3e570be`, J89-2 =
+`181d7a8f` (usage generated, retrieval hand-written), after = this tree).** Over 20% against
+`b3e570be` is flagged with its cause.
+
+| Path | Before | J89-2 | After | vs before |
+|---|---|---|---|---|
+| #204 bar: 5,000-fact recall p50 of 20 (bar 15 ms) | 6.10 ms | 6.16 ms | 7.13 ms | +16.9% |
+| `recall` over the 307-fact store, warm, unstamped | 10.40 ms | 11.65 ms | 12.64 ms | **+21.5%** (J89-2's ledger +12.0%, retrieval +8.5%) |
+| `recall`, warm, stamped (`memory_recall`) | 10.85 ms | 12.45 ms | 13.42 ms | **+23.7%** (J89-2's ledger +14.7%, retrieval +7.8%) |
+| `recall` in a fresh process, import included | 102.5 ms | 120.4 ms | 121.2 ms | +18.2% (retrieval +0.7%) |
+| `--hook` UserPromptSubmit, a process | 362.4 ms | 382.0 ms | 385.4 ms | +6.4% (retrieval +0.9%) |
+| cold `import bantamkit.memory.retrieval` | 95.3 ms | | 96.1 ms | +0.8% |
+
+Warm calls (us, two runs each; the user paths above are what they cost a recall):
+
+| Call | Before | After | |
+|---|---|---|---|
+| `bm25_segments`, 5,000 docs, 7 terms of one run each (the bar's shape) | 1,998 / 2,012 | 2,241 / 2,224 | +12% / +11% |
+| `bm25_segments`, 5,000 docs, 4 terms of ~1,500 one-doc runs | 1,318 / 1,314 | 6,885 / 6,898 | **+422%**: each run is a turn of the outer loop over `seg[j]`, `seg[j + 1]`, `seg[j + 2]`, whose step of 3 and offsets the proven copy does not cover, so it runs the general lowering (about 1 us a run); the per-doc work inside is proven |
+| `rank_columns` over 5,000 | 1,142 / 1,145 | 1,636 / 1,633 | **+43%**: one Python loop where the hand-written module mapped at C speed, and `x * weights[i]` through `_js_mul` (two proven numbers, neither proven a float) |
+| `weight_of`, 5,000 calls | 421 / 436 | 11,456 / 11,528 | **+2,600%**: a scalar function of a Map value and adapter results, which prove nothing, so every operation is a JS-semantics call (`store` calls it once per type and once per used fact, not per row) |
+| `stale`, 5,000 calls | 1,151 / 1,107 | 6,467 / 6,491 | **+470%**: the string helpers per character (the hot index calls it once per fact it writes) |
+| `tokenize_v2`, mixed-script text | 38 / 37 | 46 / 47 | **+25%**: the code-unit loop; ASCII text is 94% faster (the `[a-z0-9]+` fast path) |
+| `bm25_scores` over 200 docs | 10,573 / 10,414 | 10,225 / 10,200 | -3% |
+
+**Tests.** Added (`test_memory_retrieval.py`): the module is the generated one and keeps the miner's
+names; `W_TYPE` writes reach the generated Map; `GATE_FLOOR` is read at call time; the two moved
+`rank_columns` answers. (`test_memory_usage.py`): the far-future line weighs Infinity. None retired.
+
+### The store's constructs (#316 G3 U2, J89-4a): ts2py compiles `memory/store.ts`; generating it is J89-4b's
+
+J89-4 counted 86 refusals compiling `runtime-ts/src/memory/store.ts` with the G1/G2/G3 call; J89-4a
+leaves none (`tools/ts2py/tests/g3_store.rs` `j89_4a_store_compiles_with_the_committed_modules`;
+the rules and the 34 adapter rows are in `tools/ts2py/RULES.md`, J89-4a). `store.py` is still the
+hand-written module: no committed generated file changed (`workplan`, the codec, G1, G2, usage and
+retrieval recompile byte for byte), only the runtime and adapter support modules ts2py writes.
+
+**D1, fixed in Node (the orchestrator's ruling: python is right).** `candidatesDone`'s `ordinal` built
+the day with `Date.UTC(y, mo - 1, d)`, which reads a year 0-99 as 1900-1999, so the year read back
+differed and a fact `created` in 0001-0099 was never aged, where store.py's
+`date.fromisoformat(...)` ages it. The day is now `parseTs(`${iso}T00:00:00Z`) / 86_400_000`
+(`usage.ts`'s `daysFromCivil`, already held equal to `Date.UTC` on every day of years 1..9999); year
+0000 and every impossible day stay refused on both sides. `--suite store`'s UNRULED case went STALE
+by design and is the agreeing case `J89-4a candidates_done(older_than_days=0): created in the years
+0001-0099` with a literal for each side (red against the old ordinal on a scratch copy: 2 failures).
+30,000 seeded strings: the new ordinal agrees with `date.fromisoformat` (behind `_ISO_DAY_RE`) and
+with the generated `usage.parse_ts` on every one; the old one disagreed on 3,908.
+
+**TypeScript changes, each with Node's answers unchanged** (`npm test` and `--suite store` green):
+
+| Was | Is | Why |
+|---|---|---|
+| `DONE_WORD_RE = new RegExp(`(?<!${PY_WORD_CLASS})(${pyCaseless(...)})(?!...)`, 'u')` and `.exec` | `pysem.pySearchWord(DONE_WORD_ALTERNATIVES, text)` (the same regex, built once per alternatives string) | ts2py compiles a pattern only when it is known at compile time; the adapter is store.py's `_DONE_WORD_RE`, which J89-1F and J89-2 swept the Node regex against |
+| `private usage()` | `private usageLedger()` | `tokenledger.ts`'s `message.usage` (a plain object's property) is refused while any compiled class declares a method `usage`: a receiver's type is never a proven fact in ts2py, so the clash cannot be resolved by type (the orchestrator's first choice), and the private method was renamed |
+| `(memo ??= usage())` | `{ if (memo === null) memo = usage(); return memo; }` | an assignment inside an expression is refused |
+| `.filter(matchesMd)` | `.filter((name) => matchesMd(name))` | an adapter function as a callback would be called with the index and array too |
+| `NOT_ONE_LINE.lastIndex = 0; NOT_ONE_LINE.exec(text); NOT_ONE_LINE.lastIndex = 0` (a `g` regex) | `NOT_ONE_LINE_UNIT.exec(text)` (the same class, no `g`, no `+`) | the subset models no `lastIndex`; the run's first unit is what `codepoint` reads either way. Found by running the compiled store (ts2py accepted the write and the runtime refused it); the write is now refused at compile time |
+| the `Date.UTC` ordinal | `parseTs` (D1 above) | |
+
+Node, medians of 11 per process over a 2,000-fact store, three processes each interleaved against
+the build of `9e44aa5c` (old / new, the median of the three): `candidatesDone(30)` 35.74 / 35.05 ms
+(-1.9%), `recall` 0.582 / 0.574 ms (-1.3%), `listFacts()` 34.09 / 34.45 ms (+1.1%), a refused
+`save` (`notOneLine`) 10.9 / 10.8 us (-0.9%): every one within 5%.
+
+**Ahead of J89-4b, found and not decided here.** The adapter rows make store.ts compile and a
+scratch compile answer as Node does on saves, recall, lookup, `candidatesDone` and archived recall
+over one store (identical trees and index file lists); J89-4b's suites will be the real test. Three
+things it will meet: (1) store.ts reads `e.message` of a `PyOSError` (`skipped` reasons), and the
+runtime refuses `message` on a Python exception (a Node fs error's message is not CPython's), so the
+generated store needs the `OSError`'s CPython text there; (2) `parseFrontmatter` / `formatFact` are
+the compiled codec's functions here, and the PyYAML fallback (#315's owner ruling) is J89-4b's to
+route; (3) the pyfs adapters call CPython with the path as given (not the G2 `_os_char` policy), so a
+lone-surrogate store root takes CPython's answers (`os.scandir` raises `UnicodeEncodeError`,
+`Path.exists` answers false), not the Node answers `--suite store`'s `G3 as Node` rulings pin.
+
+### The store (#316 G3 U2, J89-4b): generated, behind its shim
+
+Since J89-4b `bantamkit.memory.store` runs code compiled from `runtime-ts/src/memory/store.ts`:
+`_generated/store.py`, from the same ts2py call as G1, G2, the usage ledger and retrieval (the event
+log now imports the compiled store's `.bantamkit` helpers from it). The hand-written module (2,635
+lines at `5fc230c8`) is retired; `memory/store.py` is the shim. The orchestrator's three rulings on
+J89-4's design questions are what it implements.
+
+**1. The boundary.** The Python surface is unchanged: `Fact`, `Pool`, `SaveResult`, `ArchivedFact`,
+`MergeResult` and `CompactResult` stay dataclasses of the values `yaml.safe_load` builds, and the
+generated store keeps the codec's shape inside (dicts, `PyScalar`, `Map`s). The shim converts at
+every crossing, both ways, checked: `_fact_in` / `_fact_out` through `factcodec.held_meta` /
+`native_value`, `_pool_in` / `_pool_out` (a pool's lists are shared, its `df` / `segs` read as
+read-only Maps). The modules not generated yet are untouched: `component`, `native`, `skills`,
+`dream`, `hookadapter`, `mcpserver` and the hand-written hot and cold indexes call the same names
+as before. `pick_hits` / `pooled_ranking` run the generated ranking over each layer's Python store
+(a `_Resolver` per layer: `resolve` is the layer's own, the hit is that same `Fact` object) and the
+Python scorer (`_Scorer` asks `scorer.column(Columns, vecs)`, so `queries_ref.py`'s hook on
+`QueryScorer.column` still sees every column). The HotIndex <-> store cycle is the adapter's late
+import (J89-4a), plus `HotIndex._of` for a caller that hands a store its own index
+(`storage_ref.py`). A JS `TypeError` the generated store throws reaches a Python caller as the bare
+`TypeError` the reference raised (`frontmatter scalar: links is an int` was the one case that
+showed it).
+
+The shim keeps these private names, each the generated method of the same job: `_facts`,
+`_read_fact`, `_fact_paths`, `_listing`, `_fact_path`, `_index_line`, `_fact_text`, `_write_fact`,
+`_rebuild_index`, `_check_index_budget`, `_after_write`, `_ensure_dirs`, `_present`, `_unwritable`,
+`_reachable`, `_unreadable`, `_index_text`, `_indexed`, `_indexed_fact`, `_fact_named`,
+`_probe_facts`, `_pool_indexed`, `_cold_synced`, `_use`, and the attributes `index_budget`, `k`,
+`_today`, `_now`, `_index`, `_snapshot` (read through to the generated store, which reads them at
+call time). **Retired: `_eviction_key` and `_staleness_key`** (store.ts ranks inside `compact`,
+`byEviction`). One test reached one: `test_memory.py::test_the_eviction_rank_never_raises_on_a_hand_edited_type`
+is rewritten against `compact` itself (five hand-edited types, `[1, 2]`, `{a: 1}`, `2026`, `null`,
+`!!binary`, beside one `user` fact and room for one line: every weird one is archived and the `user`
+fact kept). `test_archive_cli_…` / `test_restore_cli_prints_one_sentence_for_a_permission_error_at_the_move`
+now refuse the move at `os.replace` (the `pyReplace` adapter; `Path.replace` is `os.replace`), not at
+`Path.replace`. No other test changed.
+
+**2. The PyYAML fallback stays** (#315's owner ruling). The `parseFrontmatter` / `formatFact` adapters
+are `factcodec.held_frontmatter` (`load_frontmatter` — the compiled codec, then PyYAML where it
+refuses — converted to the codec's shape; a PyYAML refusal is a JS Error carrying PyYAML's `str(e)`,
+which `readFact`'s catch turns into `malformed fact file <name>: <that>`, the reference's sentence;
+a non-mapping is `frontmatter is not a mapping`) and `factcodec.held_fact_text` (`fact_text` over the
+Python values the fact stands for, so a write is the bytes the reference wrote). A value the codec's
+shape cannot hold as Python holds it is carried OPAQUE (`factcodec._Opaque`, a `PyScalar` whose
+`text` is `str()` of the value and whose `<` names its Python type): a set, bytes, a tuple, a
+collection met twice (written back as PyYAML's anchor and alias), a dict with a non-text key, and a
+list or dict where the store prints the value (`name`, `description`, `type`, the stamps, the
+lifecycle fields, a `links` item, a `metadata` value), so the index line still prints Python's
+`['a', 'b']` and not JS's `a,b`. The #120 rulings and the malformed-message rulings are unchanged
+(`--suite store`: none STALE).
+
+**3. `snapshot()` stays Python-only**, hand-written in the shim on the generated `candidates` /
+`indexed` (the row in *Where the two runtimes deliberately differ*). Its callers
+(`component.Memory.batch`, `test_memory.py`, `test_memory_queries.py`, `queries_ref.py`) are unchanged.
+
+**Python-side behaviour changes, all toward Node.** The two `G3 as Node` store-root rows (a NUL, a
+lone U+D800) are closed: the generated store's file calls take the G2 path policy (`_store_path`),
+so Python saves a lone-surrogate root at U+FFFD and answers a NUL root with the store's own
+could-not-be-created sentence, as Node does (*Where the two runtimes deliberately differ*, the two
+struck rows; `--suite store` 428 cases, 11 ruled, 0 failures: the two `ruling:` cases went STALE as
+designed and nothing else did). A store root holding a surrogateescape code point (U+DC80) stays
+ruled (G2 target-specific, permanent).
+
+**TypeScript changes, each with Node's answers unchanged** (`npm test` 2460 pass / 0 fail, every
+suite above green):
+
+| Was | Is | Why |
+|---|---|---|
+| `e.message` of a `PyOSError` (the `skipped` reason); `error.strerror` in `unwritable` / `unreadable` | `pyfs.pyOSErrorText(e)` / `pyfs.pyOSErrorStrerror(e)` (new; Node: `e.message` / `e.strerror`) | a compiled read of a Python exception's `message` / `strerror` stays refused (a Node fs error spells both differently); these two are adapters onto CPython's `str(e)` / `e.strerror` |
+| `tokens`: `text.toLowerCase().match(/[a-z0-9]+/g)` | the `[A-Za-z0-9]+` runs, each lowered; a text holding U+0130 or U+212A lowered with every other non-ASCII code point read as a space | `.toLowerCase()` of arbitrary text is refused by ts2py (55 code points CPython's tables and Node's map apart; the suite's fuzz met one). Swept: every code point 0..0x10FFFF in six contexts against the old body in Node (0 differences) and the generated function against the reference's `re.findall(r"[a-z0-9]+", text.lower())` in Python (7,998,784 inputs, 0 differences, 0 refusals). Node speed, interleaved medians of 31 rounds over the live store's 91 names and descriptions: 21.25 against 21.40 ms (-0.7%); the first spelling (one `replace` pass) measured +15.6% and was dropped |
+| `if (!(OUTCOME_TYPES as …).includes(type))`, the same in `lint` | the test named in a `const`, then `if (!…)` | the proven `includes` lowers to `in`, and `not x in y` is the E713 ruff refuses; Node within 0.1% (25 rounds) |
+
+**Writes stay safe** (property 4). The atomic write is the `pyWriteTextAtomic` adapter (store.py's
+`_write_text_atomic`, statement for statement); `--suite store`'s EFBIG cases (`j65-6: #161 …`, `J89-1F
+a fact write cut short by EFBIG`, `J89-1F a save whose index.md write is cut short`) pass on the generated
+store. ENOSPC, measured in a 1 MiB Docker tmpfs (CPython 3.13 `j88rf-py3.13`, Node 22 `node:22-slim`):
+60 saves, the filesystem filled to two free pages, a 61st save. Python generated, Python at `b3e570be`
+and Node answer the same: `OSError [Errno 28] No space left on device` from the `index.md` write,
+`index.md` byte for byte the 11,390 bytes it was, no temp left, the new fact file landed (61 files).
+Concurrency: 4 Python and 4 Node processes saving 30 distinct facts each into one store and each
+rewriting one shared name after every save: 240 + 1 fact files, none lost, none duplicated, no temp
+left, every file parses, `index.md` 241 unique lines and equal to `index_text()`.
+
+**Cost, measured (J89-4b, macOS arm64, CPython 3.12.13; n = 9 interleaved rounds, medians; before =
+`b3e570be`, after = this tree; the store a copy of this repository's 91-fact `.bantamkit/memory`, HOME
+a scratch directory).** Over 20% is flagged with its cause.
+
+| Path | Before | After | |
+|---|---|---|---|
+| #204 bar: 5,000-fact recall p50 of 20 (bar 15 ms) | 6.31 ms | 8.14 ms | **+29.0%**, under the bar: `poolIndexed`'s stride-5 segment loop runs the general lowering (`_js_mul` / `_js_add` per run; J89-3's proven copy covers stride-1 loops only) |
+| first recall over 5,000 facts (builds the index) | 909.8 ms | 914.9 ms | +0.6% |
+| `_facts()` over 5,000 facts | 378.4 ms | 537.0 ms | **+41.9%**: `readFact` is general JS-semantics code, plus the codec-shape conversion each way (`held_meta`, `_fact_out`) |
+| cold `import bantamkit.memory.store` | 126.9 ms | 126.7 ms | -0.2% |
+| cold `import bantamkit.eventlog` (now imports the compiled store) | 121.0 ms | 123.4 ms | +2.0% |
+| `recall` in a fresh process | 124.7 ms | 127.8 ms | +2.5% |
+| `--hook` UserPromptSubmit, a process | 383.5 ms | 388.0 ms | +1.2% |
+| `Memory.recall` (`memory_recall`), warm | 3.80 ms | 4.50 ms | +18.3% |
+| `Memory.save_outcome` (`memory_save`) | 31.5 ms | 36.4 ms | +15.5% |
+| `MemoryStore.recall`, warm, unstamped | 284 us | 639 us | **+124.9%**: `poolIndexed` (above) and the hit's `readFact` |
+| `MemoryStore.recall`, warm, stamped | 1,048 us | 1,781 us | **+70.0%**: the same, under the ledger write |
+| `lookup`, warm | 22.3 us | 29.7 us | **+33.6%**: the generated `indexed()` / `names()` path |
+| `_facts()` / `list_facts()` / `index_text()`, 91 facts | 2.50 / 2.50 / 2.48 ms | 5.48 / 5.48 / 5.37 ms | **+119%**: `readFact` and the conversions, as at 5,000 |
+
+Every process-level path (what a hook, a CLI call or a server start pays) is within 3%; the warm
+per-call paths that read facts are not. The remedy is ts2py work (a counted-loop proof with a constant
+stride, and typed fact fields), not a shim change.
+
+**Gates.** `--suite store` 428 cases, 0 failures, 11 ruled (13 before); `--all` 23,133 cases, 0
+failures, 193 ruled; the F4 byte comparison and the sha256 header each red once on a scratch copy
+(`ts2py/committed/store.py`; `test_generated_module_names_the_typescript_on_disk[store.py]`).
+
+### The native layer (#316 G3 U3, J89-5): generated, behind its shim
+
+Since J89-5 `bantamkit.memory.native` runs `_generated/native.py`, compiled from
+`runtime-ts/src/memory/native.ts` in the G1/G2/G3 call (it imports the compiled store). The
+hand-written layer is retired; `memory/native.py` is the shim: `NativeStore` keeps its Python
+surface (a `Path` root, `Fact` / `Pool` dataclasses through the store shim's `_fact_out` /
+`_pool_out`, `index()` answering the hand-written `HotIndex`, `_indexed`, `_listing`, `_read`,
+`_named`, and the Python-only no-op `snapshot()`). A host file is read by `divergence.parse_fact`
+through the new `parseNative` adapter, the function the hand-written layer called. The layer is
+read-only on both sides: a probe over six files (two facts, a `metadata.type` fact, a file with no
+fences, a duplicate name, `MEMORY.md`) through `pool`, `resolve`, `lookup`, `candidates` and
+`count` left every file's mode, mtime and sha256 unchanged on Python generated, Python at
+`8693f406` and Node, and all three gave the same answers. (The native MIRROR on save is
+`hookadapter._export_to_native`, not this module, and is not generated.)
+
+ts2py: a type imported from a compiled module declares its data fields (`pool.facts`), and an
+annotated arrow parameter declares its fields (tokenledger.ts's `(o: Omission) => o.count`, which
+`NativeStore.count()` would otherwise refuse under J89-4a's clash ruling); `tools/ts2py/RULES.md`,
+*J89-5 rules*. TS refactors, Node's answers unchanged (`npm test` 2460 pass / 0 fail): native.ts's
+two `skipped?.push(...)` are `if (skipped != null) skipped.push(...)`, and the callback annotation.
+
+**A fix found by generating it.** The adapter that restates a hand-written `BantamError` built a
+SECOND `BantamError` class on each direct call, so a compiled `e instanceof BantamError` missed the
+restated error and the generated `candidates` raised on a malformed host file instead of skipping it.
+No case covered it; `--suite recall-strings` now has `native candidates past a malformed file and a
+duplicate name` (agreeing, plus a per-side literal), red (exit 2) against the old adapter.
+
+**Cost (J89-5, macOS arm64, CPython 3.12.13; n = 9 interleaved rounds, medians; before = `8693f406`,
+after = this tree; the native directory a copy of this project's 211-file Claude Code auto-memory,
+the project store a copy of the 91-fact `.bantamkit/memory`, HOME a scratch directory per side).**
+
+| Path | Before | After | |
+|---|---|---|---|
+| `NativeStore.pool` (warm, indexed) | 331 us | 342 us | +3.2% |
+| `pool` + `resolve` of the top rows | 925 us | 952 us | +2.9% |
+| `lookup` | 217 us | 231 us | +6.2% |
+| `candidates` (parses all 211 files) | 40.4 ms | 42.2 ms | +4.5% |
+| `count` | 211 us | 714 us | **+238%**: native.ts lists by `readdirSync` and then `statSync`s every name (`isFile`), where the hand-written layer read `os.scandir`'s cached type; two adapter speedups (`py_join` memoised, a code-point sort without the comparator) took it from 2,128 us |
+| layered `Memory.recall` (`memory_recall`, native layer last) | 14.0 ms | 14.7 ms | +5.1% |
+| cold `import bantamkit.memory.native` | 136.3 ms | 139.8 ms | +2.6% |
+| `--hook` UserPromptSubmit with the native layer, a process | 419.6 ms | 415.3 ms | -1.0% (output byte-identical, and equal to Node's) |
+
+**Gates.** `--all` 23,136 cases, 0 failures, 193 ruled; the F4 byte comparison
+(`ts2py/committed/native.py`) and the sha256 header
+(`test_generated_module_names_the_typescript_on_disk[native.py]`) each red once on a scratch edit.
+
+### The queries sidecar (#316 G3 U3, J89-5a): generated, behind its shim
+
+Since J89-5a `bantamkit.memory.queries` runs `_generated/queries.py`, compiled from
+`runtime-ts/src/memory/queries.ts` in the G1/G2/G3 call (it imports the compiled store and
+retrieval). The hand-written module is retired; `memory/queries.py` is the shim and keeps every
+name its callers use (`component`, `mcpserver`, the tests, `queries_ref.py`): the constants,
+`sidecar_path` / `terms_path` answering `Path`, `read_sidecar` a dict, `layer_terms` a dict of
+`(weights, length)` tuples (a cached row's flat list read first-wins, `+ 0.0`, as `CountsView`
+reads it), `check_queries`, `fact_sha`, `write_entries` and `status_line`. `write_entries` restates
+the TypeScript's `SidecarWriteError` as `OSError` with its message, which is what `component.py`
+catches (a lone surrogate in a query was a `UnicodeEncodeError` before; both are caught there, and
+the reply is the same `WRITE_FAILED` tail).
+
+ts2py (`tools/ts2py/RULES.md`, *J89-5a rules*): a class no export names keeps its method names in
+its own module, so `CountsView`'s `get` / `has` / `keys` do not turn every Map call of the other
+ten modules into a run-time dispatch (the other modules refuse an instance at run time instead of
+answering for it). The codec call's `factfile.py` is regenerated by the same rule (pyyaml.ts's
+private `Emitter` no longer makes its `push` calls dispatch). Adapters: `parseJson`, `dumpJson`,
+`encodeBasestringAscii` (CPython's `json`, with the int/float kind kept as tags), `sha16`,
+`pyDecodeUtf8`, `fs.writeFileSync`, and `createHash('sha1')` over a Buffer; a seeded fuzz of
+20,000 JSON texts against Node's `pyjson.ts` agreed with 0 differences. TS refactors, Node's
+answers unchanged (`npm test` green): `SidecarWriteError`'s name is a class field; `CountsView`'s
+parameter property is a declared field; `doc['facts']` is read through a binding annotated with a
+JSON type (J89-4a's clash ruling stands); `[n, [dl, c]]` is `[n, row]`; `flatMap` a loop; the
+merge builds a new Map instead of `Map.delete` (the sidecar's keys are written sorted); and the
+write's error text is `pyOSErrorText(asPyOSError(e))`, CPython's `str(e)`, on both sides.
+
+Writes are unchanged. A probe (umask 022 and 077) through `write_entries` (a first write into a
+missing directory, a merge with a removal, a lone surrogate refused, a BOM-led sidecar replaced, an
+unwritable directory) and `layer_terms` (the cache built, then read) left the same files, modes
+(0o644 / 0o600) and sha256s, and no `.tmp`, on Python generated, Python at `2737c34e` and Node;
+the one difference is the exception type above.
+
+**A fix found by generating it.** `layer_terms` (every recall) read the sidecar through
+`json.loads`, which raised `RecursionError` out of the recall on a sidecar holding an entry nested
+20,000 lists deep; Node's `JSON.parse` path reads it and skips the entry. The generated module takes
+Node's path (`_js_json_parse`, J88-2), so both rank as the same bed without the entry.
+`--suite recall-queries` `sidecar/deep: ...` (7 prompts, python against node and against the bed
+without the deep entry), red against the Python of `2737c34e` (the reference raised).
+
+**Found, not ruled, not changed (reported to the orchestrator):** `read_sidecar` (`readSidecar`, the
+`memory_queries` coverage and missing list, `bantamkit_status`) reads through `parseJson`, the port
+of `json.loads`, and the two disagree on a deep sidecar. Nested 3,000 deep, Node's recursive
+`parseJson` overflows its stack and reads the sidecar as malformed (`[]`), where CPython's
+`json.loads` reads it (`{'a': ['ok']}`); nested 20,000 deep, Node answers `[]` and Python raises
+`RecursionError`. Python at `2737c34e` and Python generated answer the same at every depth
+(the adapter is `json.loads`), so generation neither made nor moved this difference; no case pins
+it and no ruling chooses a side. **Ruled and closed by J89-5d** (below): past CPython's limit Python
+takes Node's answer; between the two limits the difference is a ruled divergence.
+
+**Cost (J89-5a, macOS arm64, CPython 3.12.13; n = 9 interleaved rounds, medians; before =
+`2737c34e`, after = this tree; the store a copy of the project's 172-file `.bantamkit/memory` and
+its real 7,142-byte sidecar, HOME and the index dir scratch per side).**
+
+| Path | Before | After | |
+|---|---|---|---|
+| `layer_terms`, cache current | 135.2 us | 431.5 us | **+219%**: the cache's validation loop (every term's `isCount`, `typeof`, `Number.isInteger`) runs through the runtime's untyped helpers, where the hand-written loop was `type(x) is int`; and `JSON.parse` is `json.loads` with JS number hooks |
+| `layer_terms`, cache rebuilt | 460.6 us | 1,240.9 us | **+169%**: as above, plus `dumpTerms` and the tokenizer's generated path |
+| `read_sidecar` | 40.0 us | 149.2 us | **+273%**: `parseJson`'s tagged value is built for every node and walked by the generated loop |
+| `check_queries` (5 queries) | 0.4 us | 9.9 us | **+2,544%**: the code-point count is a per-character loop and `forEach` a callback, where Python's was `len(x)` |
+| `write_entries` (one entry merged) | 246.9 us | 486.1 us | **+97%**: tagging and untagging the document; `fs.writeFileSync`'s UTF-8 is one strict `encode` (a surrogate scan first cost 140 us of it) |
+| `memory_queries` missing list | 1.1 ms | 1.3 ms | +13.2% |
+| `memory_queries` write (one fact) | 598.8 us | 979.2 us | **+63.5%**: `write_entries` and `check_queries`, above |
+| layered `Memory.recall` (`memory_recall`) | 3.0 ms | 3.3 ms | +9.7% |
+| cold `import bantamkit.memory.queries`, a process | 116.7 ms | 115.3 ms | -1.2% |
+| `--hook` UserPromptSubmit, a process | 410.0 ms | 415.5 ms | +1.3% (output byte-identical, and equal to Node's) |
+
+Node, the same bed (n = 9, before = `2737c34e`'s `dist`): `layerTerms` cached +0.2%, rebuilt +2.4%,
+`writeEntries` +1.4%, a removal +2.4%: the TS refactors move Node less than 5%.
+
+**Gates.** `--all` 23,151 cases, 0 failures, 193 ruled (`--suite recall-queries` 464); the F4
+byte comparison (`ts2py/committed/queries.py`) and the sha256 header
+(`test_generated_module_names_the_typescript_on_disk[queries.py]`) each red once on a scratch edit.
+
+### The layers (#316 G3 U3, J89-5b): generated, the config read kept on PyYAML
+
+Since J89-5b `bantamkit.memory.layers` runs `_generated/layers.py`, compiled from
+`runtime-ts/src/memory/layers.ts` in the G1/G2/G3 call (it imports the compiled store). The
+hand-written module is retired; `memory/layers.py` is the shim and keeps every name its callers use
+(`component`, `hookadapter`, `mcpreport`, `divergence`, `__main__`, the tests, `layers_ref.py`,
+`g3_ref.py`): `PROJECT_STORE` a `Path`, `CONFIG_NAME`, `MEMORY_DIR_ENV`, `StoreBinding` (the
+frozen dataclass, `fact_count` / `searched_from` snake_case, `Path` fields), `discover_project_store`
+and `load_grants` answering `Path`s, `resolve_project_store`, `count_facts`, `tab_sentence` and
+`_pinned_store`.
+
+**The config is still read by PyYAML (the orchestrator's ruling on J89-5's stop, option b).** It
+follows the owner's #315 ruling for fact files: generated, with PyYAML kept on the Python side.
+layers.ts's own reader (`firstTokenTab`, `parseConfigDocument` and their helpers) moved byte for
+byte into `runtime-ts/src/memory/grantconfig.ts`, which is not compiled; layers.ts imports the two
+functions and ts2py resolves them to adapters that ARE `yaml.safe_load` (one load per text): the
+tab mark read off PyYAML's own `ScannerError` as the reference's `_token_tab` read it, the document
+converted to the `ConfigDocument` the generated validator reads, a `yaml.YAMLError` a JS Error with
+`str(e)`. Every other rule of layers.ts is generated. Pathlib calls are adapters onto the same
+pathlib calls (`tools/ts2py/RULES.md`, *J89-5b rules*). TS refactors, Node's answers unchanged
+(`npm test` green, Node's `loadGrants` / `resolveProjectStore` / `discoverProjectStore` within
+-0.9%..-0.4%, n = 9 against `32831cff`'s `dist`): the move; `data.entries` read through a local
+`ConfigMapping` binding (J87-12); `e.strerror` as `pyOSErrorStrerror(e)` and the read failure as
+`pyOSErrorText(e)` (J89-4b).
+
+Python's answers are unchanged. A battery of 72 config documents (anchors, aliases, merge keys,
+tags, directives, a second document, a document end, block and folded scalars, flow mappings and
+sequences over lines, `\x` / `\u` / `\t` / `\0` escapes, a BOM, a NUL, impossible timestamps, a
+5,000-digit int, nesting 1,000 and 3,000 deep) gave byte-identical `load_grants` answers on the
+generated module and on the hand-written module at `32831cff` (exception types included).
+
+**The config family, ruled (J89-5b).** J89-5's finding, `extra_stores: &a [g]` (Python grants
+`<…>/.bantamkit/g`, Node refuses with `invalid memory config <path>: extra_stores must be a list of
+paths`), is a deliberate difference by the same ruling, and the scan for others found 28 documents
+whose OUTCOME differs (Python grants, Node refuses) and 13 where both refuse in different sentences
+(or, for `"g\t"`, after reading a different path). All 41 are one family, a document outside the
+port reader's language, and carry the three pins: the divergence row above, a `RULED: config
+outside the reader's language — <document>` case each in `--suite recall-strings`, a non-ruled
+`J89-5b outcome bit per side: <document>` companion each (each side's grant/refuse bit against a
+literal), and per-side literals of every answer. Red once: a scratch-tree shim that refused the
+anchored list with Node's sentence turned the ruling STALE and its companion and the Python literal
+red (3 failures).
+
+**Found, not ruled, not changed (reported to the orchestrator).** Seven documents are NOT this
+family: CPython raises out of `load_grants` an exception it never caught, where Node grants or
+refuses by name. An implicit timestamp PyYAML cannot construct (`k: 2001-02-30`, `2001-02-30: x`,
+`k: 2001-02-03 25:00:00`: `ValueError`, and Node GRANTS), an int past CPython's 4,300-digit limit
+(`ValueError`; Node grants), the same timestamp as a grant (`ValueError`; Node refuses), a decoded
+NUL in a grant (`"a\0b"`: `ValueError` from `Path.resolve`; Node reads `a0b` and refuses it) and a
+flow sequence 1,000 deep (`RecursionError`; Node refuses). Generation keeps Python's answer (the
+`firstTokenTab` adapter raises such an exception outside the compiled `try`, as it left
+`load_grants`). Each is pinned `ruling: UNRULED DIVERGENCE (J89-5b) load_grants — <document>` with
+its outcome-bit companion and the per-side literals; no ruling chooses a side. **Ruled and closed by
+J89-5d** (below): Python refuses each by name, and all seven joined the family.
+
+**Cost (J89-5b, macOS arm64, CPython 3.12.13; n = 9 interleaved rounds, medians; before =
+`32831cff`, after = this tree; the project store a copy of the 91-fact `.bantamkit/memory`, granted
+a second copy through `config.yaml`, the walk starting two levels below it, HOME scratch).**
+
+| Path | Before | After | |
+|---|---|---|---|
+| `discover_project_store` | 40.6 us | 42.5 us | +4.6% |
+| `resolve_project_store` | 112.4 us | 118.9 us | +5.8% |
+| `load_grants` (one grant) | 96.2 us | 110.9 us | +15.2%: the converted document and the generated validator's `_js_get` reads |
+| `count_facts` (91 facts) | 68.1 us | 69.8 us | +2.5% |
+| `Memory.layered` (project, grant, profile) | 321.7 us | 348.5 us | +8.3% |
+| layered `Memory.recall` (`memory_recall`) | 7.55 ms | 7.16 ms | -5.3% |
+| cold `import bantamkit.memory.layers` | 91.2 ms | 89.9 ms | -1.4% |
+| `--hook` UserPromptSubmit, a process | 423.1 ms | 421.6 ms | -0.3% (output byte-identical, and equal to Node's) |
+
+**An instrument followed the lever.** `divergence.writer_store_env_names` (the register of env
+names the writer's store resolution reads, Python-only, off the MCP path) scanned `memory/*.py`;
+once the shim no longer spells `BANTAMKIT_MEMORY_DIR` the scan found nothing and
+`test_no_environment_variable_moves_the_writers_store_behind_this_resolvers_back` went red. It now
+also scans the generated body of each memory shim (`from bantamkit._generated import <x> as`) and
+treats a module's `__all__` strings as names, not env reads (`_generated/store.py` lists
+`BANTAMKIT_GITIGNORE_TEXT`): the population is `{BANTAMKIT_MEMORY_DIR}` again, read from
+`_generated/layers.py`, so a lever added to `layers.ts` is seen.
+
+**Gates.** `--all` 23,250 cases, 0 failures, 241 ruled (`--suite recall-strings` 261, 50 ruled);
+the F4 byte comparison (`ts2py/committed/layers.py`) and the sha256 header
+(`test_generated_module_names_the_typescript_on_disk[layers.py]`) each red once on a scratch edit.
+
+### The dream (#316 G3 U3, J89-5c): generated, behind its shim
+
+Since J89-5c `bantamkit.memory.dream` runs `_generated/dream.py`, compiled from
+`runtime-ts/src/memory/dream.ts` in the G1/G2/G3 call (it imports the compiled store). The
+hand-written module is retired; `memory/dream.py` is the shim and keeps every name its callers use
+(`component`, `memory/__init__`, `test_memory_dream.py`, `dream_ref.py`): `PROJECT_LAYER`,
+`PROFILE_LAYER`, `SUPERSEDED_HEADING`, the frozen dataclasses `DateHit`, `Superseded`, `DreamMerge`,
+`SimilarPair` and `DreamResult` (with `over_budget`, `changes`, `superseded`) holding Python values,
+and `collapse`, `block_key`, `split_blocks`, `claim_slot`, `union_keywords`, `absolutise`,
+`merge_descriptions`, `merge_links`, `merge_bodies`, `dream`. Values cross through the codec
+(`held_values` / `native_value`), the stores as the generated store each `MemoryStore` wraps, and a
+JS `TypeError` / `AttributeError` the generated pass throws reaches a caller as the bare Python
+exception the reference raised, with its text. The private helpers (`_resolve`, `_consume`,
+`_size`, `_rebuild_if_present`, the compiled patterns) had no caller outside the module and are gone.
+
+**The patterns are CPython's own.** Every pattern dream.ts built at run time from `pysem`'s CPython
+classes under the `u` flag (`RELATIVE`, `UNRESOLVED`, `STAMPED`, `BULLET`, `SLOT`, `\s+`) moved byte
+for byte into `runtime-ts/src/memory/dreamre.ts`, which is not compiled, with `pyIntDigits` and
+`formatFixed3`; each is a port of a `dream.py` pattern or call, so ts2py reaches it through an
+adapter that runs that CPython pattern or call (`tools/ts2py/RULES.md`, *J89-5c rules*). Every other
+rule of dream.ts is generated. TS refactors, Node's answers unchanged (180,014 calls of dream.js's
+exported functions over a seeded corpus, 053569d5's `dist` against this tree's: 0 differences;
+`npm test` green): the move (the relative scan hands back each match's `lead` and a `tail`, so no
+string position crosses the seam, and its count group is `digits`); `SUBJECT_OK` without its no-op
+`u`; `flatMap` a loop; `pyHashKey` in an inline arrow; `store.internals()` destructured into locals
+(a property call of a name a compiled class declares is dispatched, and refused on a plain object).
+One runtime extension: `s.split(re)` (G3-29), which `splitBlocks` needs.
+
+**Python's answers are unchanged but for the ruling.** The day-table lookup is dream.ts's, so a
+matched spelling that is not a key (`tonıght`, `TONİGHT`, `yeſterday`) is reported unresolved where
+the hand-written `_resolve` raised `KeyError`: the orchestrator's ruling on J89-5 (node is right).
+The J89-2 UNRULED case went STALE by design and is an agreeing case with per-side literals, joined by
+U+0130 and `yeſterday` (U+017F, the same lookup, never pinned before); red against 053569d5's python
+(6 failures). The write probe below and every `--suite dream` scenario (plan and both trees) are
+otherwise byte-identical to the hand-written module.
+
+**Found, not ruled, not changed (reported to the orchestrator).** Two counts `int()` and node's
+`pyIntDigits` read differently, the same before and after generation (the compiled dream reaches
+`int()` through the adapter): a digit of U+1D7D8..U+1D7FF (four ten-digit Nd blocks that follow the
+bold digits; node's walk back to the block's zero stops nine codepoints down and reads every one as
+9: `𝟘 days ago` is 2026-08-28 on node and 2026-09-06 on python), and a count of more than 4,300
+digits (`int()` raises `ValueError` out of `dream()`; node reports the term unresolved). Each is
+pinned `ruling: UNRULED DIVERGENCE absolutise: …` with a literal per side in `--suite dream`; no
+ruling chooses a side. **Ruled and closed by J89-5d** (below): Node's digit fixed, Python's limit
+case answers Node's. UCD skew (a Unicode 16 assignment such as U+10D40, an Nd digit and a word
+character to Node's ICU and unassigned to CPython 3.12) moves `\b`, `\d` and `lower()` as the
+`candidates_done` row above describes; it is unchanged by generation.
+
+**Writes (J89-5c probe, both sides).** One bed (an identical pair, a diverged pair with a slot
+contradiction, mtimes and modes 0640 / 0600 / 0604, keywords and an extra key, a project-only fact
+with relative dates, a profile-only fact, a project `index.md` and none in the profile) applied
+with `dry_run=False` under umask 022 by 053569d5's python, this tree's python and Node: the three
+trees are identical file for file, byte for byte and mode for mode (the profile copies moved to
+`archive/` keeping 0604 and 0600, the survivors rewritten 0644 through the atomic write, the
+profile store still without an `index.md`).
+
+**Cost (J89-5c, macOS arm64, CPython 3.12.13, Node v26.13.0; n = 9 interleaved rounds, medians;
+before = `053569d5`, after = this tree; the project store a copy of the repository's
+`.bantamkit/memory`, the profile a copy of `~/.bantamkit/memory`, 313 files, HOME scratch).**
+
+| Path | Before | After | |
+|---|---|---|---|
+| cold `import bantamkit.memory.dream` | 91.4 ms | 92.2 ms | +0.9% |
+| `absolutise` (a 9-term body) | 38.7 us | 165.9 us | **+329%**: dream.ts's day arithmetic (`isoFromOrdinal` walks the years of a 400-year cycle) compiled, in place of CPython's C `date + timedelta`; ~14 us a term |
+| `merge_bodies` | 77.3 us | 120.4 us | **+56%**: the compiled `splitBlocks` / `claimSlot` / `blockKey` through the runtime's UTF-16 helpers and the adapter's dicts, in place of three `re` calls |
+| `claim_slot` | 1.41 us | 2.60 us | **+85%**: the same |
+| `dream` dry run (the two stores) | 398.9 ms | 334.7 ms | -16.1% |
+| `memory_dream` (`Memory.layered(...).dream_outcome(True)`) | 398.5 ms | 332.8 ms | -16.5% |
+| `--hook` UserPromptSubmit, a process | 377.6 ms | 372.8 ms | -1.3% (output identical) |
+| Node `absolutise` / `dream` dry run / import | 5.37 us / 45.1 ms / 9.68 ms | 5.37 us / 45.2 ms / 9.71 ms | +0.0% / +0.3% / +0.3% |
+| Node `mergeBodies` / `claimSlot` | 36.5 us / 0.633 us | 30.6 us / 0.409 us | -16.3% / -35.4% (faster; cause not isolated: the `u`-less `SUBJECT_OK` alone measured equal) |
+
+The user path is faster: the pass is dominated by the generated store's reads, and the per-call
+regressions above are microseconds a fact.
+
+**Gates.** The F4 byte comparison (`ts2py/committed/dream.py`) and the sha256 header
+(`test_generated_module_names_the_typescript_on_disk[dream.py]`) each red once on a scratch edit.
+`--all` 23,263 cases, 0 failures, 242 ruled (`--suite dream` 148, 2 ruled). The repo map's own
+test over this package (`test_repomap.py`, `repomap.test.mjs`) focused `memory/dream.py` and
+expected `memory/store.py` in its top three; the shim imports the codec's converters too, so
+`memory/factcodec.py` ranks first and `memory/store.py` sixth, and both tests say so.
+
+### Three crashes ruled, and a digit fixed (#316 G3, J89-5d)
+
+The orchestrator ruled the three findings J89-5a, J89-5b and J89-5c left unruled. The rule for all
+three: **a crash is a bug**, so where CPython raised out of a user path, Python takes Node's answer.
+Generation is not involved, and the generated modules are unchanged. Every Python change is an
+adapter in `tools/ts2py/src/adapters.py`, written out as `_generated/_ts2py_adapters.py`.
+
+**The queries sidecar, nested.** `parse_json` (the `parseJson` adapter, which reads the sidecar
+for `readSidecar` and for the merge in `writeEntries`) now answers `json.loads`'s `RecursionError`
+with the RangeError `Maximum call stack size exceeded`, which is what Node's recursive `parseJson`
+throws. The compiled `catch` sees that error, so the sidecar is malformed on both sides.
+- Python's coverage, missing list, write and status no longer raise on a sidecar nested 20,000 or
+  100,000 deep. They answer as the bed with no project sidecar, and a write replaces the sidecar.
+- Between the two limits, the two sides differ by ruling. Node's limit is 1,562 cold and 6,902
+  optimised; CPython's is 9,994. See the divergence row above, pinned at 8,500.
+  **Superseded by J89-5e** (below): CPython's limit is 9,994 only on 3.12 and 3.13, so Python now
+  reads to a fixed 512 and the ruled band is 512 to Node's stack, pinned at 513; 8,500 agrees.
+
+**The scan for the same shape (rule 3)** was a probe of both sides at 3,000, 8,500 and 100,000 deep:
+- **The term cache** (`cached`, `JSON.parse`) agreed on a deep entry, a deep row and a deep extra
+  key: same rows, same cache bytes after.
+- **The usage ledger** (`LogSegment._load`, `JSON.parse`) agreed with deep values in `keywords`,
+  `weight`, `last`, `ts`, a stray key and a whole line. `weights`, `last_used_map`, `census`,
+  `keywords_copy` and the fold were identical; the fold keeps a deep save line as it was read.
+- **The pricing table** (`decodePriceJson`) agreed on a deep `note` and on a deep token-class rate:
+  same `PriceTableError`. Its validation looks only one level down.
+- **The event log** and **the store** have no JSON read in their generated modules. The event log
+  writes `number | boolean | string` details. The store stringifies `[file, mtime_ns, size]`.
+- **The token ledger and the log segment** are pinned at 100,000 deep by J88-2.
+
+Each `JSON.parse` lowering, `_js_json_parse`, reads any depth without recursing, as V8 does (J88-2).
+`parseJson` was the only recursive JSON read on a user path. Nothing found fits neither rule.
+
+**The grants config: seven crashes are now refusals.** `yaml.safe_load` raised a `ValueError` for a
+scalar PyYAML resolves but cannot construct, and a `RecursionError` past CPython's limit. The
+`firstTokenTab` adapter now holds that error instead of raising it out of `loadGrants`.
+`parseConfigDocument` then throws it as a JS Error, which the compiled `catch` turns into
+`invalid memory config <path>: <reason>`. The reasons:
+- CPython's own `str(e)` for a scalar that cannot be constructed, for example
+  `day is out of range for month`;
+- `the document is nested too deeply to read` past CPython's limit;
+- `extra_stores must be a list of paths` for a NUL that PyYAML decoded into a grant. A path holding
+  NUL names nothing, so the item is not a path. Before, `Path.resolve` raised `ValueError`.
+
+The seven rows of `--suite recall-strings` are now in the family (48 documents) with its three
+pins. Against 053569d5's Python, each of the seven outcome-bit companions and the Python literal
+went red: 8 failures. A raw NUL in the YAML text is unchanged: it is still the both-refuse row.
+
+**The dream's counts.**
+- **Node's `pyIntDigits` was wrong.** It walked back at most nine code points to a block's zero.
+  U+1D7CE..U+1D7FF is five ten-digit blocks back to back, so every digit of the last four blocks
+  read as 9 (36 of 40 wrongly). It now reads a digit's distance from the start of its run of `Nd`
+  code points, modulo ten. Swept over every code point CPython 3.12's `int()` accepts (680): 0
+  differences. The sweep is a case in `--suite dream`; against a4321fdf's Node, it named the 36.
+- **Python raised on long counts.** A count of more than 4,300 digits raised `ValueError` out of
+  `dream()`. The `pyIntDigits` adapter now reads such a run as Node does: leading zeros dropped,
+  and infinity past 400 digits. CPython's limit is left where it is.
+  - So 4,301 nines is unresolved on both sides.
+  - A zero-padded 4,301-digit `…03 days ago` resolves to three days on both sides.
+
+The two UNRULED cases are now agreeing `J89-5d absolutise: …` cases, with a per-side literal each,
+and a second mathematical spelling and the padded count are added. Against a4321fdf, nine cases
+went red, on Node and on Python.
+
+**Red once, each, in a scratch worktree with this change's suites.**
+- `--suite recall-queries` against 32831cff's `runtime-py/src` stopped on the reference's
+  `RecursionError` (exit 2).
+- `--suite recall-strings` against 053569d5's: 8 failures.
+- `--suite dream` against a4321fdf's `runtime-py/src` and `dreamre.ts`: 9 failures.
+
+**Gates.** `--all` 23,289 cases, 0 failures, 241 ruled (242 before: the two dream rulings became agreeing
+cases, and the nested-sidecar ruling was added). By suite: `--suite recall-queries` 482 (1 ruled),
+`--suite recall-strings` 261 (50 ruled), `--suite dream` 156 (0 ruled), `--suite ts2py` 464,
+`--suite store` 428, `--suite recall-usage` 256, `--suite eventlog` 131 and `--suite wire` 712, each
+with 0 failures. ts2py `cargo test`: 87 passed (`j89_5b_layers_adapters_answer_like_the_reference`
+now holds the held error, the two refusals and the NUL item); clippy (`-D warnings`) and fmt are
+clean. `npm test`: 2,460 passed, 0 failed, 47 skipped. Full pytest: 5,335 passed, 0 failed. ruff is
+clean.
+
+
+### The nested sidecar on every supported CPython (#316 G3, J89-5e)
+
+J89-5d ruled the band between Node's stack and CPython's `json.loads` limit at 8,500, measured on
+3.12. The orchestrator probed 3.11, the supported floor: there `json.loads` of an array 8,500 deep
+raises `RecursionError`, so Python answered `[]` as Node does and the ruled case went stale, and
+between ~980 and Node's cold 1,562 the band ran the other way, unpinned. **Ruled (J89-5e): Python's
+answer must not depend on the CPython version or its recursion limit.**
+
+**Measured** (Docker, `python:3.11-slim`, `python:3.12-slim`, `python:3.13-slim`, `python:3.14-slim`,
+default recursion limit 1,000; a binary search over `json.loads('[' * n + ']' * n)`):
+
+| CPython | top level | 50 / 100 / 200 / 400 frames deeper | inside `parse_json` on the MCP path |
+|---|---|---|---|
+| 3.11.18 | 991 | 941 / 891 / 791 / 591 | 979 (978 one frame deeper) |
+| 3.12.16 | 9,997 | 9,997 | 9,993 |
+| 3.13.18 | 9,998 | 9,998 | 9,994 |
+| 3.14.10 | none (20,000, the probe's ceiling) | | |
+
+The MCP path is the real server under the real SDK (`memory_save`, `memory_queries` coverage and
+write, `memory_recall`, `bantamkit_status`): `parse_json` runs 14-15 frames deep in the AnyIO worker
+thread. The hook path (`--hook` UserPromptSubmit, SessionStart, Stop) is as shallow (981, on a local
+3.11.15).
+
+**The change.** `parse_json` (the `parseJson` adapter) reads at most 512 deep
+(`_PARSE_JSON_DEPTH`), counted as `JSON.parse` nests: each array or object one level, the outermost
+included. Past it, the RangeError `Maximum call stack size exceeded`, which the compiled `catch`
+sees, so the sidecar is malformed. 512 is below every supported CPython's limit, with more than 450
+frames to spare on 3.11, where the real paths use 15. The depth is found by `_json_too_deep`, a non-recursive
+scan of the brackets outside strings; the 513th opener counts only when `json.loads` of the text
+before it stops there with `Expecting value` (a well-formed prefix wanting a value), so a text
+malformed earlier keeps `json.loads`'s own refusal, as a recursive descent would give it. A text
+with no more than 512 brackets is not scanned. `RecursionError` stays mapped to the same RangeError
+as the backstop, and the recursion limit is not touched.
+- Checked against an oracle: CPython 3.11's `json.loads` with the recursion limit set so it reads
+  exactly 512 deep, over 20,000 seeded texts nested around 512 in arrays and objects, with random
+  corruptions. 0 differences in outcome (read, refused, too deep), but for 31 texts where 3.11 itself
+  raised `RecursionError` while building a decode error within two frames of its limit: each is
+  malformed no deeper than 512, and `parse_json` refuses it with `json.loads`'s message.
+- The outcome of 20,000 more seeded texts (trailing commas included) hashes the same on 3.11, 3.12
+  and 3.13.
+- A 1.8 MB sidecar of 3,000 facts scans in 13 ms (its `json.loads` is 3 ms).
+- `cargo test`: `j89_5e_parse_json_reads_a_fixed_depth` pins 512 and 513 in arrays and in objects,
+  brackets inside strings, refusals before the deep opener, and the same answers with the recursion
+  limit lowered to 600.
+
+**The cases** (`--suite recall-queries`): the ruling moved to 513, the first depth past Python's
+(`ruling: sidecar/nested — read of a sidecar nested 513 deep (between python's limit of 512 and
+node's stack)`, in lists and in objects), with its per-side literals; new agreeing cases at 512 in
+lists and in objects, where both read, with per-side literals; 8,500 joined 20,000 and 100,000 as
+agreeing (both read it as no sidecar). Depth now means the whole document's, the sidecar's own
+three objects included. Against 8539b384's `runtime-py/src` (a scratch worktree, this suite): 4
+failures on 3.12 (the stale ruling, the Python literal at 513, and 8,500 now agreeing) and 2 on
+3.11 (the stale ruling and the Python literal at 513). With this change the suite passes with a
+3.11, a 3.12 and a 3.13 reference interpreter (`--python`, venvs made by `uv` with the repo venv's
+pinned versions).
+
+**The other JSON reads J89-5d scanned do not take the limit.** The term cache (`cached`), the usage
+ledger and the log segment (`LogSegment`), the token ledger and the pricing table all read through
+`_js_json_parse`, the `JSON.parse` lowering: it catches `RecursionError` and rereads without
+recursing (J88-2), so its answer is an unlimited read on every CPython, as V8's `JSON.parse` is.
+Applying 512 there would make a divergence where there is none. `--suite recall-usage`,
+`tokenledger`, `storage-log`, `pricing` and `eventlog` pass with 3.11 and 3.13 reference
+interpreters too.
+
+**Gates.** `--all` 23,298 cases, 0 failures, 241 ruled (23,289 before: nine cases added, and the
+one ruling moved from 8,500 to 513). By suite: `--suite recall-queries` 491 (1 ruled),
+`--suite recall-usage` 256, `--suite ts2py` 464 and `--suite wire` 712, each with 0 failures.
+ts2py `cargo test`: 88 passed; clippy (`-D warnings`) and fmt are clean. `npm test`: 2,460 passed, 0
+failed, 47 skipped. Full pytest: 5,335 passed, 0 failed. ruff is clean.
+
+**Left open (found, not changed here).** The same version dependence is outside the generated
+modules. The hand-written `json.loads` / `parseJson` pairs (`hookadapter`, `hostinstall`,
+`skillfile`, `client`, `mcpreport`, `contract`) still read to CPython's own depth. A transcript line
+1,200 deep makes `hookadapter._previous_prompt` answer `''` on 3.11 and `'first prompt'` on 3.12,
+3.13 and Node. CPython 3.13 also changed `json.loads`'s refusal for a trailing comma (`Illegal
+trailing comma before end of object: … (char 6)` where 3.11 and 3.12 say `Expecting property name
+enclosed in double quotes: … (char 7)`), so `parse_json`'s message moves with the version. The
+sidecar's bare `catch` cannot see it, but `j89_5a_queries_adapters_answer_like_node` fails with
+`TS2PY_PYTHON` set to 3.13. PyYAML's depth for the grants config does not move with the version
+(492 nested flow sequences at the top level on 3.11, 3.12 and 3.13), but it does move with the
+caller's stack.
+
+### Lowercase and digits on every supported CPython (#316 G3, J89-7)
+
+J89-R found two things that moved with the interpreter's Unicode table.
+
+**Lowercase (F1, fixed).** `blockKey`, `claimSlot` and `mergeDescriptions` key on
+`.toLowerCase()`. ts2py's runtime helper raised `TypeError` on any U+03A3 and on 55 code points.
+So on a fact present in both layers, a body, claim or description in ordinary Greek made Python's
+`memory_dream` fail, and the Stop hook's dream child exit 1 (and spawn again on every Stop). Main's
+Python and Node merged it, with the same bytes. The helper (`tools/ts2py/src/runtime.py`) now
+answers as Node 26.13 does, measured over every code point on CPython 3.11, 3.12, 3.13 and 3.14:
+- **The 55 code points.** CPython 3.11 to 3.13 have no lowercase for any of them (`Cn` there; 28 on
+  3.14). Each maps one code point to one code point in Node. The helper maps them to Node's answer
+  first, then calls `str.lower()`. Every single code point matches Node, with 0 refused.
+- **Final sigma.** J89-7 still lowered U+03A3 with `str.lower()` and raised when the walk out
+  from it reached a code point CPython has as `Cn`, or U+0295, or U+1171E. J89-R2 found that
+  refused far more than it had to: `ΓΕΙΑ ΣΑΣ🫩` (U+1FAE9, Unicode 16) in both layers made Python's
+  dream raise on 3.11 to 3.13 (`🩷`, U+1FA77, on 3.11), where Node merged and both would pick `ς`.
+  Since J89-7b the helper lowers each U+03A3 itself, by Unicode's Final_Sigma walk, and never
+  refuses. The walk skips Case_Ignorable code points and asks whether the first other one is
+  Cased. For the code points the two tables classify apart, it uses Node's class, embedded as
+  ranges (`_JS_SIGMA_NODE`). Everywhere else it uses CPython's own, read back off `str.lower()`.
+  J89-7b's sweep probed every code point in both walk directions, against Node 26.13. The two
+  tables classify 307 apart on 3.11, 196 on 3.12 and 3.13, and 100 on 3.14, each set inside
+  3.11's. Every one is `Cn` to CPython but U+0295 and U+1171E. Both sides walk symmetrically
+  everywhere. Embedding Node's class answers all inputs; keying a refusal on
+  `unicodedata.unidata_version` would still refuse those 307 (or 196, or 100).
+
+So `ΣΟΦΟΣ`, `ΟΔΟΣ 🫨` and `ΟΔΟΣ🫨`, `ΑΣ` directly before U+0378, ǅ and U+1C89 answer as Node does on
+every supported CPython. Nothing refuses. The measure, the eleven contexts of J89-R2 over every code
+point (12,255,232 strings), its 402,145 fuzzed strings, and every pair of the 307 in four contexts
+(407,044), on CPython 3.11.15, 3.12.13, 3.13.18 and 3.14.10:
+
+| CPython | J89-7 (8165f9a7): ok / refused | J89-7b: ok / refused | wrong, before and after |
+|---|---|---|---|
+| 3.11 | 3,956,872 / 8,298,360 · fuzz 366,129 / 36,016 · pairs 4,108 / 402,936 | all ok, 0 refused | 0 |
+| 3.12 | 4,001,762 / 8,253,470 · fuzz 372,918 / 29,227 · pairs 63,316 / 343,728 | all ok, 0 refused | 0 |
+| 3.13 | 4,008,032 / 8,247,200 · fuzz 372,918 / 29,227 · pairs 63,316 / 343,728 | all ok, 0 refused | 0 |
+| 3.14 | 4,059,882 / 8,195,350 · fuzz 382,628 / 19,517 · pairs 201,616 / 205,428 | all ok, 0 refused | 0 |
+
+There is no ruling, because the two runtimes agree. A string without U+03A3 is `str.lower()`. The 55
+are translated first only when a precompiled class of ranges finds one. J89-R2 measured the
+`translate` on every non-ASCII string as 2.01 → 12.85 µs. J89-7b measured a 63-character Thai and
+Latin string without U+03A3 on 3.12 at 2.68 µs on 8165f9a7 and 0.55 µs now (`str.lower()` alone:
+0.17 µs). `--suite dream` has four arms (`J89-7 dream lowercases …`), each with a block that differs
+only in case: Greek with a medial-sigma twin, U+1C89 against U+1C8A, ǅ against ǆ, and (J89-7b)
+`ΣΑΣ🫩` and `ΣΑΣ🩷` with a `σασ🫩` twin. Each arm compares the plan and both trees, plus a per-side
+literal survivor. The first three were red on c4fc46d9 on 3.11, 3.12 and 3.13. The fourth was red
+on 8165f9a7 on the same three. `--suite ts2py` compares 28 inputs against Node's `toLowerCase()`
+(`runtime/toLowerCase …`). Four of them put each of the 307 on both sides of a U+03A3. The 10
+inputs J89-7 and J89-R2 found refused, which now answer, are pinned against Node's answer typed into
+the suite. Flipping one range's class in the table (cased to neither, ignorable to neither) reddens
+those cases.
+
+**Relative dates and the interpreter's Unicode table (F2, documented).** Node's `pyRelativeScan` and
+`pyIntDigits` reproduce CPython 3.12's `\d` (UCD 15.0, 680 digits). CPython 3.11's `int()` and `\d`
+read UCD 14.0 (660). So on 3.11, a count spelled in one of the 20 digits Unicode 15.0 added (Kawi
+U+11F50..U+11F59, Nag Mundari U+1E4F0..U+1E4F9) is not a count to Python. `It landed 𑽓 days ago.`
+stays unresolved there, where Node and CPython 3.12 to 3.14 date it 2026-09-03. Main's
+hand-written dream did the same. This was not changed: the adapter is Python's own `re` and
+`int()`, and pinning 3.11 to 15.0 would mean carrying a digit table for `\d`, `\b` and `\w`. In
+`--suite dream`, the digit-count literal is keyed on the UCD version the reference reports: 660 on
+14.0, 680 on 15.0 and 15.1, 760 on 16.0 (3.14). An unknown version is red. Each count went red on
+3.11 and 3.12 when moved by one. A `ruling:` case pins the 3.11 Kawi answer, with each side's
+literal; from UCD 15.0 the same case is an agreeing one.
+
+### The component (#316 G3 U4, J89-6): generated, behind its shim
+
+Since J89-6 `bantamkit.memory.component` runs `_generated/component.py`, compiled from
+`runtime-ts/src/memory/component.ts` in the G1/G2/G3 call (it imports the compiled store, native
+layer, queries sidecar, layers, dream, retrieval and usage ledger). The hand-written 1,745-line
+module is retired; `memory/component.py` is the shim. G3 is generated end to end: usage,
+retrieval, store, native, queries, layers, dream and component.
+
+**The shim** keeps every name its callers use (grep over runtime-py, its tests and tools/, then the
+suites): `Memory` with `layered`, `layered_for_eval`, `save` / `save_outcome` (and the old `_save`
+/ `_recall` aliases), `recall` / `recall_outcome` / `recall_file`, `layer_stores`, `inject_candidates`,
+`rank_all`, `usage`, `usage_census`, `queries_coverage` / `queries_missing` / `queries_write`,
+`index_accounting`, `compact` / `compact_outcome`, `dream` / `dream_outcome`, `store`, `k`,
+`repaired`, and the privates callers reach (`_layers`, `_show_layers`, `_binding`, `_pooled`,
+`_fact_count` for `mcpserver`'s status line, `_unreadable_layers`, `_searchable_facts`,
+`_walk_ascended`, `_binding_diagnosis`, `_is_profile_store`); the frozen `SaveOutcome`,
+`RecallOutcome`, `CompactOutcome`, `DreamOutcome` (its `result` the dream shim's `DreamResult`);
+and `normalize_name`, `_profile_store`, `_same_directory`, `_layer_label`. The boundary follows
+J89-4b ruling 1: Python callers keep the dataclasses and plain values, facts cross as `Fact`s (the
+store shim's `_fact_out`), a `TouchContext` as the object component.ts reads, a `StoreBinding` as
+the layers module's shape, and a JS `TypeError` as the bare `TypeError`.
+
+The layers are the stores a Python caller holds. The generated component constructs its stores
+with `new MemoryStore(...)`; the shim binds that name in the generated module to the store shim's
+core (`_Core`, which now also takes `(root, options)` and makes its own `MemoryStore` shim), so
+every layer, the project store included, is a core with a Python face: `Memory.store` and
+`_layers` hand back the same `MemoryStore` objects whose `snapshot()` pins what the generated
+component reads. A native layer's face is made once, on first read; the skill layer is the
+`SkillStore` adapter over the hand-written `SkillStore`. `_layers` is a list a caller may append
+to or insert into (the eval harness, the dream and queries tests do): the layer is bound into the
+generated component's own list. The usage ledger the component builds is the usage shim's (its
+fold and rotate thresholds read at call time). `RECALL_MIN_SCORE_RATIO` and `_profile_store`,
+which `tools/eval/recall/tune.py` and `test_memory_compact_tool.py` rebind on this module, are
+forwarded to the generated module, as `retrieval`'s weights are. `setup()` and `batch()` stay
+Python-only (ruling 1; *Where the two runtimes deliberately differ*).
+
+**What is not compiled, and how it is reached** (`tools/ts2py/RULES.md`, *J89-6 rules*). The skill
+layer, the touch modules, the asset pack, the reply-language frame and CPython's `str.lower()`
+are reached through 15 adapter rows onto the hand-written modules component.ts's imports port.
+Two moves made that possible without changing Node: `recallFile`'s repository half
+(`process.cwd()`, `findRepo`, the touch graph over the layers, `lsFiles`, `FileSet`, the history
+line, the linked names) moved statement for statement into `touch/recallfile.ts`'s `fileLinks`,
+and `fire`'s three calls into `skills.ts`'s `fireOn`; the adapters make the reference's calls in
+the reference's order. The census counted 82 refusals; the TS refactors that cleared the rest
+(named imports for two namespaces, counted loops for `findIndex` and destructured `forEach`
+parameters, `layerKind` for `split(':', 1)[0]`, `[...text]` for `Array.from(text)`, a `map` copy
+of `PROJECT_STORE`, destructures for three property reads ts2py takes for method values, the
+private `usage()` renamed `ledger()`) leave Node's answers unchanged: 25a9fadc's `dist` against this
+tree's over a 41,166-record seeded corpus of component calls and store trees, 0 differences (three
+wall-clock fields masked that differ between two runs of one dist too); `npm test` green.
+
+**Python's answers are unchanged.** One Python-only harness answer differs from Node's and is kept
+at the boundary rather than chosen: `layered_for_eval` with an engine other than `v2` raises
+`ValueError("unknown engine: 'v1'")` as the reference did, where component.ts throws an `Error`
+with the engine JSON-quoted (`unknown engine: "v1"`); no MCP tool, CLI or hook reaches it, and no
+ruling covers it (reported to the orchestrator). `normalize_name` reaches `str.lower()` through
+`pyLower`, where ts2py's `.toLowerCase()` would refuse `Σ` (a case `--suite store` pins); since
+J89-7b that adapter is the runtime's `toLowerCase()` (see *Lowercase and digits*). Three
+tests that reached the hand-written internals follow the generated ones:
+`test_layered_reads_every_layer_and_ranks_them_as_one` spies on the profile store's core (the
+method the component calls), and `queries_ref.py` hooks the generated `QueryScorer.column` and the
+generated `layer_terms` beside the Python ones it already hooked (the trace and `force_off` read
+what the generated walk does).
+
+Parity beyond the suites: a seeded plan of 33,105 calls (20,000 `normalizeName`; 1,000 scenarios
+over `layered`, `layeredForEval` and a budgeted store, with and without a skill, a native directory,
+a profile collision and the trigger switch: save, recall, recall by name, `includeArchived`, the
+outcome filter, queries listing, writing and coverage, compact, dream dry and applied, inject, rank,
+accounting and the binding diagnosis) run by Node and by the generated Python and serialized by
+`JSON.stringify` / its port: identical.
+
+**Writes (J89-6 probe, both sides).** One bed under umask 022: 16 saves across the project store,
+the profile store and a budgeted store (a duplicate nudge for a bent name, a validation refusal,
+four budget refusals, a 0640 fact rewritten), a queries write, a stamped recall (ledger line and
+read-repair), a dream applied across a diverged name collision with mtimes set, and two compactions
+(three facts archived), through 25a9fadc's Python, this tree's Python and Node: the three trees
+(28 entries) are identical byte for byte and mode for mode, and all 21 replies are identical. Concurrency: 4 Python and 4 Node processes saving 30 distinct facts
+each through `Memory.save` into one store, each rewriting one shared name after every save (480
+saves): 241 fact files, none lost, none duplicated, every one parses, no temp left, `index.md` 241
+unique lines and equal to `index_text()`.
+
+**Cost (J89-6, macOS arm64, CPython 3.12.13, Node v26.13.0; n = 9 interleaved rounds, medians;
+before = `25a9fadc`, after = this tree; the project store a copy of this repository's
+`.bantamkit/memory`, the profile a copy of `~/.bantamkit/memory`, 314 files, HOME scratch; each MCP
+tool called through `build_server` over an in-process `mcp` client, median of three warm calls).**
+
+| Path | Before | After | |
+|---|---|---|---|
+| cold `import bantamkit.memory.component` (a process) | 118.28 ms | 118.71 ms | +0.4% |
+| `memory_recall` | 2.46 ms | 2.80 ms | +13.6% |
+| `memory_recall`, a name-shaped query | 1.44 ms | 1.44 ms | +0.5% |
+| `memory_save` | 32.02 ms | 31.93 ms | -0.3% |
+| `memory_queries` (the missing list) | 1.58 ms | 2.18 ms | **+38.1%**: the body excerpt (`[...body].slice(0, 600).join('')`) spreads each body into one-character strings and joins them through the general `join` lowering (a nullish test and `_js_str` per character), in place of a slice |
+| `memory_compact` | 12.51 ms | 12.59 ms | +0.6% |
+| `memory_dream` (dry run) | 343.33 ms | 341.15 ms | -0.6% |
+| `bantamkit_status` | 12.64 ms | 12.08 ms | -4.4% |
+| `--hook` UserPromptSubmit, a process | 366.73 ms | 363.49 ms | -0.9% |
+| #204 bar: 5,000-fact recall p50 of 20, a new `MemoryStore` each (bar 15 ms) | 8.03 ms | 7.99 ms | -0.5% |
+| the same through a new `Memory` each | 10.96 ms | 11.99 ms | +9.3% |
+| Node import / `recallOutcome` / `saveOutcome` / `queriesMissing` / `dreamOutcome` | 18.51 / 1.029 / 25.78 / 0.769 / 45.94 ms | 18.22 / 1.013 / 25.86 / 0.755 / 45.58 ms | -1.5% / -1.5% / +0.3% / -1.9% / -0.8% |
+
+Every process-level path is within 1%; the one flag is a per-call 0.6 ms on the queries listing,
+whose remedy is ts2py work (a join of a list proven to hold strings), not a shim change.
+
+**Gates.** The F4 byte comparison (`ts2py/committed/component.py`, 60,037 bytes committed against
+60,035 fresh) and the sha256 header (`test_generated_module_names_the_typescript_on_disk[component.py]`)
+each red once on a scratch edit, then green. `--all` 23,299 cases, 0 failures, 241 ruled (no
+ruling moved, none STALE). ts2py `cargo test` 90 passed (`j89_6_component_compiles_with_the_g3_call`,
+`j89_6_component_adapters_answer_like_node` added); clippy (`-D warnings`) and fmt clean. `npm test`
+2,460 passed, 0 failed, 47 skipped (`memory-skills.test.mjs` reads the ledger path through the
+renamed private `ledger()`). Full pytest 5,337 passed and one failed, `test_build_identity`'s
+k-floor mutation, which edited the hand-written line; it now edits the generated one, and the file
+passes (12). The touched pytest files under `python:3.11` in Docker, `test_storage_bar.py` among
+them: 604 passed. ruff is clean. A 20,000-query fuzz of the exact-name walk (the name-shape regex
+and its strip, against a store holding three hyphenated names): 0 differences against Node (2,974
+hits, 517 misses, 16,509 outside the shape).
 
 ## Concurrency
 

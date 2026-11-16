@@ -44,6 +44,7 @@ import {
 } from 'node:fs';
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { g3Cases } from '../lib/g3pure.mjs';
 
 export const name = 'dream';
 export const summary = 'cross-layer consolidation: the plan, and both directories after it';
@@ -925,6 +926,7 @@ function literalCases(pySide, nodeSide, label, expected) {
 export async function run(ctx) {
   const store = await import(pathToFileURL(join(ctx.runtimeTs, 'dist', 'memory', 'store.js')).href);
   const dreamer = await import(pathToFileURL(join(ctx.runtimeTs, 'dist', 'memory', 'dream.js')).href);
+  const dreamre = await import(pathToFileURL(join(ctx.runtimeTs, 'dist', 'memory', 'dreamre.js')).href);
   const cases = [];
   const notes = [];
 
@@ -1016,6 +1018,78 @@ export async function run(ctx) {
     }
   }
 
+  // ------------------------------- J89-7 (J89-R F1): `blockKey` / `claimSlot` lowercase Greek text
+  // A fact in both layers whose description, body and claim-slot value hold U+03A3 used to make
+  // the generated dream.py raise TypeError out of `_js_m_toLowerCase` (Python exit 1, the Stop
+  // hook's dream child re-spawned every Stop) while Node merged. Each arm writes the same fact
+  // to both layers with a block that differs ONLY in case, so the merge is right only if the
+  // two keys are the same string `toLowerCase()` gives: final sigma (`ΛΟΓΟΣ.` keys as
+  // `λογος.`, so `σοφος λογος.` is the same block and `σοφοσ λογοσ.`, spelled with a medial
+  // sigma at the word ends, is a different one a sigma-blind lowercase would drop), U+1C89 (Node 26.13 lowers it to U+1C8A, which CPython <= 3.13 has no mapping
+  // for) and U+01C5 (titlecase ǅ to ǆ); the two descriptions differ only in case too, and
+  // `mergeDescriptions` keys them the same way. Plan and both trees side by side, then each
+  // side's survivor against a literal: the project's description alone, one copy of the
+  // case-only block, both claim values kept
+  // apart (the contradiction rule: the newer project claim kept, the profile's moved under
+  // `superseded`), nothing raised.
+  {
+    // [label, [project, profile] descriptions, project body, profile body, the survivor's
+    // description line and body each side must write]
+    const superseded = (claim) => `\n\n## superseded by a dream merge\n\n- from profile (2026-08-27): ${claim}\n`;
+    const arms = [
+      ['final sigma', ['Η ΟΔΟΣ ΤΟΥ ΣΟΦΟΥ ΣΑΣ', 'η οδος του σοφου σας'],
+        'ΣΟΦΟΣ ΛΟΓΟΣ.\n\nDeploys: ΟΔΟΣ ΑΣ', 'σοφος λογος.\n\nDeploys: ΟΔΟΣ ΒΣ\n\nΑΛΛΟΣ ΛΟΓΟΣ.\n\nσοφοσ λογοσ.',
+        `description: Η ΟΔΟΣ ΤΟΥ ΣΟΦΟΥ ΣΑΣ\nΣΟΦΟΣ ΛΟΓΟΣ.\n\nDeploys: ΟΔΟΣ ΑΣ\n\nΑΛΛΟΣ ΛΟΓΟΣ.\n\nσοφοσ λογοσ.${superseded('Deploys: ΟΔΟΣ ΒΣ')}`],
+      ['U+1C89', ['\u1c89 tje', '\u1c8a tje'],
+        '\u1c89 tje block.\n\nDeploys: \u1c89 one', '\u1c8a tje block.\n\nDeploys: \u1c89 two',
+        `description: \u1c89 tje\n\u1c89 tje block.\n\nDeploys: \u1c89 one${superseded('Deploys: \u1c89 two')}`],
+      ['U+01C5', ['\u01c5emal ΣΑΣ', '\u01c6emal σας'],
+        '\u01c5emal block.\n\nDeploys: \u01c5 one', '\u01c6emal block.\n\nDeploys: \u01c5 two',
+        `description: \u01c5emal ΣΑΣ\n\u01c5emal block.\n\nDeploys: \u01c5 one${superseded('Deploys: \u01c5 two')}`],
+      // J89-7b (J89-R2 F1): a U+03A3 whose context reaches U+1FAE9 (Unicode 16) or U+1FA77
+      // (Unicode 15), `Cn` to CPython 3.11-3.13 / 3.11. J89-7's helper refused there, so Python's
+      // dream raised where Node merged; both pick the final sigma, and `σασ🫩` is a different block.
+      ['a sigma beside a Unicode 15 and 16 emoji (J89-7b)', ['ΓΕΙΑ ΣΑΣ\u{1FAE9} ΚΑΙ ΕΣΥ', 'γεια σας\u{1FAE9} και εσυ'],
+        'ΓΕΙΑ ΣΑΣ\u{1FAE9} ΚΑΙ ΕΣΥ.\n\nDeploys: ΣΑΣ\u{1FA77} Α',
+        'γεια σας\u{1FAE9} και εσυ.\n\nDeploys: ΣΑΣ\u{1FA77} Β\n\nΑΛΛΟΣ ΣΑΣ\u{1FA77}.\n\nγεια σασ\u{1FAE9} και εσυ.',
+        `description: ΓΕΙΑ ΣΑΣ\u{1FAE9} ΚΑΙ ΕΣΥ\nΓΕΙΑ ΣΑΣ\u{1FAE9} ΚΑΙ ΕΣΥ.\n\nDeploys: ΣΑΣ\u{1FA77} Α\n\nΑΛΛΟΣ ΣΑΣ\u{1FA77}.\n\nγεια σασ\u{1FAE9} και εσυ.${superseded('Deploys: ΣΑΣ\u{1FA77} Β')}`],
+    ];
+    arms.forEach(([armLabel, [projectDescription, profileDescription], projectBody, profileBody, expected], i) => {
+      const label = `J89-7 dream lowercases ${armLabel} like toLowerCase()`;
+      const bed = join(ctx.scratch, `j89-7-${i}`);
+      const roots = {};
+      for (const side of ['py', 'node']) {
+        roots[side] = { project: join(bed, side, 'project'), profile: join(bed, side, 'profile') };
+        materialise(roots[side].project, {
+          files: { 'facts/greek.md': factFile('greek', { description: projectDescription, body: projectBody }) },
+          mtimes: { 'facts/greek.md': '2026-08-28' },
+        });
+        materialise(roots[side].profile, {
+          files: { 'facts/greek.md': factFile('greek', { description: profileDescription, body: profileBody }) },
+          mtimes: { 'facts/greek.md': '2026-08-27' },
+        });
+      }
+      const request = (side) => ({
+        op: 'run', project: roots[side].project, profile: roots[side].profile, dry_run: false,
+        index_budget: null, profile_index_budget: null, create: true, passes: 1,
+      });
+      const py = ctx.runPython(REF, request('py'));
+      const nd = runNode(store, dreamer, request('node'));
+      cases.push({ name: `${label} — plan`, kind: 'json', expected: py.results, actual: nd.results });
+      cases.push({ name: `${label} — project tree`, kind: 'bytes', expected: manifest(roots.py.project), actual: manifest(roots.node.project) });
+      cases.push({ name: `${label} — profile tree`, kind: 'bytes', expected: manifest(roots.py.profile), actual: manifest(roots.node.profile) });
+      const survivor = (side, results) => {
+        if (results[0]?.error) return `RAISED ${results[0].error.type}: ${Buffer.from(results[0].error.message, 'base64').toString('utf8')}`;
+        const text = readFileSync(join(roots[side].project, 'facts', 'greek.md'), 'utf8').replace(/\r\n/g, '\n');
+        const description = text.slice(text.indexOf('description:'), text.indexOf('\n', text.indexOf('description:')) + 1);
+        return description + text.slice(text.indexOf('\n---\n\n') + 6);
+      };
+      for (const [who, side, results] of [['python', 'py', py.results], ['node', 'node', nd.results]]) {
+        cases.push({ name: `${label} — PINNED PER SIDE: ${who}'s survivor description and body`, kind: 'string', expected, actual: survivor(side, results) });
+      }
+    });
+  }
+
   // ------------------------------------------------------ the pure boundary, side by side
   const boundaryCases = BOUNDARY_TERMS.map(([, term]) => [
     b64(`It landed ${term}, they said.`),
@@ -1052,6 +1126,148 @@ export async function run(ctx) {
       actual: ndBoundary[i],
     });
   });
+  // #316 G3 (J89-1, fixed J89-1F). A relative-date term next to U+0345 COMBINING GREEK
+  // YPOGEGRAMMENI. WAS a difference, FIXED IN NODE: Node spelled CPython's `\b` as
+  // `(?<![\p{L}\p{N}_])` / `(?![\p{L}\p{N}_])` under the `giu` flags, and under `i` U+0345
+  // folds to iota, a letter, so the boundary was gone where CPython's `\w` (U+0345 is Mn) keeps
+  // it. Both patterns are now compiled without `i` (`pysem.PY_WORD_CLASS`, `pyCaseless`), so
+  // node annotates (or reports) the term as python does. The text without U+0345 stays beside it.
+  {
+    const ypo = [
+      ['a resolved term followed by U+0345', 'It landed yesterdayͅ, they said.', 'was: python wrote `yesterday (<basis - 1>)` and reported the hit; node wrote nothing'],
+      ['a resolved term preceded by U+0345', 'Note ͅtoday we ship.', 'was: python wrote `today (<basis>)`; node wrote nothing'],
+      ['an unresolved term followed by U+0345', 'It shipped recentlyͅ.', 'was: python reported `recently` unresolved; node reported nothing'],
+      // J89-2: CPython's IGNORECASE matches U+0131 / U+0130 for `i`; node's `pyCaseless` now
+      // does too (was: node wrote and reported nothing). The `ͅ`-stripped twin is the same text.
+      ['a resolved term spelled with U+0131 (dotless i)', 'We ship rıght now.', 'was: python wrote `rıght now (<basis>)`; node wrote nothing'],
+      ['an unresolved term spelled with U+0130 (dotted capital I)', 'Planned for next tİme.', 'was: python reported `next tİme` unresolved; node reported nothing'],
+    ];
+    const rows = ypo.flatMap(([, body]) => [body, body.replace(/ͅ/g, '')]).map((body) => [b64(body), BOUNDARY_BASIS, b64('ypo'), 'project']);
+    const pyRows = ctx.runPython(REF, { op: 'absolutise', cases: rows }).out;
+    const ndRows = rows.map(([body, basis, nm, layer]) => {
+      const [text, hits, unresolved] = dreamer.absolutise(Buffer.from(body, 'base64').toString('utf8'), basis, Buffer.from(nm, 'base64').toString('utf8'), layer);
+      const hit = (h) => ({ name: b64(store.pyText(h.name)), layer: b64(h.layer), term: b64(h.term), resolved: b64(h.resolved), basis: b64(h.basis) });
+      return { body: b64(text), hits: hits.map(hit), unresolved: unresolved.map(hit) };
+    });
+    ypo.forEach(([label], i) => {
+      const tag = label.includes('U+013') ? 'J89-2' : 'J89-1F';
+      cases.push({ name: `${tag} absolutise: ${label}`, kind: 'json', expected: pyRows[2 * i], actual: ndRows[2 * i] });
+      // Per side, the term is found: a hit or an unresolved report (a symmetric miss would agree).
+      for (const [side, row] of [['python', pyRows[2 * i]], ['node', ndRows[2 * i]]]) {
+        cases.push({ name: `LITERAL: ${tag} ${side} finds the term in absolutise: ${label}`, kind: 'json', expected: 1, actual: row.hits.length + row.unresolved.length });
+      }
+      if (tag === 'J89-1F') cases.push({ name: `J89-1 absolutise: ${label.replace('U+0345', 'nothing')}`, kind: 'json', expected: pyRows[2 * i + 1], actual: ndRows[2 * i + 1] });
+    });
+    // J89-2 found `tonight` spelled with U+0131 or U+0130: both runtimes MATCH it (CPython's
+    // IGNORECASE; node's `pyCaseless`), but the hand-written reference then looked the lowercased
+    // term up in its day table (`_resolve`), `'tonıght'` was not a key, and the dream RAISED
+    // KeyError, where node's lookup answers undefined, `addDays` refuses it, and the term is
+    // REPORTED unresolved. RULED by the orchestrator on J89-5: node is right (a crash on a user's
+    // note is a bug). FIXED BY GENERATION (J89-5c): python runs dream.ts's lookup, so this is an
+    // agreeing case now (red against 053569d5's hand-written python: KeyError), with the answer
+    // pinned per side. `yeſterday` (U+017F LONG S, which IGNORECASE folds to `s`) is the same
+    // lookup, never pinned before J89-5c: KeyError there too, and node's answer now on both sides.
+    {
+      const spellings = [
+        ['`tonight` spelled with U+0131 (dotless i)', 'We merged it tonıght.', 'tonıght'],
+        ['`tonight` spelled with U+0130 (dotted capital I)', 'We merged it TONİGHT.', 'TONİGHT'],
+        ['`yesterday` spelled with U+017F (long s)', 'It landed yeſterday.', 'yeſterday'],
+      ];
+      const rows = spellings.map(([, body]) => [b64(body), BOUNDARY_BASIS, b64('ypo'), 'project']);
+      const pyRows = ctx.runPython(REF, { op: 'absolutise', cases: rows }).out;
+      const shape = (row) =>
+        row.error ? { error: row.error.type } : { body: row.body, hits: row.hits.length, unresolved: row.unresolved.map((h) => h.term) };
+      spellings.forEach(([label, body, term], i) => {
+        const [text, hits, unresolved] = dreamer.absolutise(body, BOUNDARY_BASIS, 'ypo', 'project');
+        const nd = { body: b64(text), hits: hits.length, unresolved: unresolved.map((h) => b64(h.term)) };
+        const py = shape(pyRows[i]);
+        cases.push({ name: `J89-5c absolutise: ${label} is reported unresolved, not a KeyError (ruled J89-5: node is right)`, kind: 'json', expected: py, actual: nd });
+        const expected = { body: b64(body), hits: 0, unresolved: [b64(term)] };
+        cases.push({ name: `LITERAL: J89-5c python reports ${label} unresolved`, kind: 'json', expected, actual: py });
+        cases.push({ name: `LITERAL: J89-5c node reports ${label} unresolved`, kind: 'json', expected, actual: nd });
+      });
+    }
+
+    // J89-5c found two counts `int()` and node's `pyIntDigits` read differently; RULED by the
+    // orchestrator on J89-5d and fixed, so these are agreeing cases with the answer pinned per side:
+    //  - a digit of U+1D7D8..U+1D7FF: U+1D7CE..U+1D7FF is five ten-digit Nd blocks back to back,
+    //    and node's walk back to the block's zero stopped nine codepoints down, reading every digit
+    //    of the last four as 9. Node was wrong: it now reads the digit's distance from its run's
+    //    first codepoint modulo ten, CPython's value (swept over every codepoint `int()` accepts:
+    //    0 differences, the J89-5d sweep case below). Red against a4321fdf's node.
+    //  - a count of more than 4300 digits: `int()` raised ValueError (CPython's
+    //    `sys.get_int_max_str_digits()`) out of `dream()`, where node's sum is Infinity, past
+    //    `addDays`'s cap, and the term is reported unresolved. A crash is a bug, so python takes
+    //    node's answer: the adapter reads such a run as `pyIntDigits` does (leading zeros dropped,
+    //    past the largest double infinity), CPython's limit left where it is. Red against
+    //    a4321fdf's python. A zero-padded count of 4301 digits is 3 days on both.
+    {
+      const long = `${'9'.repeat(4301)} days ago`;
+      const padded = `${'0'.repeat(4300)}3 days ago`;
+      const counts = [
+        ['a count spelled U+1D7D8 (double-struck zero)', 'It landed 𝟘 days ago.',
+          { body: b64('It landed 𝟘 days ago (2026-09-06).'), hits: 1, unresolved: [] }],
+        ['a count spelled U+1D7FF U+1D7E2 (monospace nine, sans-serif zero)', 'It landed 𝟿𝟢 days ago.',
+          { body: b64('It landed 𝟿𝟢 days ago (2026-06-08).'), hits: 1, unresolved: [] }],
+        ['a count of 4301 digits', `It landed ${long}.`,
+          { body: b64(`It landed ${long}.`), hits: 0, unresolved: [b64(long)] }],
+        ['a zero-padded count of 4301 digits', `It landed ${padded}.`,
+          { body: b64(`It landed ${padded} (2026-09-03).`), hits: 1, unresolved: [] }],
+      ];
+      const rows = counts.map(([, body]) => [b64(body), BOUNDARY_BASIS, b64('ypo'), 'project']);
+      const pyRows = ctx.runPython(REF, { op: 'absolutise', cases: rows }).out;
+      const shape = (row) =>
+        row.error ? { error: row.error.type } : { body: row.body, hits: row.hits.length, unresolved: row.unresolved.map((h) => h.term) };
+      counts.forEach(([label, body, expected], i) => {
+        const [text, hits, unresolved] = dreamer.absolutise(body, BOUNDARY_BASIS, 'ypo', 'project');
+        const nd = { body: b64(text), hits: hits.length, unresolved: unresolved.map((h) => b64(h.term)) };
+        const py = shape(pyRows[i]);
+        cases.push({ name: `J89-5d absolutise: ${label} — python against node`, kind: 'json', expected: py, actual: nd });
+        cases.push({ name: `LITERAL: J89-5d python on ${label}`, kind: 'json', expected, actual: py });
+        cases.push({ name: `LITERAL: J89-5d node on ${label}`, kind: 'json', expected, actual: nd });
+      });
+      // The sweep: every codepoint CPython's `int()` accepts as a digit, alone, through node's
+      // `pyIntDigits` against the value `int()` gives it (the reference lists them).
+      const { digits, unidata_version: ucd } = ctx.runPython(REF, { op: 'int_digits' });
+      const wrong = digits.filter(([cp, v]) => dreamre.pyIntDigits(String.fromCodePoint(cp)) !== v);
+      cases.push({ name: 'J89-5d pyIntDigits: every codepoint CPython\'s int() accepts as a digit reads its int() value', kind: 'json', expected: [], actual: wrong.map(([cp]) => cp.toString(16)) });
+      // J89-7 (J89-R F2): the count is a fact about the INTERPRETER's Unicode table, so the
+      // literal is keyed on the version the reference reports, each count measured by running
+      // `int(chr(cp))` over every codepoint on that CPython (2026-11-16: 3.11.15, 3.12.13,
+      // 3.13.18, 3.14.10). A version with no count written here is red, never skipped.
+      const DIGITS_BY_UCD = { '14.0.0': 660, '15.0.0': 680, '15.1.0': 680, '16.0.0': 760 };
+      cases.push({
+        name: `LITERAL: J89-5d the digits CPython's int() accepts on this interpreter (UCD ${ucd})`,
+        kind: 'json',
+        expected: DIGITS_BY_UCD[ucd] ?? `a count written for UCD ${ucd}`,
+        actual: digits.length,
+      });
+      // ...and what that costs a user on 3.11 (docs/porting.md, "Relative dates and the
+      // interpreter's Unicode table"): a count spelled in a Unicode 15.0 digit (U+11F53, KAWI
+      // DIGIT THREE) is a `\d` to node's pinned 15.0 table and to CPython from 3.12, and not to
+      // 3.11's 14.0 one, so 3.11 leaves the term unresolved where node dates it. RULED on UCD
+      // 14.0 and agreeing from 15.0, each side pinned to its own literal either way.
+      {
+        const body = 'It landed \u{11f53} days ago.';
+        const pyRow = ctx.runPython(REF, { op: 'absolutise', cases: [[b64(body), BOUNDARY_BASIS, b64('kawi'), 'project']] }).out[0];
+        const py = pyRow.error ? { error: pyRow.error.type } : { body: pyRow.body, hits: pyRow.hits.length };
+        const [text, hits] = dreamer.absolutise(body, BOUNDARY_BASIS, 'kawi', 'project');
+        const nd = { body: b64(text), hits: hits.length };
+        const resolved = { body: b64('It landed \u{11f53} days ago (2026-09-03).'), hits: 1 };
+        const before15 = ucd === '14.0.0';
+        cases.push({
+          name: `J89-7 absolutise: a count in a Unicode 15.0 digit, python against node (UCD ${ucd})`,
+          kind: 'json',
+          expected: py,
+          actual: nd,
+          ...(before15 ? { ruling: 'CPython 3.11 (UCD 14.0) has no U+11F53 in `\\d`; node reads 3.12\'s 15.0 table. docs/porting.md, Relative dates and the interpreter\'s Unicode table' } : {}),
+        });
+        cases.push({ name: `LITERAL: J89-7 python on a Unicode 15.0 digit (UCD ${ucd})`, kind: 'json', expected: before15 ? { body: b64(body), hits: 0 } : resolved, actual: py });
+        cases.push({ name: 'LITERAL: J89-7 node on a Unicode 15.0 digit', kind: 'json', expected: resolved, actual: nd });
+      }
+    }
+  }
+
   const sentence = (row) => {
     if (row.error) return `RAISED ${row.error.type}`;
     return Buffer.from(row.body, 'base64').toString('utf8');
@@ -1252,5 +1468,11 @@ export async function run(ctx) {
     );
   }
 
+  {
+    // #316 G3 (J89-1): memory/dream's constants and pure functions, compared directly.
+    const g3 = await g3Cases(ctx, 'dream');
+    cases.push(...g3.cases);
+    notes.push(...g3.notes);
+  }
   return { cases, notes };
 }

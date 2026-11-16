@@ -1,6 +1,7 @@
 # ts2py runtime support: the JavaScript semantics the generated code leans on.
 # Pure standard library. Every name starts with `_js_`, `_Js` or `_JS_`, and ts2py refuses a
 # TypeScript identifier with one of those prefixes, so nothing here can be shadowed by source.
+import decimal as _js_decimal
 import errno as _js_errno
 import functools as _js_functools
 import json as _js_jsonlib
@@ -31,6 +32,12 @@ def _js_is_nullish(value):
 
 def _js_typeof(value):
     """`typeof value`. A Python bool is `boolean`, never `number`."""
+    # J89-2: the exact types first (a `str` and a `dict` are what JSON rows hold).
+    kind = type(value)
+    if kind is str:
+        return "string"
+    if kind is dict or kind is list:
+        return "object"
     if value is _JS_UNDEFINED:
         return "undefined"
     if value is None:
@@ -237,6 +244,9 @@ def _js_add(left, right):
         and _JS_SAFE_MIN <= right <= _JS_SAFE_MAX
     ):
         return _js_num(left + right)
+    # J89-2: two floats are two doubles; their IEEE sum is the general path's `_js_num(l + r)`.
+    if type(left) is float and type(right) is float:
+        return left + right
     if isinstance(left, str) or isinstance(right, str):
         return _js_cat(_js_str(left), _js_str(right))
     if _js_is_number(left) and _js_is_number(right):
@@ -458,7 +468,24 @@ def _js_get(obj, key):
 
 
 def _js_put(obj, key, value):
-    """`obj.key = value` on a plain object."""
+    """`obj.key = value` on a plain object. J89-2: `xs[i] = value` on an array, `i` an index
+    within it or exactly its length (an append); one past the end would leave a hole, and any
+    other key on an array is a property, both outside the subset."""
+    if type(obj) is list:
+        if type(key) is int and 0 <= key < len(obj):
+            obj[key] = value
+            return
+        index = _js_index_key(key)
+        canonical = index is not None and _js_str(index) == _js_str(key)
+        if canonical and -1 < index < 2**32 - 1:
+            if index < len(obj):
+                obj[index] = value
+                return
+            if index == len(obj):
+                obj.append(value)
+                return
+            raise TypeError("ts2py: an array write past its end (a hole) is outside the subset")
+        raise TypeError("ts2py: a property write on an array is outside the subset")
     key = key if isinstance(key, str) else _js_str(key)
     if isinstance(obj, _JsObject):
         if key.startswith("_") or key in _JS_OBJECT_PROTO_NAMES:
@@ -762,6 +789,8 @@ def _js_m_startsWith(receiver, prefix):
 
 
 def _js_m_split(receiver, separator):
+    if isinstance(receiver, str) and isinstance(separator, (_js_re.Pattern, _JsGlobalRegExp)):
+        return _js_split_regex(receiver, separator)
     if isinstance(receiver, str) and isinstance(separator, str):
         if receiver.isascii() and separator.isascii():
             return list(receiver) if separator == "" else receiver.split(separator)
@@ -770,8 +799,45 @@ def _js_m_split(receiver, separator):
         units = _js_code_units(receiver)
         if separator == "":
             return list(units)
-        return [_js_from_units(part) for part in units.split(_js_code_units(separator))]
+        parts = units.split(_js_code_units(separator))
+        # J89-2: with no surrogate anywhere in the units, every part is already canonical
+        # (`_js_from_units` would return it unchanged), so the per-part pass is skipped.
+        if _JS_SURROGATE.search(units) is None:
+            return parts
+        return [_js_from_units(part) for part in parts]
     raise _js_outside("split", receiver)
+
+
+def _js_split_regex(text, separator):
+    """`s.split(re)` (J89-5c): ECMA-262's `RegExp.prototype[@@split]` with no limit, over UTF-16
+    code units. The splitter is tried at each position `q` from the end of the last piece (Python's
+    `search(units, q)` finds the first `q` it matches at, the same match a sticky `exec` there
+    finds); a match ending where the last piece ended (an empty one there) moves on one unit, and
+    one starting at the end of the string is never taken. Each capture group joins the result
+    after its piece (`undefined` for one that did not take part). An empty string is `[]` when the
+    splitter matches it, else `[""]`. A `g` flag changes nothing (JS builds its own sticky
+    splitter)."""
+    pattern = separator.pattern if isinstance(separator, _JsGlobalRegExp) else separator
+    units = _js_code_units(text)
+    size = len(units)
+    if size == 0:
+        return [] if pattern.match(units, 0) is not None else [text]
+    out = []
+    p = q = 0
+    while q < size:
+        m = pattern.search(units, q)
+        if m is None or m.start() >= size:
+            break
+        q = m.start()
+        e = min(m.end(), size)
+        if e == p:
+            q += 1
+            continue
+        out.append(_js_from_units(units[p:q]))
+        out.extend(_JS_UNDEFINED if g is None else _js_from_units(g) for g in m.groups())
+        p = q = e
+    out.append(_js_from_units(units[p:]))
+    return out
 
 
 # J86-5: `_js_code_units` of a non-ASCII string, remembered. The answer is a function of the
@@ -912,6 +978,11 @@ def _js_m_sort(receiver, compare=_JS_UNDEFINED):
     missing = len(items) - len(present)
     if compare is _JS_UNDEFINED:
         present.sort(key=lambda item: _js_utf16(_js_str(item)))
+    elif getattr(compare, "_js_codepoint_order", False) and all(type(x) is str for x in present):
+        # J89-5: a comparator that IS code-point order on strings (`cmpCodepoint`'s adapter says
+        # so) sorts strings exactly as Python's own `<` on `str` does; both sorts are stable and
+        # two strings it ties are equal, so the order is the same and the comparator never runs.
+        present.sort()
     else:
 
         def order(left, right):
@@ -1079,7 +1150,10 @@ def _js_string_receiver(method, receiver):
 
 
 def _js_m_indexOf(receiver, search, position=_JS_UNDEFINED):
-    """`s.indexOf(search, position)` in UTF-16 code units (strings only)."""
+    """`s.indexOf(search, position)` in UTF-16 code units (strings only). J89-2: also
+    `buf.indexOf(byte, offset)` on a Buffer, `byte` a number."""
+    if isinstance(receiver, _JS_BYTES):
+        return _js_buffer_index_of(receiver, search, position)
     units = _js_code_units(_js_string_receiver("indexOf", receiver))
     needle = _js_code_units(_js_str(search))
     start = min(max(_js_to_integer(position), 0), len(units))
@@ -1128,28 +1202,107 @@ def _js_m_repeat(receiver, count=_JS_UNDEFINED):
     return _js_from_units(text * int(times))
 
 
-# J88-2: the code points whose lowercase CPython 3.12 (Unicode 15.0) and Node 26.13 (ICU) spell
-# differently, measured over every code point but the surrogates: 55, each assigned after 15.0.
-_JS_LOWER_DIFFERS = _js_re.compile(
-    "[\u1c89\ua7cb\ua7cc\ua7ce\ua7d2\ua7d4\ua7da\ua7dc\U00010d50-\U00010d65\U00016ea0-\U00016eb8\u03a3]"
-)
+# J88-2 / J89-7: the code points whose lowercase CPython and Node 26.13 (ICU, Unicode 17.0) spell
+# differently, measured over every code point but the surrogates: 55 on CPython 3.11, 3.12 and
+# 3.13 (28 on 3.14), every one unassigned (`Cn`) in CPython's table and every one a single code
+# point to a single code point. The table is Node's answer for all 55, so `str.lower()` after it
+# is Node's answer whatever CPython's Unicode version is.
+_JS_LOWER_NODE = {
+    0x1C89: 0x1C8A, 0xA7CB: 0x0264, 0xA7CC: 0xA7CD, 0xA7CE: 0xA7CF, 0xA7D2: 0xA7D3,
+    0xA7D4: 0xA7D5, 0xA7DA: 0xA7DB, 0xA7DC: 0x019B,
+    **{cp: cp + 0x20 for cp in range(0x10D50, 0x10D66)},
+    **{cp: cp + 0x1B for cp in range(0x16EA0, 0x16EB9)},
+}
+# J89-7b: those 55 as a precompiled class of ranges (a class of 55 single astral code points is
+# slower to search than `str.translate`), so a string without one never pays for `translate`.
+_JS_LOWER_NODE_FIND = _js_re.compile(
+    "[\u1c89\ua7cb\ua7cc\ua7ce\ua7d2\ua7d4\ua7da\ua7dc\U00010d50-\U00010d65\U00016ea0-\U00016eb8]"
+).search
+# J89-7 / J89-7b: U+03A3 lowers to U+03C2 or U+03C3 by its Final_Sigma context: walk out from it
+# over Case_Ignorable code points to the first that is not, and ask whether that one is Cased. The
+# two tables classify a code point apart in 307 places on CPython 3.11, 196 on 3.12 and 3.13 and
+# 100 on 3.14 (each a subset of 3.11's; J89-7b's sweep of every code point, Node 26.13 against each
+# interpreter, probing both walk directions: symmetric on every side). Those 307 carry Node's class
+# here, as code point ranges: 1 Case_Ignorable, 2 Cased (and not Case_Ignorable); U+0295 and
+# U+1171E are neither to Node. Every other code point is classed by CPython's own `str.lower()`.
+_JS_SIGMA_NODE = {}
+for _js_first, _js_last, _js_class in (
+    (0x0897, 0x0897, 1), (0x0ECE, 0x0ECE, 1), (0x1ACF, 0x1ADD, 1), (0x1AE0, 0x1AEB, 1),
+    (0xA7F1, 0xA7F1, 1), (0x10D4E, 0x10D4E, 1), (0x10D69, 0x10D6D, 1), (0x10D6F, 0x10D6F, 1),
+    (0x10EC5, 0x10EC5, 1), (0x10EFA, 0x10EFF, 1), (0x11241, 0x11241, 1), (0x113BB, 0x113C0, 1),
+    (0x113CE, 0x113CE, 1), (0x113D0, 0x113D0, 1), (0x113D2, 0x113D2, 1), (0x113E1, 0x113E2, 1),
+    (0x11B60, 0x11B60, 1), (0x11B62, 0x11B64, 1), (0x11B66, 0x11B66, 1), (0x11DD9, 0x11DD9, 1),
+    (0x11F00, 0x11F01, 1), (0x11F36, 0x11F3A, 1), (0x11F40, 0x11F40, 1), (0x11F42, 0x11F42, 1),
+    (0x11F5A, 0x11F5A, 1), (0x13439, 0x13440, 1), (0x13447, 0x13455, 1), (0x1611E, 0x16129, 1),
+    (0x1612D, 0x1612F, 1), (0x16D40, 0x16D42, 1), (0x16D6B, 0x16D6C, 1), (0x16FF2, 0x16FF3, 1),
+    (0x1E030, 0x1E06D, 1), (0x1E08F, 0x1E08F, 1), (0x1E4EB, 0x1E4EF, 1), (0x1E5EE, 0x1E5EF, 1),
+    (0x1E6E3, 0x1E6E3, 1), (0x1E6E6, 0x1E6E6, 1), (0x1E6EE, 0x1E6EF, 1), (0x1E6F5, 0x1E6F5, 1),
+    (0x1E6FF, 0x1E6FF, 1),
+    (0x1C89, 0x1C8A, 2), (0xA7CB, 0xA7CF, 2), (0xA7D2, 0xA7D2, 2), (0xA7D4, 0xA7D4, 2),
+    (0xA7DA, 0xA7DC, 2), (0x10D50, 0x10D65, 2), (0x10D70, 0x10D85, 2), (0x16EA0, 0x16EB8, 2),
+    (0x16EBB, 0x16ED3, 2), (0x1DF25, 0x1DF2A, 2),
+    (0x0295, 0x0295, 0), (0x1171E, 0x1171E, 0),
+):
+    for _js_cp in range(_js_first, _js_last + 1):
+        _JS_SIGMA_NODE[chr(_js_cp)] = _js_class
+del _js_first, _js_last, _js_class, _js_cp
+
+
+@_js_functools.lru_cache(maxsize=4096)
+def _js_sigma_class(ch):
+    """Node's class of `ch` for the Final_Sigma walk: 1 Case_Ignorable, 2 Cased, 0 neither. Off
+    the table, CPython's own, read back off `str.lower()`: skipped when U+03A3 after it is final
+    behind a cased letter and not behind a space, Cased when it alone makes U+03A3 final."""
+    known = _JS_SIGMA_NODE.get(ch)
+    if known is not None:
+        return known
+    behind_cased = ("A" + ch + "\u03a3").lower()[-1] == "\u03c2"
+    behind_space = (" " + ch + "\u03a3").lower()[-1] == "\u03c2"
+    if behind_cased and not behind_space:
+        return 1
+    return 2 if behind_space else 0
+
+
+def _js_final_sigma(text, at):
+    """Unicode's Final_Sigma for the U+03A3 at `at`: a Cased code point before it, past any
+    Case_Ignorable ones, and none after it, past the same."""
+    j = at - 1
+    while j >= 0 and _js_sigma_class(text[j]) == 1:
+        j -= 1
+    if j < 0 or _js_sigma_class(text[j]) != 2:
+        return False
+    j = at + 1
+    while j < len(text) and _js_sigma_class(text[j]) == 1:
+        j += 1
+    return j == len(text) or _js_sigma_class(text[j]) != 2
+
+
+def _js_lower_no_sigma(text):
+    """`toLowerCase()` of text holding no U+03A3: context-free on both sides, so the 55 first."""
+    if _JS_LOWER_NODE_FIND(text) is not None:
+        text = text.translate(_JS_LOWER_NODE)
+    return text.lower()
 
 
 def _js_m_toLowerCase(receiver):
-    """`s.toLowerCase()`: full Unicode lowercase mapping, which `str.lower()` is for every code
-    point but the 55 whose mapping CPython's Unicode tables do not yet have (J88-2 measured the
-    1,462 non-ASCII code points with a lowercase against Node 26.13). A string holding one of those,
-    or U+03A3 (whose final-sigma context depends on neighbours the two tables may classify
-    apart), raises rather than risk a different answer."""
+    """`s.toLowerCase()`: full Unicode lowercase mapping, Final_Sigma included. Outside U+03A3
+    both sides lower one code point at a time, and `str.lower()` is Node's answer for every one
+    but the 55 `_JS_LOWER_NODE` maps first. Each U+03A3 is lowered here, by the Final_Sigma walk
+    over Node's classes (J89-7b: never refused; 0 answers apart from Node 26.13 over every code
+    point alone and in eleven sigma contexts, on CPython 3.11 to 3.14)."""
     text = _js_string_receiver("toLowerCase", receiver)
     if text.isascii():
         return text.lower()
-    if _JS_LOWER_DIFFERS.search(text):
-        raise TypeError(
-            "ts2py: .toLowerCase() of a code point the two Unicode tables map apart"
-            " is outside the subset"
-        )
-    return text.lower()
+    if "\u03a3" not in text:
+        return _js_lower_no_sigma(text)
+    parts = text.split("\u03a3")
+    out = [_js_lower_no_sigma(parts[0])]
+    at = len(parts[0])
+    for part in parts[1:]:
+        out.append("\u03c2" if _js_final_sigma(text, at) else "\u03c3")
+        out.append(_js_lower_no_sigma(part))
+        at += 1 + len(part)
+    return "".join(out)
 
 
 def _js_m_toUpperCase(receiver):
@@ -1272,6 +1425,14 @@ _JS_NAN = _js_math.nan
 def _js_double_out(value):
     """A float result back in the int-when-exact spelling: an integral finite value within 2^53
     becomes an `int`, except -0, which only a float can hold."""
+    # J89-2: the common case first, the same test in a cheaper order (a non-integral float, NaN
+    # and the infinities are not `is_integer()`).
+    if type(value) is float:
+        if not value.is_integer() or not -9007199254740992.0 <= value <= 9007199254740992.0:
+            return value
+        if value == 0 and _js_math.copysign(1.0, value) < 0:
+            return value
+        return int(value)
     if (
         isinstance(value, float)
         and value == value
@@ -1309,6 +1470,24 @@ def _js_float_pair(left, right):
 
 def _js_mul(left, right):
     """`left * right`: numbers as doubles (the sign of a zero kept), two BigInts exactly."""
+    # J89-2: the general path's answer for two floats, or two non-zero ints in the exact range.
+    kind = type(left)
+    if kind is float and type(right) is float:
+        product = left * right
+        # J89-3: a product that is not integral (NaN and the infinities included) is what
+        # `_js_double_out` returns unchanged.
+        if not product.is_integer():
+            return product
+        return _js_double_out(product)
+    if (
+        kind is int
+        and type(right) is int
+        and left
+        and right
+        and _JS_SAFE_MIN <= left <= _JS_SAFE_MAX
+        and _JS_SAFE_MIN <= right <= _JS_SAFE_MAX
+    ):
+        return _js_num(left * right)
     left, right = _js_to_numeric(left), _js_to_numeric(right)
     if isinstance(left, _JsBigInt) or isinstance(right, _JsBigInt):
         a, b = _js_bigint_operands(left, right)
@@ -1323,6 +1502,15 @@ def _js_mul(left, right):
 def _js_div(left, right):
     """`left / right`: IEEE division of the two doubles, so `1 / 0` is Infinity and `0 / 0` NaN;
     two BigInts divide truncating toward zero and a BigInt zero divisor is a RangeError."""
+    # J89-2: the general path's answer for two numbers that are floats or ints in the exact range,
+    # the divisor not zero.
+    kind, other = type(left), type(right)
+    if (
+        (kind is float or (kind is int and _JS_SAFE_MIN <= left <= _JS_SAFE_MAX))
+        and (other is float or (other is int and _JS_SAFE_MIN <= right <= _JS_SAFE_MAX))
+        and right != 0
+    ):
+        return _js_double_out(float(left) / float(right))
     left, right = _js_to_numeric(left), _js_to_numeric(right)
     if isinstance(left, _JsBigInt) or isinstance(right, _JsBigInt):
         a, b = _js_bigint_operands(left, right)
@@ -1342,6 +1530,15 @@ def _js_div(left, right):
 def _js_mod(left, right):
     """`left % right`: the remainder takes the sign of the dividend (a zero result keeps it, so
     `-4 % 2` is -0); a zero divisor or an infinite dividend is NaN. BigInts exactly."""
+    # J89-2: a non-negative int over a positive one, both in the exact range: Python's `%` is the
+    # remainder the general path's `fmod` computes exactly.
+    if (
+        type(left) is int
+        and type(right) is int
+        and 0 <= left <= _JS_SAFE_MAX
+        and 0 < right <= _JS_SAFE_MAX
+    ):
+        return left % right
     left, right = _js_to_numeric(left), _js_to_numeric(right)
     if isinstance(left, _JsBigInt) or isinstance(right, _JsBigInt):
         a, b = _js_bigint_operands(left, right)
@@ -1374,6 +1571,15 @@ def _js_math_arg(value):
 
 def _js_floor(value):
     """`Math.floor`: NaN, the infinities and -0 come back unchanged."""
+    # J89-2: an int in the exact range is its own floor (`_js_math_arg` returns it unchanged), and
+    # a float is its own ToNumber, so the general path's answer is read straight off it.
+    kind = type(value)
+    if kind is int and _JS_SAFE_MIN <= value <= _JS_SAFE_MAX:
+        return value
+    if kind is float:
+        if value != value or value in (_js_math.inf, -_js_math.inf) or value == 0:
+            return value
+        return _js_math.floor(value)
     value = _js_math_arg(value)
     if type(value) is int or value != value or value in (_js_math.inf, -_js_math.inf) or value == 0:
         return value
@@ -1401,18 +1607,43 @@ def _js_extreme(values, pick_max):
     return best
 
 
+def _js_number_pair(values):
+    """J89-2: True for exactly two operands that are floats or ints in the exact range (each its
+    own ToNumber), neither NaN and not both zero (where the sign of a zero decides)."""
+    if len(values) != 2:
+        return False
+    a, b = values
+    for v in (a, b):
+        kind = type(v)
+        if kind is float:
+            if v != v:
+                return False
+        elif not (kind is int and _JS_SAFE_MIN <= v <= _JS_SAFE_MAX):
+            return False
+    return not (a == 0 and b == 0)
+
+
 def _js_max(*values):
     """`Math.max`: any NaN is NaN, +0 beats -0, no argument is -Infinity."""
+    # J89-2: `_js_extreme` keeps the first of two equal values, as Python's `max` does.
+    if _js_number_pair(values):
+        return max(values)
     return _js_extreme(values, True)
 
 
 def _js_min(*values):
     """`Math.min`: any NaN is NaN, -0 beats +0, no argument is Infinity."""
+    if _js_number_pair(values):
+        return min(values)
     return _js_extreme(values, False)
 
 
 def _js_number(value=0):
     """`Number(value)`: ToNumeric, and a BigInt converts to the nearest double."""
+    # J89-2: a string of at most 15 ASCII digits is the int it spells (StringToNumber reads it as
+    # that double exactly, and `_js_double_out` answers the int).
+    if type(value) is str and 0 < len(value) <= 15 and value.isascii() and value.isdigit():
+        return int(value)
     value = _js_to_numeric(value)
     if isinstance(value, _JsBigInt):
         return _js_num(value.value)
@@ -1958,7 +2189,23 @@ def _js_in(key, obj):
         if key == "length":
             return True
         raise TypeError(f"ts2py: {key!r} in an array is outside the subset")
+    if isinstance(obj, (_JsMap, _JsSet)):
+        # J89-2: a Map or Set has no own string keys; `in` sees what its prototype chain holds.
+        names = _JS_MAP_PROTO_NAMES if isinstance(obj, _JsMap) else _JS_SET_PROTO_NAMES
+        return key in names or key in _JS_OBJECT_PROTO_NAMES
     raise _JsTypeError(f"Cannot use 'in' operator to search for '{key}' in {_js_str(obj)}")
+
+
+# J89-2: the string-keyed members of Map.prototype and Set.prototype (Node 26.13).
+_JS_MAP_PROTO_NAMES = frozenset(
+    ("clear", "constructor", "delete", "entries", "forEach", "get", "getOrInsert",
+     "getOrInsertComputed", "has", "keys", "set", "size", "values")
+)
+_JS_SET_PROTO_NAMES = frozenset(
+    ("add", "clear", "constructor", "delete", "difference", "entries", "forEach", "has",
+     "intersection", "isDisjointFrom", "isSubsetOf", "isSupersetOf", "keys", "size",
+     "symmetricDifference", "union", "values")
+)
 
 
 def _js_destructure(value, count):
@@ -2170,9 +2417,12 @@ _JS_BYTES = (bytes, bytearray, memoryview)
 def _js_buffer_to_string(buffer, encoding=_JS_UNDEFINED):
     """`buf.toString(encoding?)`: `utf8` (the default) decodes as Node's does, one U+FFFD per
     maximal invalid subpart and a BOM kept, which `bytes.decode('utf-8', 'replace')` is (J86's
-    measurement, the TextDecoder row); `hex` is two lowercase digits a byte."""
+    measurement, the TextDecoder row); `hex` is two lowercase digits a byte; J89-2: `latin1` is one
+    character U+0000..U+00FF a byte, as Node's `latin1` (alias `binary`) decoder writes it."""
     if encoding is _JS_UNDEFINED or encoding in ("utf8", "utf-8"):
         return bytes(buffer).decode("utf-8", "replace")
+    if encoding in ("latin1", "binary"):
+        return bytes(buffer).decode("latin-1")
     if encoding == "hex":
         return bytes(buffer).hex()
     raise TypeError(f"ts2py: Buffer.toString({encoding!r}) is outside the subset")
@@ -2216,6 +2466,57 @@ def _js_m_values(receiver):
     raise _js_outside("values", receiver)
 
 
+def _js_m_keys(receiver):
+    """`m.keys()` iterated or spread at once (J89-4a): a Map's keys, a Set's items or an array's
+    indexes, in order, as a fresh list (a snapshot, as `values` is)."""
+    if isinstance(receiver, _JsMap):
+        return [key for key, _ in receiver]
+    if isinstance(receiver, _JsSet):
+        return list(receiver)
+    if isinstance(receiver, list):
+        return list(range(len(receiver)))
+    raise _js_outside("keys", receiver)
+
+
+def _js_m_forEach(receiver, callback):
+    """`a.forEach(cb)` (J89-4a), an array only: `cb(item, index, a)` for each index below the
+    length read once at the start that is still present when reached (one the callback removed is
+    skipped, as JS skips a missing index); answers `undefined`."""
+    items = _js_array("forEach", receiver)
+    for index in range(len(items)):
+        if index < len(items):
+            callback(items[index], index, items)
+    return _JS_UNDEFINED
+
+
+def _js_m_copyWithin(receiver, target, start, end=_JS_UNDEFINED):
+    """`a.copyWithin(target, start, end?)` (J89-4a), an array only: ECMA-262's steps (each bound
+    ToIntegerOrInfinity, a negative one from the end, clamped to the length; the count the smaller
+    of what is left of the source and of the target), copying in place as if through a temporary,
+    which is what JS's direction-aware loop amounts to on an array without holes. Answers the
+    array."""
+    items = _js_array("copyWithin", receiver)
+    length = len(items)
+
+    def bound(value, default):
+        if value is _JS_UNDEFINED:
+            return default
+        n = _js_to_integer(value)
+        if n == -_js_math.inf:
+            return 0
+        if n < 0:
+            return max(length + int(n), 0)
+        return length if n == _js_math.inf else min(int(n), length)
+
+    to = bound(target, 0)
+    begin = bound(start, 0)
+    finish = bound(end, length)
+    count = min(finish - begin, length - to)
+    if count > 0:
+        items[to : to + count] = items[begin : begin + count]
+    return items
+
+
 def _js_to_int32(value):
     number = _js_to_number(_js_to_primitive(value))
     if number != number or number in (_js_math.inf, -_js_math.inf):
@@ -2230,6 +2531,15 @@ def _js_shl(left, right):
         raise TypeError("ts2py: << on a BigInt is outside the subset")
     n = (_js_to_int32(left) << (_js_to_int32(right) & 31)) & 0xFFFFFFFF
     return n - 0x100000000 if n >= 0x80000000 else n
+
+
+def _js_sar(left, right):
+    """`left >> right` (J89-4a): ToInt32 of the left, ToUint32 of the count mod 32 (the low five
+    bits, which ToInt32's carry too), and the sign-propagating shift: a Python `>>` of an int in
+    Int32 range is that arithmetic shift."""
+    if isinstance(left, _JsBigInt) or isinstance(right, _JsBigInt):
+        raise TypeError("ts2py: >> on a BigInt is outside the subset")
+    return _js_to_int32(left) >> (_js_to_int32(right) & 31)
 
 
 def _js_now():
@@ -2526,3 +2836,675 @@ def _js_json_parse_deep(text):
                 value = container
                 continue
             fail(i)
+
+
+# ---------------------------------------------------------------- J89-2 (#316 G3): usage, retrieval
+
+
+def _js_inc(value):
+    """`x++` / `++x` as a statement: ToNumeric(x) + 1 (a string `"1"` becomes 2, never `"11"`)."""
+    if isinstance(value, _JsBigInt):
+        raise TypeError("ts2py: ++ on a BigInt is outside the subset")
+    return _js_num(_js_to_number(_js_to_primitive(value)) + 1)
+
+
+def _js_dec(value):
+    """`x--` / `--x` as a statement: ToNumeric(x) - 1."""
+    if isinstance(value, _JsBigInt):
+        raise TypeError("ts2py: -- on a BigInt is outside the subset")
+    return _js_num(_js_to_number(_js_to_primitive(value)) - 1)
+
+
+def _js_m_charCodeAt(receiver, position=_JS_UNDEFINED):
+    """`s.charCodeAt(i)`: the UTF-16 code unit at `i` (half of an astral character's pair), NaN
+    outside the string; `i` is ToIntegerOrInfinity (missing or NaN is 0)."""
+    text = _js_string_receiver("charCodeAt", receiver)
+    if type(position) is int:
+        index = position
+    else:
+        index = _js_to_integer(position)
+    units = text if text.isascii() else _js_code_units(text)
+    if 0 <= index < len(units):
+        return ord(units[int(index)])
+    return _js_math.nan
+
+
+def _js_m_match(receiver, pattern):
+    """`s.match(re)` for a regex literal: with `g`, every match's text over the UTF-16 code units
+    (an empty match advances one unit, as `RegExpBuiltinExec` and Python's `finditer` both do),
+    or `null` when there is none; without `g`, what `re.exec(s)` answers."""
+    text = _js_string_receiver("match", receiver)
+    if isinstance(pattern, _JsGlobalRegExp):
+        units = _js_code_units(text)
+        found = [_js_from_units(m.group(0)) for m in pattern.pattern.finditer(units)]
+        return found if found else None
+    if isinstance(pattern, _js_re.Pattern):
+        return _js_m_exec(pattern, text)
+    raise TypeError("ts2py: .match() of anything but a regex literal is outside the subset")
+
+
+# Wide enough for every double times 10**100 exactly (a double's decimal expansion has at most 767
+# significant digits), so `scaleb` rounds nothing.
+_JS_EXACT = _js_decimal.Context(prec=1200, Emax=2000, Emin=-2000)
+
+
+def _js_m_toFixed(receiver, digits=_JS_UNDEFINED):
+    """`x.toFixed(f)` (Number.prototype.toFixed): the integer `n` nearest to `x * 10**f` on the
+    EXACT binary value of `x`, the LARGER of two on a tie (so a tie rounds away from zero, where
+    Python's `format(x, '.9f')` rounds it to even), written with `f` fraction digits; `-0` is
+    `"0"`, NaN and the infinities are their `String()`, and from 1e21 the number's `String()`."""
+    if isinstance(receiver, bool) or not isinstance(receiver, (int, float)):
+        raise _JsTypeError("Number.prototype.toFixed requires that 'this' be a Number")
+    f = _js_to_integer(digits)
+    if f in (_js_math.inf, -_js_math.inf) or not 0 <= f <= 100:
+        raise _JsRangeError("toFixed() digits argument must be between 0 and 100")
+    x = _js_num(receiver)
+    if x != x or x in (_js_math.inf, -_js_math.inf):
+        return _js_str(x)
+    sign = ""
+    if x < 0:
+        sign, x = "-", -x
+    if x >= 1e21:
+        return sign + _js_str(x)
+    exact = _js_decimal.Decimal(x).scaleb(int(f), _JS_EXACT)
+    n = int(exact.to_integral_value(_js_decimal.ROUND_HALF_UP, _JS_EXACT))
+    m = str(n)
+    if f != 0:
+        k = len(m)
+        if k <= f:
+            m = "0" * (int(f) + 1 - k) + m
+            k = int(f) + 1
+        m = m[: k - int(f)] + "." + m[k - int(f) :]
+    return sign + m
+
+
+def _js_buffer_index_of(buffer, search, offset):
+    """`buf.indexOf(value, byteOffset)` for a number `value` (lib/buffer.js `bidirectionalIndexOf`
+    and node_buffer.cc `IndexOfNumber`): the byte `value >>> 0` truncated to eight bits; the
+    offset is ToNumber, NaN (or missing) is 0, a negative one counts from the end (clamped to 0),
+    and a fraction truncates toward zero."""
+    if isinstance(search, bool) or not isinstance(search, (int, float)):
+        raise TypeError("ts2py: Buffer.indexOf of anything but a byte number is outside the subset")
+    number = _js_to_number(_js_to_primitive(search))
+    byte = 0 if number != number or number in (_js_math.inf, -_js_math.inf) else int(number) % 256
+    length = len(buffer)
+    start = _js_to_number(_js_to_primitive(offset)) if offset is not _JS_UNDEFINED else 0
+    if start != start:
+        start = 0
+    start = _js_to_integer(start)
+    if start < 0:
+        start = max(length + start, 0)
+    if start >= length:
+        return -1
+    if isinstance(buffer, (bytes, bytearray)):
+        return buffer.find(byte, int(start))
+    return bytes(buffer).find(byte, int(start))
+
+
+# ---------------------------------------------------------------- J89-3 (#316 G3): numeric lowering
+#
+# A `Float64Array` is a Python `list` whose every element is a `float` (SUBSET.md, *Typed arrays*):
+# the compiler admits one only as a `const`'s initializer and only indexed, written by index or
+# measured (`.length`), so nothing but these helpers and the proven fast lowerings ever touch it,
+# and every write stores a `float`.
+
+# The longest Float64Array a Python list is built for (Node allocates far longer ones lazily).
+_JS_F64_MAX = 2**26
+_JS_FLOAT_KINDS = frozenset({float})
+_JS_NUMBER_KINDS = frozenset({float, int})
+_JS_INT_KINDS = frozenset({int})
+
+
+def _js_f64_new(length):
+    """`new Float64Array(length)` for a primitive `length`: ToIndex (ToNumber, a fraction truncated
+    toward zero, NaN as 0); a negative length, or one past 2**53 - 1, is the RangeError Node throws,
+    naming the value as given. Every element is the float 0.0. An object argument (Node copies its
+    elements) is outside the subset."""
+    original = length
+    if not _js_is_number(length):
+        if isinstance(length, _JsBigInt):
+            raise _JsTypeError("Cannot convert a BigInt value to a number")
+        if not (length is None or length is _JS_UNDEFINED or isinstance(length, (bool, str))):
+            raise TypeError(
+                "ts2py: new Float64Array of anything but a length is outside the subset"
+            )
+        length = _js_to_number(length)
+    length = _js_num(length)
+    if length != length:
+        count = 0
+    elif length in (_js_math.inf, -_js_math.inf):
+        count = -1
+    else:
+        count = int(length)
+    if count < 0 or count > 2**53 - 1:
+        raise _JsRangeError("Invalid typed array length: " + _js_str(original))
+    if count > _JS_F64_MAX:
+        raise TypeError("ts2py: a Float64Array longer than 2**26 elements is outside the subset")
+    return [0.0] * count
+
+
+def _js_f64_index(array, key):
+    """The element index `array[key]` names (a number, or a string that is a canonical numeric
+    string), or -1 when that numeric key is not a valid integer index (out of range, a fraction,
+    -0 spelled as the string `"-0"`, NaN, an infinity). Any other key would be an ordinary property
+    of the typed array, which the subset does not have."""
+    kind = type(key)
+    if kind is int:
+        return key if 0 <= key < len(array) else -1
+    if kind is float:
+        # `-0.0` is the key "0" (ToPropertyKey), so it names element 0.
+        if key.is_integer() and 0 <= key < len(array):
+            return int(key)
+        return -1
+    if kind is str:
+        if key == "-0":
+            return -1
+        number = _js_to_number(key)
+        if _js_num_str(number) == key:
+            return _js_f64_index(array, number)
+    if _js_is_number(key):  # a subclass of int or float, or an int past 2**53
+        return _js_f64_index(array, float(_js_num(key)))
+    raise TypeError("ts2py: a Float64Array key that is not a number is outside the subset")
+
+
+def _js_ta_get(array, key):
+    """`array[key]` on a Float64Array: the element, or `undefined` for a numeric key that is not a
+    valid index."""
+    if type(key) is int:
+        return array[key] if 0 <= key < len(array) else _JS_UNDEFINED
+    at = _js_f64_index(array, key)
+    return array[at] if at >= 0 else _JS_UNDEFINED
+
+
+def _js_to_f64(value):
+    """What a Float64Array stores for `value`: ToNumber (a BigInt is the TypeError Node throws), as
+    a float."""
+    if type(value) is float:
+        return value
+    number = _js_to_numeric(value)
+    if isinstance(number, _JsBigInt):
+        raise _JsTypeError("Cannot convert a BigInt value to a number")
+    return float(_js_num(number))
+
+
+def _js_ta_put(array, key, value):
+    """`array[key] = value` on a Float64Array: the value is converted first (ToNumber), then stored
+    as a float at a valid index; a numeric key that is not one stores nothing."""
+    number = _js_to_f64(value)
+    if type(key) is int:
+        if 0 <= key < len(array):
+            array[key] = number
+        return
+    at = _js_f64_index(array, key)
+    if at >= 0:
+        array[at] = number
+
+
+def _js_fdiv(left, right):
+    """`left / right` for two numbers at least one of which is a float: IEEE division, and a zero
+    divisor is `_js_div`'s answer (NaN or a signed Infinity, never Python's ZeroDivisionError)."""
+    return left / right if right else _js_div(left, right)
+
+
+def _js_doubles(items, start, stop):
+    """The guard of a counted loop that reads `items[i]` for `start <= i < stop` (the caller has
+    checked `0 <= start` and `stop <= len(items)`): every element read is a float or an int a
+    double holds exactly, so each read is a proven number."""
+    part = items if start == 0 and stop == len(items) else items[start:stop]
+    kinds = frozenset(map(type, part))
+    if kinds <= _JS_FLOAT_KINDS:
+        return True
+    if not kinds <= _JS_NUMBER_KINDS:
+        return False
+    if kinds == _JS_INT_KINDS:
+        return _JS_SAFE_MIN <= min(part) and max(part) <= _JS_SAFE_MAX
+    return all(_JS_SAFE_MIN <= v <= _JS_SAFE_MAX for v in part if type(v) is int)
+
+
+# J89-3: V8's Array.prototype.sort (`third_party/v8/builtins/array-sort.tq`, a port of CPython's
+# listsort as it was before 3.11), step for step: the comparator is called on the same pairs in the
+# same order, so an inconsistent comparator (one a NaN makes so) leaves the order V8 leaves.
+# CPython's own `list.sort` is TimSort too, but since 3.11 merges runs by another rule
+# (powersort), and V8 insertion-sorts a short array without looking for a run first: on an
+# inconsistent comparator the two orders differ (J89-3 measured 561 of 30,000 seeded sorts against
+# Node; this port, 0, with the same number of comparator calls in every one).
+_JS_V8_MIN_GALLOP = 7
+
+
+def _js_v8_timsort(items, cmp):
+    n = len(items)
+    if n < 2:
+        return items
+    a = items  # work array, sorted in place
+    # Node v26.13.0 (V8) sorts seven or fewer elements by binary insertion alone, without
+    # looking for a run first (measured: the comparator calls it makes).
+    if n <= 7:
+        _js_v8_binary_insertion(a, cmp, 0, 1, n)
+        return items
+    st = {"min_gallop": _JS_V8_MIN_GALLOP}
+    runs = []  # [base, len]
+    remaining = n
+    low = 0
+    minrun = _js_v8_min_run(n)
+    while remaining:
+        run = _js_v8_count_run(a, cmp, low, low + remaining)
+        if run < minrun:
+            forced = min(minrun, remaining)
+            _js_v8_binary_insertion(a, cmp, low, low + run, low + forced)
+            run = forced
+        runs.append([low, run])
+        _js_v8_merge_collapse(a, cmp, runs, st)
+        low += run
+        remaining -= run
+    _js_v8_merge_force_collapse(a, cmp, runs, st)
+    return items
+
+
+def _js_v8_lt(cmp, x, y):
+    return cmp(x, y) < 0
+
+
+def _js_v8_min_run(n):
+    r = 0
+    while n >= 64:
+        r |= n & 1
+        n >>= 1
+    return n + r
+
+
+def _js_v8_binary_insertion(a, cmp, low, start, high):
+    if start == low:
+        start += 1
+    while start < high:
+        pivot = a[start]
+        left, right = low, start
+        while left < right:
+            mid = left + ((right - left) >> 1)
+            if _js_v8_lt(cmp, pivot, a[mid]):
+                right = mid
+            else:
+                left = mid + 1
+        a[left + 1 : start + 1] = a[left:start]
+        a[left] = pivot
+        start += 1
+
+
+def _js_v8_count_run(a, cmp, low, high):
+    lo = low + 1
+    if lo == high:
+        return 1
+    run = 2
+    descending = _js_v8_lt(cmp, a[lo], a[lo - 1])
+    prev = a[lo]
+    idx = lo + 1
+    while idx < high:
+        cur = a[idx]
+        order_lt = _js_v8_lt(cmp, cur, prev)
+        if descending:
+            if not order_lt:
+                break
+        elif order_lt:
+            break
+        prev = cur
+        run += 1
+        idx += 1
+    if descending:
+        a[low : low + run] = a[low : low + run][::-1]
+    return run
+
+
+def _js_v8_merge_collapse(a, cmp, runs, st):
+    while len(runs) > 1:
+        n = len(runs) - 2
+        if (n > 0 and runs[n - 1][1] <= runs[n][1] + runs[n + 1][1]) or (
+            n > 1 and runs[n - 2][1] <= runs[n - 1][1] + runs[n][1]
+        ):
+            if runs[n - 1][1] < runs[n + 1][1]:
+                n -= 1
+            _js_v8_merge_at(a, cmp, runs, n, st)
+        elif runs[n][1] <= runs[n + 1][1]:
+            _js_v8_merge_at(a, cmp, runs, n, st)
+        else:
+            break
+
+
+def _js_v8_merge_force_collapse(a, cmp, runs, st):
+    while len(runs) > 1:
+        n = len(runs) - 2
+        if n > 0 and runs[n - 1][1] < runs[n + 1][1]:
+            n -= 1
+        _js_v8_merge_at(a, cmp, runs, n, st)
+
+
+def _js_v8_merge_at(a, cmp, runs, i, st):
+    base_a, len_a = runs[i]
+    base_b, len_b = runs[i + 1]
+    runs[i][1] = len_a + len_b
+    del runs[i + 1]
+    k = _js_v8_gallop_right(a, cmp, a[base_b], base_a, len_a, 0)
+    base_a += k
+    len_a -= k
+    if len_a == 0:
+        return
+    len_b = _js_v8_gallop_left(a, cmp, a[base_a + len_a - 1], base_b, len_b, len_b - 1)
+    if len_b == 0:
+        return
+    if len_a <= len_b:
+        _js_v8_merge_low(a, cmp, base_a, len_a, base_b, len_b, st)
+    else:
+        _js_v8_merge_high(a, cmp, base_a, len_a, base_b, len_b, st)
+
+
+def _js_v8_gallop_left(arr, cmp, key, base, length, hint):
+    """The leftmost position in arr[base:base+length] where key belongs (a[k-1] < key <= a[k])."""
+    last_ofs, ofs = 0, 1
+    if _js_v8_lt(cmp, arr[base + hint], key):
+        max_ofs = length - hint
+        while ofs < max_ofs:
+            if _js_v8_lt(cmp, arr[base + hint + ofs], key):
+                last_ofs = ofs
+                ofs = (ofs << 1) + 1
+            else:
+                break
+        if ofs > max_ofs:
+            ofs = max_ofs
+        last_ofs += hint
+        ofs += hint
+    else:
+        max_ofs = hint + 1
+        while ofs < max_ofs:
+            if _js_v8_lt(cmp, arr[base + hint - ofs], key):
+                break
+            last_ofs = ofs
+            ofs = (ofs << 1) + 1
+        if ofs > max_ofs:
+            ofs = max_ofs
+        last_ofs, ofs = hint - ofs, hint - last_ofs
+    last_ofs += 1
+    while last_ofs < ofs:
+        m = last_ofs + ((ofs - last_ofs) >> 1)
+        if _js_v8_lt(cmp, arr[base + m], key):
+            last_ofs = m + 1
+        else:
+            ofs = m
+    return ofs
+
+
+def _js_v8_gallop_right(arr, cmp, key, base, length, hint):
+    """The rightmost position where key belongs (a[k-1] <= key < a[k])."""
+    last_ofs, ofs = 0, 1
+    if _js_v8_lt(cmp, key, arr[base + hint]):
+        max_ofs = hint + 1
+        while ofs < max_ofs:
+            if _js_v8_lt(cmp, key, arr[base + hint - ofs]):
+                last_ofs = ofs
+                ofs = (ofs << 1) + 1
+            else:
+                break
+        if ofs > max_ofs:
+            ofs = max_ofs
+        last_ofs, ofs = hint - ofs, hint - last_ofs
+    else:
+        max_ofs = length - hint
+        while ofs < max_ofs:
+            if _js_v8_lt(cmp, key, arr[base + hint + ofs]):
+                break
+            last_ofs = ofs
+            ofs = (ofs << 1) + 1
+        if ofs > max_ofs:
+            ofs = max_ofs
+        last_ofs += hint
+        ofs += hint
+    last_ofs += 1
+    while last_ofs < ofs:
+        m = last_ofs + ((ofs - last_ofs) >> 1)
+        if _js_v8_lt(cmp, key, arr[base + m]):
+            ofs = m
+        else:
+            last_ofs = m + 1
+    return ofs
+
+
+def _js_v8_merge_low(a, cmp, base_a, len_a, base_b, len_b, st):
+    temp = a[base_a : base_a + len_a]
+    dest = base_a
+    ct = 0
+    cb = base_b
+    a[dest] = a[cb]
+    dest += 1
+    cb += 1
+    len_b -= 1
+    if len_b == 0:
+        a[dest : dest + len_a] = temp[ct : ct + len_a]
+        return
+    if len_a == 1:
+        a[dest : dest + len_b] = a[cb : cb + len_b]
+        a[dest + len_b] = temp[ct]
+        return
+    min_gallop = st["min_gallop"]
+    while True:
+        wins_a = wins_b = 0
+        done = None
+        while True:
+            if _js_v8_lt(cmp, a[cb], temp[ct]):
+                a[dest] = a[cb]
+                dest += 1
+                cb += 1
+                wins_b += 1
+                wins_a = 0
+                len_b -= 1
+                if len_b == 0:
+                    done = "succeed"
+                    break
+                if wins_b >= min_gallop:
+                    break
+            else:
+                a[dest] = temp[ct]
+                dest += 1
+                ct += 1
+                wins_a += 1
+                wins_b = 0
+                len_a -= 1
+                if len_a == 1:
+                    done = "copyb"
+                    break
+                if wins_a >= min_gallop:
+                    break
+        if done is None:
+            min_gallop += 1
+            first = True
+            while first or wins_a >= _JS_V8_MIN_GALLOP or wins_b >= _JS_V8_MIN_GALLOP:
+                first = False
+                min_gallop = max(1, min_gallop - 1)
+                st["min_gallop"] = min_gallop
+                wins_a = _js_v8_gallop_right(temp, cmp, a[cb], ct, len_a, 0)
+                if wins_a > 0:
+                    a[dest : dest + wins_a] = temp[ct : ct + wins_a]
+                    dest += wins_a
+                    ct += wins_a
+                    len_a -= wins_a
+                    if len_a == 1:
+                        done = "copyb"
+                        break
+                    if len_a == 0:
+                        done = "succeed"
+                        break
+                a[dest] = a[cb]
+                dest += 1
+                cb += 1
+                len_b -= 1
+                if len_b == 0:
+                    done = "succeed"
+                    break
+                wins_b = _js_v8_gallop_left(a, cmp, temp[ct], cb, len_b, 0)
+                if wins_b > 0:
+                    a[dest : dest + wins_b] = a[cb : cb + wins_b]
+                    dest += wins_b
+                    cb += wins_b
+                    len_b -= wins_b
+                    if len_b == 0:
+                        done = "succeed"
+                        break
+                a[dest] = temp[ct]
+                dest += 1
+                ct += 1
+                len_a -= 1
+                if len_a == 1:
+                    done = "copyb"
+                    break
+            if done is None:
+                min_gallop += 1
+                st["min_gallop"] = min_gallop
+                continue
+        if done == "succeed":
+            if len_a > 0:
+                a[dest : dest + len_a] = temp[ct : ct + len_a]
+        else:
+            a[dest : dest + len_b] = a[cb : cb + len_b]
+            a[dest + len_b] = temp[ct]
+        return
+
+
+def _js_v8_merge_high(a, cmp, base_a, len_a, base_b, len_b, st):
+    temp = a[base_b : base_b + len_b]
+    dest = base_b + len_b - 1
+    ct = len_b - 1
+    ca = base_a + len_a - 1
+    a[dest] = a[ca]
+    dest -= 1
+    ca -= 1
+    len_a -= 1
+    if len_a == 0:
+        a[dest - (len_b - 1) : dest + 1] = temp[0:len_b]
+        return
+    if len_b == 1:
+        dest -= len_a
+        ca -= len_a
+        a[dest + 1 : dest + 1 + len_a] = a[ca + 1 : ca + 1 + len_a]
+        a[dest] = temp[ct]
+        return
+    min_gallop = st["min_gallop"]
+    while True:
+        wins_a = wins_b = 0
+        done = None
+        while True:
+            if _js_v8_lt(cmp, temp[ct], a[ca]):
+                a[dest] = a[ca]
+                dest -= 1
+                ca -= 1
+                wins_a += 1
+                wins_b = 0
+                len_a -= 1
+                if len_a == 0:
+                    done = "succeed"
+                    break
+                if wins_a >= min_gallop:
+                    break
+            else:
+                a[dest] = temp[ct]
+                dest -= 1
+                ct -= 1
+                wins_b += 1
+                wins_a = 0
+                len_b -= 1
+                if len_b == 1:
+                    done = "copya"
+                    break
+                if wins_b >= min_gallop:
+                    break
+        if done is None:
+            min_gallop += 1
+            first = True
+            while first or wins_a >= _JS_V8_MIN_GALLOP or wins_b >= _JS_V8_MIN_GALLOP:
+                first = False
+                min_gallop = max(1, min_gallop - 1)
+                st["min_gallop"] = min_gallop
+                k = _js_v8_gallop_right(a, cmp, temp[ct], base_a, len_a, len_a - 1)
+                wins_a = len_a - k
+                if wins_a > 0:
+                    dest -= wins_a
+                    ca -= wins_a
+                    a[dest + 1 : dest + 1 + wins_a] = a[ca + 1 : ca + 1 + wins_a]
+                    len_a -= wins_a
+                    if len_a == 0:
+                        done = "succeed"
+                        break
+                a[dest] = temp[ct]
+                dest -= 1
+                ct -= 1
+                len_b -= 1
+                if len_b == 1:
+                    done = "copya"
+                    break
+                k = _js_v8_gallop_left(temp, cmp, a[ca], 0, len_b, len_b - 1)
+                wins_b = len_b - k
+                if wins_b > 0:
+                    dest -= wins_b
+                    ct -= wins_b
+                    a[dest + 1 : dest + 1 + wins_b] = temp[ct + 1 : ct + 1 + wins_b]
+                    len_b -= wins_b
+                    if len_b == 1:
+                        done = "copya"
+                        break
+                    if len_b == 0:
+                        done = "succeed"
+                        break
+                a[dest] = a[ca]
+                dest -= 1
+                ca -= 1
+                len_a -= 1
+                if len_a == 0:
+                    done = "succeed"
+                    break
+            if done is None:
+                min_gallop += 1
+                st["min_gallop"] = min_gallop
+                continue
+        if done == "succeed":
+            if len_b > 0:
+                a[dest - (len_b - 1) : dest + 1] = temp[0:len_b]
+        else:
+            dest -= len_a
+            ca -= len_a
+            a[dest + 1 : dest + 1 + len_a] = a[ca + 1 : ca + 1 + len_a]
+            a[dest] = temp[ct]
+        return
+
+
+def _js_v8_sort(items, compare):
+    """`items.sort(compare)` as V8 orders it: `undefined` last (never compared), the comparator's
+    sign orders (NaN is 0, a boolean its number), in place."""
+    present = [item for item in items if item is not _JS_UNDEFINED]
+    missing = len(items) - len(present)
+
+    def order(left, right):
+        result = compare(left, right)
+        if isinstance(result, bool):
+            result = int(result)
+        if not _js_is_number(result) or result != result:
+            return 0
+        return result
+
+    _js_v8_timsort(present, order)
+    items[:] = present + [_JS_UNDEFINED] * missing
+    return items
+
+
+def _js_sort_by_f64(items, keys, descending, compare):
+    """`items.sort((a, b) => keys[b] - keys[a] || a - b)` (`descending`), or with `keys[a] -
+    keys[b]`, for `keys` a Float64Array. When every item is an int index into `keys` and no key it
+    names is NaN, the comparator is a total order (key, then index), so any stable sort gives V8's
+    order: ascending by index, then stably by key. Otherwise (a NaN key makes the comparator
+    inconsistent) V8's own sort runs with `compare` (`_js_v8_sort`), so the order is still V8's.
+    Anything but a list is the general `.sort`'s refusal."""
+    if type(items) is list:
+        if not items:
+            return items
+        ints = frozenset(map(type, items)) == _JS_INT_KINDS
+        if ints and min(items) >= 0 and max(items) < len(keys):
+            if not any(map(_js_math.isnan, map(keys.__getitem__, items))):
+                items.sort()
+                items.sort(key=keys.__getitem__, reverse=descending)
+                return items
+        return _js_v8_sort(items, compare)
+    return _js_m_sort(items, compare)

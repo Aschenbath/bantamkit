@@ -40,6 +40,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { runNode as runNodeServer } from './wire.mjs';
+import { g3Cases } from '../lib/g3pure.mjs';
 
 export const name = 'recall-queries';
 export const summary = 'likely-prompt queries and the session head: ranking, sidecar, limits, memory_queries, status (#207)';
@@ -666,6 +667,146 @@ export async function run(ctx) {
     cases.push(...literalCases(pw, nw, 'sidecar/bom: LITERAL the write answer', BOM_WRITE));
   }
 
+  // ============================================================ sidecar/deep (J89-5a)
+  // A project sidecar holding one entry nested 20,000 lists deep, its text still ending
+  // `,"v":1}`. A recall reads it through `layerTerms`, whose fast path is `JSON.parse` (V8 reads
+  // any depth) and since J89-5a the generated Python's `_js_json_parse` (J88-2: no recursion
+  // limit). The hand-written Python read it through `json.loads` and raised RecursionError out of
+  // the recall. The deep entry is not a list of strings, so it holds no queries: each side ranks as
+  // the same bed without it. Red (the reference raises) against the Python of 2737c34e.
+  {
+    const SIDES = ['py', 'node'];
+    const DEPTH = 20000;
+    const deep = mixedBed(join(root, 'deep'));
+    const ref = mixedBed(join(root, 'deep-ref'));
+    for (const side of SIDES) {
+      const p = sidecarOf(deep.homes[side], deep.project);
+      const facts = JSON.stringify(JSON.parse(readFileSync(p, 'utf8')).facts);
+      if (!facts.startsWith('{"') || facts.length < 3) throw new Error('recall-queries: the deep sidecar bed holds no project entries');
+      // The shape `writeEntries` writes (`facts` first, `"v":1` last), so `layerTerms` takes its
+      // `JSON.parse` path on both sides.
+      writeFileSync(p, `{"facts":{"zz-deep":{"queries":${'['.repeat(DEPTH)}${']'.repeat(DEPTH)}},${facts.slice(1)},"v":1}`);
+    }
+    const { p: dp, n: dn } = rankBoth(deep);
+    const { p: rp, n: rn } = rankBoth(ref);
+    const view = (r) => ({ inject: names(r.inject), rank: names(r.rank), reply: unb64(r.reply), status: r.status });
+    PROMPTS.forEach((pp, i) => {
+      cases.push({ name: `sidecar/deep: rank ${JSON.stringify(pp.prompt)} through a sidecar nested ${DEPTH} deep — python against node`, kind: 'json', expected: view(dp.results[i]), actual: view(dn.results[i]) });
+      cases.push({
+        name: `sidecar/deep: rank ${JSON.stringify(pp.prompt)} — equals the bed without the deep entry, per side`,
+        kind: 'json',
+        expected: { py: view(rp.results[i]), node: view(rn.results[i]) },
+        actual: { py: view(dp.results[i]), node: view(dn.results[i]) },
+      });
+    });
+  }
+
+  // ======================================================== sidecar/nested (J89-5d, J89-5e)
+  // `readSidecar` (the `memory_queries` coverage, its missing list and write, `bantamkit_status`,
+  // recall's term rows) reads through `parseJson`, the port of `json.loads`, and Node's is a
+  // recursive descent: on this machine it overflows its stack past a depth of 1,562 cold and 6,902
+  // once V8 has optimised it (J89-5d, measured), and reads the sidecar as malformed. CPython's
+  // `json.loads` has no one limit: 3.11's is `sys.getrecursionlimit()` less the caller's frames
+  // (978 on the MCP and hook paths), 3.12 and 3.13 read to ~9,994, 3.14 has none (J89-5e,
+  // measured in Docker). RULED (J89-5d: a crash is a bug; J89-5e: Python's answer must not move
+  // with the CPython version): the `parse_json` adapter reads at most 512 deep, counted as
+  // `JSON.parse` nests (the sidecar's own three objects included), and past that throws the
+  // RangeError node throws past its stack, which the compiled `catch` sees. So past 512 and past
+  // node's stack both answer as no sidecar (AGREEING cases below), and between 512 and node's cold
+  // limit node reads and python does not: RULED different at 513, the first depth past python's.
+  // At 512 both read (AGREEING): the boundary is pinned from both sides, on every CPython.
+  {
+    const DEEP = [8500, 20000, 100000];
+    const LIMIT = 512;
+    const dir = join(root, 'nested');
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    // A sidecar whose whole document nests `depth` deep: the root, `facts` and `z` are three
+    // objects, then lists (`nested`) or one list of objects (`nestedObj`) down to `depth`.
+    const nested = (depth) => {
+      const d = depth - 3;
+      return `{"v":1,"facts":{"a":{"queries":["ok"]},"z":{"queries":${'['.repeat(d)}${']'.repeat(d)}}}}`;
+    };
+    const nestedObj = (depth) => {
+      const d = depth - 4;
+      return `{"v":1,"facts":{"a":{"queries":["ok"]},"z":{"queries":[${'{"k":'.repeat(d)}1${'}'.repeat(d)}]}}}`;
+    };
+    const docs = [
+      ...DEEP.map((d) => [`nested-${d}.json`, nested(d)]),
+      [`nested-${LIMIT}.json`, nested(LIMIT)],
+      [`nested-${LIMIT + 1}.json`, nested(LIMIT + 1)],
+      [`nested-obj-${LIMIT}.json`, nestedObj(LIMIT)],
+      [`nested-obj-${LIMIT + 1}.json`, nestedObj(LIMIT + 1)],
+    ];
+    const paths = docs.map(([f, text]) => {
+      const p = join(dir, f);
+      writeFileSync(p, text, 'utf8');
+      return p;
+    });
+    const pr = py(ctx, sideEnv(dir, 'py', join(root, 'home-const')), { op: 'read_sidecar', paths }).maps;
+    const nr = nodeRead(paths).maps;
+    const view = (m) => m.map(([k, v]) => [unb64(k), v.map(unb64)]);
+    DEEP.forEach((d, i) => {
+      cases.push({ name: `sidecar/nested: J89-5d read of a sidecar nested ${d} deep — python against node`, kind: 'json', expected: pr[i], actual: nr[i] });
+      cases.push(...literalCases(view(pr[i]), view(nr[i]), `sidecar/nested: LITERAL J89-5d a sidecar nested ${d} deep reads as no sidecar`, []));
+    });
+    const [atA, pastA, atO, pastO] = [0, 1, 2, 3].map((k) => DEEP.length + k);
+    for (const [k, shape] of [[atA, 'lists'], [atO, 'objects']]) {
+      cases.push({ name: `sidecar/nested: J89-5e read of a sidecar nested ${LIMIT} deep in ${shape} (python's limit) — python against node`, kind: 'json', expected: pr[k], actual: nr[k] });
+      cases.push(...literalCases(view(pr[k]), view(nr[k]), `sidecar/nested: LITERAL J89-5e a sidecar nested ${LIMIT} deep in ${shape} reads its well-formed entries`, [['a', ['ok']]]));
+    }
+    cases.push({
+      name: `ruling: sidecar/nested — read of a sidecar nested ${LIMIT + 1} deep (between python's limit of ${LIMIT} and node's stack)`,
+      kind: 'json',
+      expected: { lists: view(pr[pastA]), objects: view(pr[pastO]) },
+      actual: { lists: view(nr[pastA]), objects: view(nr[pastO]) },
+      ruling:
+        'J89-5d and J89-5e, the orchestrator: python\'s parse_json reads at most 512 deep, a limit ' +
+        'of its own, because json.loads\'s moves with the CPython version (3.11: the recursion ' +
+        'limit less the caller\'s frames, 978 on the MCP path; 3.12 and 3.13: ~9,994; 3.14: none). ' +
+        'Node\'s parseJson is a recursive descent whose limit is its stack (1,562 cold, 6,902 ' +
+        'optimised, measured on macOS arm64, Node 26), an implementation limit and not a contract. ' +
+        'Between the two, node reads the sidecar\'s well-formed entries and python reads it as ' +
+        'malformed. Past node\'s stack the two agree (the cases above). docs/porting.md, divergence table.',
+    });
+    cases.push(
+      { name: `sidecar/nested: LITERAL J89-5e python reads a sidecar nested ${LIMIT + 1} deep as no sidecar`, kind: 'json', expected: { lists: [], objects: [] }, actual: { lists: view(pr[pastA]), objects: view(pr[pastO]) } },
+      { name: `sidecar/nested: LITERAL J89-5e node reads a sidecar nested ${LIMIT + 1} deep`, kind: 'json', expected: { lists: [['a', ['ok']]], objects: [['a', ['ok']]] }, actual: { lists: view(nr[pastA]), objects: view(nr[pastO]) } },
+    );
+
+    // Every caller on the path, past both limits: coverage, the missing list and a write over a
+    // project sidecar nested 20,000 deep answer as the bed with no project sidecar (the write
+    // replaces it, as any malformed sidecar), per side, with node's answers as the literals.
+    const SIDES = ['py', 'node'];
+    const bed = mixedBed(join(root, 'nested-bed'));
+    const ref = mixedBed(join(root, 'nested-ref'));
+    for (const side of SIDES) {
+      writeFileSync(sidecarOf(bed.homes[side], bed.project), nested(DEEP[1]));
+      rmSync(sidecarOf(ref.homes[side], ref.project));
+    }
+    const qreq = (b2) => ({ op: 'queries', project: b2.project, profile: b2.profile, native: b2.native, calls: [{ do: 'coverage' }, { do: 'missing' }] });
+    const qview = (o) => [o[0], { result: o[1].result, remaining: o[1].remaining, facts: o[1].facts.map((f) => [f.layer, f.name]) }];
+    const pq = qview(py(ctx, sideEnv(bed.root, 'py', bed.homes.py), qreq(bed)).out);
+    const nq = qview(nodeQueries(sideEnv(bed.root, 'node', bed.homes.node), qreq(bed)).out);
+    const pqRef = qview(py(ctx, sideEnv(ref.root, 'py', ref.homes.py), qreq(ref)).out);
+    const nqRef = qview(nodeQueries(sideEnv(ref.root, 'node', ref.homes.node), qreq(ref)).out);
+    cases.push({ name: `sidecar/nested: J89-5d coverage and the missing list over a sidecar nested ${DEEP[1]} deep — python against node`, kind: 'json', expected: pq, actual: nq });
+    cases.push({ name: 'sidecar/nested: J89-5d coverage and the missing list equal the bed with no project sidecar, per side', kind: 'json', expected: { py: pqRef, node: nqRef }, actual: { py: pq, node: nq } });
+    cases.push(...literalCases(pq[0], nq[0], 'sidecar/nested: LITERAL J89-5d coverage counts the native sidecar only', BOM_COVERAGE));
+    const good = { name: 'gate-rule', queries: ['zero failures'] };
+    const wreq = { op: 'queries', project: bed.project, profile: bed.profile, native: bed.native, calls: [{ do: 'write', facts: [good] }] };
+    const pw = py(ctx, sideEnv(bed.root, 'py', bed.homes.py), wreq).out[0];
+    const nw = nodeQueries(sideEnv(bed.root, 'node', bed.homes.node), wreq).out[0];
+    const after = (side) => {
+      const p = sidecarOf(bed.homes[side], bed.project);
+      return existsSync(p) ? readFileSync(p, 'utf8') : null;
+    };
+    cases.push({ name: 'sidecar/nested: J89-5d write — answer and the sidecar bytes after it, python against node', kind: 'json', expected: { out: pw, sidecar: after('py') }, actual: { out: nw, sidecar: after('node') } });
+    const factSha = createHash('sha1').update(readFileSync(join(bed.project, 'facts', 'gate-rule.md'))).digest('hex');
+    cases.push(...literalCases(after('py'), after('node'), 'sidecar/nested: LITERAL J89-5d a write replaces the nested sidecar', `{"facts":{"gate-rule":{"queries":["zero failures"],"sha":"${factSha}"}},"v":1}`));
+    cases.push(...literalCases(pw, nw, 'sidecar/nested: LITERAL J89-5d the write answer', BOM_WRITE));
+  }
+
   // ======================================================================= head (8-11)
   {
     const dir = join(root, 'head');
@@ -1125,6 +1266,12 @@ export async function run(ctx) {
   }
 
   notes.push(`beds under ${root}; every side ran with its own HOME, BANTAMKIT_INDEX_DIR and BANTAMKIT_RETENTION=off`);
+  {
+    // #316 G3 (J89-1): memory/queries's constants and pure functions, compared directly.
+    const g3 = await g3Cases(ctx, 'queries');
+    cases.push(...g3.cases);
+    notes.push(...g3.notes);
+  }
   return { cases, notes };
 }
 

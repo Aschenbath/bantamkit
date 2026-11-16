@@ -38,12 +38,12 @@
  * handed — the two branches Python takes when `_snapshot` is pinned have no reachable
  * caller here. Everything else about both functions is the reference's.
  */
-import { randomBytes } from 'node:crypto';
-import { statSync, writeFileSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename } from 'node:path';
 
 import { BantamError } from '../errors.js';
+import { pySearchWord } from '../pysem.js';
 import { ColdIndex, ColdIndexError } from '../storage/coldindex.js';
 import { HotIndex, INDEX_DIR_ENV, type IndexDoc } from '../storage/hotindex.js';
 import type { Fact, FactValue } from './factfile.js';
@@ -74,7 +74,7 @@ import {
   tokenizeV2,
   weightOf,
 } from './retrieval.js';
-import { seedTs, storeId, UsageLedger } from './usage.js';
+import { parseTs, seedTs, storeId, UsageLedger } from './usage.js';
 import {
   asPyOSError,
   cmpCodepoint,
@@ -86,7 +86,8 @@ import {
   pyMkdirParents,
   pyMtimeDate,
   pyName,
-  pyNewlineOut,
+  pyOSErrorStrerror,
+  pyOSErrorText,
   pyParent,
   pyParents,
   pyReadText,
@@ -96,6 +97,7 @@ import {
   pySuffix,
   pyUnlink,
   pyWriteText,
+  pyWriteTextAtomic,
   PyOSError,
   PyUnicodeDecodeError,
   sortedPathNames,
@@ -204,8 +206,11 @@ export const VALID_STATUSES = ['active', 'done'] as const;
 export const OUTCOME_TYPES = ['feedback', 'project'] as const;
 /** `candidates` done-words (#221): whole-word, case-insensitive, `type: project` only. */
 export const DONE_WORDS = ['done', 'shipped', 'completed', 'closed', 'released', 'merged'] as const;
-/** Python's `\b(...)\b`: a boundary is a change of `\w` (Unicode letters, digits, `_`). */
-const DONE_WORD_RE = new RegExp(`(?<![\\p{L}\\p{N}_])(${DONE_WORDS.join('|')})(?![\\p{L}\\p{N}_])`, 'iu');
+/**
+ * The reference's `\b(done|...)\b` under `IGNORECASE`, searched with `pySearchWord` (pysem.ts holds
+ * the regex since #316 G3, J89-4a; J89-1F compiled it WITHOUT `i`, see `PY_WORD_CLASS`).
+ */
+const DONE_WORD_ALTERNATIVES = DONE_WORDS.join('|');
 
 /** `list(VALID_OUTCOMES)` as Python prints it: `['error', 'success']`. */
 const pyListText = (items: readonly string[]): string => `[${items.map((t) => `'${t}'`).join(', ')}]`;
@@ -216,7 +221,10 @@ function validateOutcomeStatus(type: string, outcome: string | null, status: str
     if (!(VALID_OUTCOMES as readonly string[]).includes(outcome)) {
       throw new MemoryValidationError(`invalid outcome '${outcome}'; must be one of ${pyListText(VALID_OUTCOMES)}`);
     }
-    if (!(OUTCOME_TYPES as readonly string[]).includes(type)) {
+    // Named, not negated in place: ts2py lowers a proven `includes` to `in`, and `!` of that is
+    // the `not x in y` ruff refuses (J89-4b).
+    const lessonType = (OUTCOME_TYPES as readonly string[]).includes(type);
+    if (!lessonType) {
       throw new MemoryValidationError(
         `invalid outcome '${outcome}' for type '${type}'; outcome is only for feedback and project facts`,
       );
@@ -294,10 +302,15 @@ export function oneLine(text: string): string {
   return text.replace(NOT_ONE_LINE, ' ');
 }
 
+/**
+ * The first code unit `NOT_ONE_LINE` matches. Not that `g` regex with its `lastIndex` reset around
+ * an `exec` (#316 G3, J89-4a: ts2py models no `lastIndex`): the run's first unit is the one
+ * `codepoint` reads either way.
+ */
+const NOT_ONE_LINE_UNIT = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
 function notOneLine(text: string): string | null {
-  NOT_ONE_LINE.lastIndex = 0;
-  const found = NOT_ONE_LINE.exec(text);
-  NOT_ONE_LINE.lastIndex = 0;
+  const found = NOT_ONE_LINE_UNIT.exec(text);
   return found === null ? null : codepoint(found[0]);
 }
 
@@ -823,7 +836,10 @@ export function pickHits(
   rows: RowsOf | null = null,
 ): Array<[number, Fact]> {
   let memo: ReadonlyMap<string, number> | null = null;
-  const weights = (): ReadonlyMap<string, number> => (memo ??= usage());
+  const weights = (): ReadonlyMap<string, number> => {
+    if (memo === null) memo = usage();
+    return memo;
+  };
   const live = [...pools];
   for (;;) {
     const out: Array<[number, Fact]> = [];
@@ -864,8 +880,25 @@ export function utcNow(): string {
  * it stops being a division by zero.
  */
 export function tokens(text: string): Set<string> {
-  return new Set(text.toLowerCase().match(/[a-z0-9]+/g) ?? []);
+  // J89-4b: the ASCII letter-and-digit runs are taken first and each one lowered, which is the same
+  // set as lowering the whole text first, and lowers nothing but ASCII -- except for the two code
+  // points whose lowercase holds an ASCII letter (U+0130 -> `i` + U+0307, U+212A -> `k`), where the
+  // text is lowered with every other non-ASCII code point read as a space (each one only ENDS a
+  // run). Swept against the old body over every code point in six contexts in Node (no difference)
+  // and against the reference's `re.findall(r"[a-z0-9]+", text.lower())` likewise in Python; ts2py
+  // can compile it, where `.toLowerCase()` of arbitrary text is refused (55 code points CPython's
+  // tables and Node's map apart). Node's speed is the old body's (interleaved medians,
+  // docs/porting.md).
+  if (text.includes('\u0130') || text.includes('\u212a')) {
+    return new Set(text.replace(NOT_TOKEN_SOURCE, ' ').toLowerCase().match(/[a-z0-9]+/g) ?? []);
+  }
+  const out = new Set<string>();
+  for (const run of text.match(/[A-Za-z0-9]+/g) ?? []) out.add(run.toLowerCase());
+  return out;
 }
+
+/** Every code point but ASCII, U+0130 and U+212A: the ones whose lowercase holds no `[a-z0-9]`. */
+const NOT_TOKEN_SOURCE = /[^\x00-\x7f\u0130\u212a]/g;
 
 /**
  * `len(a & b) / len(a | b)`, except that an empty side is 0.0 and never a division.
@@ -1221,7 +1254,7 @@ export class MemoryStore {
   /** `_unwritable`: one sentence for a store that exists and refused a write (#141). */
   private unwritable(error: PyOSError): MemoryValidationError {
     return new MemoryValidationError(
-      `memory store is not writable: ${this.root}: ${error.strerror}; the directory` +
+      `memory store is not writable: ${this.root}: ${pyOSErrorStrerror(error)}; the directory` +
         ' exists but cannot be written to, so nothing was written',
     );
   }
@@ -1351,7 +1384,7 @@ export class MemoryStore {
     } catch (e) {
       if (!(e instanceof MemoryBudgetExceeded)) throw e;
       if (existed === null) pyUnlink(path);
-      else pyWriteText(path, existed);
+      else pyWriteTextAtomic(path, existed); // a temp and a rename, as the write it undoes (J89-1F)
       this.rebuildIndex(true);
       throw e;
     }
@@ -1395,7 +1428,7 @@ export class MemoryStore {
     if (!(minRatio >= 0 && minRatio <= 1)) throw new MemoryValidationError(MIN_RATIO_RANGE);
     const limit = k ?? this.k;
     const q = queryTerms(query);
-    const ledger = this.usage();
+    const ledger = this.usageLedger();
     // The outcome filter (#219) runs BEFORE scoring, so `k` and the ratio gate apply to the
     // filtered pool; the hot index carries no outcome, so a filtered recall pools the files.
     const factsPool = (): Pool => {
@@ -1421,7 +1454,7 @@ export class MemoryStore {
    * side only so the published `.d.ts` names no `UsageLedger` (its `reduceUsage` types reach
    * `Buffer`, which a consumer without `@types/node` cannot resolve, job66/#144).
    */
-  private usage(): UsageLedger {
+  private usageLedger(): UsageLedger {
     return new UsageLedger(homedir(), this.root);
   }
 
@@ -1563,13 +1596,13 @@ export class MemoryStore {
   candidatesDone(olderThanDays: number | null = null, today?: string): Array<[Fact, string]> {
     const todayS = today || this.today();
     const out: Array<[Fact, string]> = [];
+    // `date.fromisoformat(iso).toordinal()`, shifted: a real `YYYY-MM-DD` of the years 1..9999
+    // as days since 1970-01-01, else `null`. `parseTs` counts the day by `daysFromCivil`; until
+    // #316 G3 (J89-4a, D1) this used `Date.UTC`, which reads a year below 100 as 19xx, so a fact
+    // created in 0001-0099 was never aged.
     const ordinal = (iso: string): number | null => {
-      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
-      if (m === null) return null;
-      const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
-      const t = new Date(Date.UTC(y, mo - 1, d));
-      if (t.getUTCFullYear() !== y || t.getUTCMonth() !== mo - 1 || t.getUTCDate() !== d) return null;
-      return Math.round(t.getTime() / 86_400_000);
+      const t = parseTs(`${iso}T00:00:00Z`);
+      return Number.isNaN(t) ? null : t / 86_400_000;
     };
     const sorted = [...this.facts()].sort((a, b) => cmpCodepoint(pyText(a.name), pyText(b.name)));
     for (const fact of sorted) {
@@ -1578,9 +1611,9 @@ export class MemoryStore {
         continue;
       }
       if (fact.type === 'project') {
-        const m = DONE_WORD_RE.exec(pyText(fact.description));
-        if (m !== null) {
-          out.push([fact, `done-word '${m[1]!.toLowerCase()}' in description`]);
+        const word = pySearchWord(DONE_WORD_ALTERNATIVES, pyText(fact.description));
+        if (word !== null) {
+          out.push([fact, `done-word '${word.toLowerCase()}' in description`]);
           continue;
         }
       }
@@ -1708,13 +1741,13 @@ export class MemoryStore {
       if (!idx.names().has(name)) return null;
       const hit = this.indexedFact(idx, name);
       if (hit !== null) {
-        if (stamp) this.use(this.usage(), [hit], 'body_read');
+        if (stamp) this.use(this.usageLedger(), [hit], 'body_read');
         return hit;
       }
     }
     for (const fact of this.candidates(skipped)) {
       if (typeof fact.name === 'string' && fact.name === name) {
-        if (stamp) this.use(this.usage(), [fact], 'body_read');
+        if (stamp) this.use(this.usageLedger(), [fact], 'body_read');
         return fact;
       }
     }
@@ -1930,7 +1963,8 @@ export class MemoryStore {
   lint(): void {
     const findings: string[] = [];
     for (const fact of this.facts(findings)) {
-      if (!(VALID_TYPES as readonly string[]).includes(pyText(fact.type))) {
+      const valid = (VALID_TYPES as readonly string[]).includes(pyText(fact.type)); // see validateOutcomeStatus
+      if (!valid) {
         throw new MemoryValidationError(
           `fact '${pyText(fact.name)}' has invalid type '${pyText(fact.type)}'`,
         );
@@ -2064,7 +2098,7 @@ export class MemoryStore {
     let size = all.reduce((total, bytes) => total + bytes, 0);
     const before = size;
     const archived: ArchivedFact[] = [];
-    for (const fact of this.byEviction(facts, this.usage().lastUsedMap())) {
+    for (const fact of this.byEviction(facts, this.usageLedger().lastUsedMap())) {
       if (size <= target) break;
       // THE FILE THE FACT WAS READ FROM, not `facts/<name>.md` (#122). The two are the same
       // path for every fact this store wrote; they part on a hand-edited file whose
@@ -2479,7 +2513,7 @@ export class MemoryStore {
    */
   private listing(directory: string, consequence: string): string[] {
     try {
-      return pyScandirNames(directory).filter(matchesMd);
+      return pyScandirNames(directory).filter((name) => matchesMd(name));
     } catch (e) {
       const error = e instanceof PyOSError ? e : asPyOSError(e, directory);
       if (error.code === 'ENOENT') {
@@ -2505,7 +2539,7 @@ export class MemoryStore {
     consequence: string,
     detail = '',
   ): MemoryValidationError {
-    const because = `${error.strerror}${detail ? ` (${detail})` : ''}`;
+    const because = `${pyOSErrorStrerror(error)}${detail ? ` (${detail})` : ''}`;
     return new MemoryValidationError(
       `memory store is unreadable: ${directory}: ${because}; ${consequence}`,
     );
@@ -2568,7 +2602,7 @@ export class MemoryStore {
         out.push(this.readFact(path, findings));
       } catch (e) {
         if (!(e instanceof BantamError || e instanceof PyOSError)) throw e;
-        skipped.push({ file: basename(path), reason: e.message });
+        skipped.push({ file: basename(path), reason: e instanceof PyOSError ? pyOSErrorText(e) : e.message });
       }
     }
     return out;
@@ -2689,23 +2723,11 @@ export class MemoryStore {
    * never see it.
    */
   private writeFact(fact: Fact): void {
-    const path = this.factPath(fact.name);
-    const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-    try {
-      try {
-        writeFileSync(tmp, pyNewlineOut(formatFact(fact)), { encoding: 'utf8', flag: 'wx' });
-      } catch (e) {
-        throw asPyOSError(e, tmp, undefined, 'crt');
-      }
-      pyReplace(tmp, path);
-    } catch (e) {
-      try {
-        pyUnlink(tmp);
-      } catch (cleanup) {
-        if (!(cleanup instanceof PyOSError)) throw cleanup;
-      }
-      throw e;
-    }
+    // `pyWriteTextAtomic` IS this shape, written once (J89-1F): open `wx`, a loop until every
+    // byte is written, close, rename, unlink on failure. A failed write names no file, as
+    // CPython's buffered `write` raises it (`[Errno 27] File too large`); before, libuv's text
+    // and the temp's path came through `writeFileSync`.
+    pyWriteTextAtomic(this.factPath(fact.name), formatFact(fact));
   }
 
   /**
@@ -2716,7 +2738,8 @@ export class MemoryStore {
    * lied to. The read was wrong and the read is where it is fixed.
    */
   private rebuildIndex(tolerant = false): void {
-    pyWriteText(pyJoin(this.root, 'index.md'), this.indexTextOf(tolerant));
+    // Through a temp and a rename (J89-1F): a write cut short leaves the old `index.md` whole.
+    pyWriteTextAtomic(pyJoin(this.root, 'index.md'), this.indexTextOf(tolerant));
     // Every writer of a fact file ends here (save, its rollback, compact, archive, restore),
     // so this is where the hot index follows the files (#204).
     this.afterWrite();

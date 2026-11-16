@@ -130,6 +130,7 @@ One line per construct: TypeScript, its Python lowering, and the JS semantic tha
 | `class C { ... }` / `class E extends Error {}` (J86) | `class C(_JsObject)` / `class E(_JsError)` | Classes below |
 | `const f = (...) => ...` (module level) | `def _f(...):` (`return <expr>` for an expression body) | same as a function |
 | `const X = <expr>` (module level) | `X = <expr>` | evaluated once, in source order |
+| `let X = <expr>` / `export let X = <expr>` (module level, J89-2) | `X = <expr>`, a module global; a module function that assigns it declares `global X` | every function reads it when it runs, as JS reads the live binding; it holds no type facts; a closure may read it but not assign it, it needs an initializer, and another compiled module may not import it (`from .m import X` would copy the binding once: refused as a name the module does not export) |
 | `interface`, `type` alias, `import type`, `export type` | erased | type-only |
 
 ### Statements (inside a function)
@@ -146,18 +147,22 @@ One line per construct: TypeScript, its Python lowering, and the JS semantic tha
 | `o.k += e`, `o[k] -= e` (J88-2; `o` a local, `k` a local or a literal) | `_js_put(o, "k", <_js_get(o, "k") + e>)` | the property read before `e` is evaluated, then written back; anything else as the object (`o.a.k += 1`) is refused, since it would be evaluated twice |
 | `[a, b] = e` (J86) | `a, b = _js_destructure(e, 2)` | as the declaration |
 | `o.k = e`, `o[k] = e` (statement) | `_js_put(o, "k", e)` | sets a key on a plain object (`__proto__` is refused at run time: JS would set the prototype); on a class instance (J86) the attribute, a TypeError on a frozen one |
+| `xs[i] = e` on an array (J89-2) | `_js_put(xs, i, e)` | an index inside the array, or exactly its length (an append); a write past the end (a hole) or a non-index key on an array is outside the subset at run time |
 | `this.x = e` (J86) | `self.x = e` | a declared member; a TypeError once `Object.freeze(this)` ran |
 | `if / else if / else` | `if / elif / else` | condition through ToBoolean (below) |
 | `while (c)` | `while c:` | condition through ToBoolean |
 | `for (;;)` (J86) | `while True:` | |
-| `for (let i = a; test; i -= 1) body` (J87-3) | `i = a`, `while test:`, the body, then the update as the body's last statement | the init must be a `let` declaration (or absent), the update an assignment (or absent); a `continue` that would continue this loop is refused (in JS it runs the update, in Python it would skip it); closures in the body are refused as in any loop |
+| `for (let i = a; test; i++) body` (J89-2: `i++`, `++i`, `i--`, `--i`, `i` a local) | as below, the update `i = _js_inc(i)` / `_js_dec(i)` (`_js_num(i + 1)` when `i` is proven a number) | ToNumeric then plus or minus one: a string `"1"` becomes 2, never `"11"`; an update of anything but a local name is refused |
+| `for (let i = a; test; i -= 1) body` (J87-3) | `i = a`, `while test:`, the body, then the update as the body's last statement | the init must be a `let` declaration (or absent), the update an assignment (or absent); closures in the body are refused as in any loop |
+| the same loop whose body `continue`s it (J89-4a) | `i = a`, `_js_firstN = True`, `while True:`, `if _js_firstN: _js_firstN = False` / `else:` the update, `if not (test): break`, the body | JS's order: a `continue` runs the update, then the test (a Python `continue` reaches the update at the top of the next iteration); the first iteration runs no update |
 | `try { ... } finally { ... }`, `try { ... } catch { ... } finally { ... }` (J88-2) | `try:` holding the try (and its catch, as below) / `finally:` the finalizer | Python's `finally` runs where JS's does: a normal end, a `return`, a `break` and a throw; a `return` inside the finalizer replaces the completion in both |
 | `try { ... } catch (e?) { ... }` (J87-3) | `_js_caughtN = None` / `try:` / `except Exception as _js_errorN: _js_caughtN = _js_catch(_js_errorN)` / `if _js_caughtN is not None:` the handler | a `catch` sees only what JS could have thrown (`_js_catch`): a JS Error (`_JsError`), an `OSError` an fs adapter raised where Node throws an fs Error, or the runtime's JS-worded `TypeError` (`Cannot read properties of null ...`); a subset refusal (`ts2py: ...`), a `RecursionError` and any other Python exception propagate. The handler runs after the `try` statement, so nothing it raises is chained to what was caught (a JS throw carries no implicit cause). `throw e` is `raise` of the caught object, unchanged; J88-2: `e` may be read as a value (passed on, `e.code`, `typeof e`), and the runtime answers only what JS would read of it: a Python exception's `code` is the errno name of an `OSError` (libuv's spelling) or `undefined`, and any other property of a Python exception (`message`, `errno`, ...) is outside the subset at run time |
 | `switch (x) { case a: ... }` (J86) | `x` once into `_js_switchN`, then `if _js_strict_eq(...) / elif / else` | `===` per case, in order; empty cases group (`case a: case b:`); each case group must end in `return` / `throw` or a trailing `break` (dropped); fallthrough, a `break` elsewhere in a case, and a `default` that is not last are refused |
 | `throw e` (J86) | `raise e` for `new <class or Error>(...)`, else `raise _js_throw(e)`; J87-3: `throw e` of a `catch` binding is `raise` of what was caught | throwing a value that is not an Error raises a TypeError instead |
 | `for (const x of xs)` | `for x in xs:` | iterates a list, a `Map` (as `[key, value]` pairs), a `Set`, a string |
 | `for (const [i, x] of xs.entries())` | `for i, x in _js_m_entries(xs):` | pairs are exact, so a plain unpack |
-| `for (const [a, b] of xs)` (other iterables) | `for _js_itemN in xs:` + `a = _js_get(_js_itemN, 0)` ... | a short element reads `undefined`, not an unpack error |
+| `for (const [a, b] of xs)` (other iterables) | `for _js_itemN in xs:` + `a = _js_get(_js_itemN, 0)` ... | a short element reads `undefined`, not an unpack error; J89-4a: a hole (`[, b]`) binds nothing |
+| `function* g(...) { ... yield v; ... }` (module level, J89-4a) | a Python generator function: `yield v` as a statement, `return;` as `return`; a body with no `yield` ends `yield` (still a generator) | lazy, as a JS generator: the body runs as the consumer pulls. Its call is allowed only as a for-of's iterable or an array spread's argument (in its own module and in any module of the call that imports it), so the object is never held: a JS `break` closes the generator, a Python `break` leaves it open, and no compiled code can iterate it again. A `yield` inside a `try` (JS closes at the `break`, Python at collection, with a GeneratorExit at the `yield`), a `yield` whose value is read, `yield*`, `return v`, a generator method or arrow, and a typed body are refused |
 | `break` / `continue` (unlabelled) | `break` / `continue` | |
 | `return e` / `return` | `return e` / `return _JS_UNDEFINED` | a bare return yields `undefined`; J86: a body that can run off its end gets a final `return _JS_UNDEFINED` (Python would return `None`, which is `null`) |
 | parameter default `p = d` (J86) | `p=_JS_UNDEFINED`, then `if p is _JS_UNDEFINED: p = d` | applied when the argument is missing or `undefined`, evaluated at call time |
@@ -185,7 +190,9 @@ One line per construct: TypeScript, its Python lowering, and the JS semantic tha
 | `C.m(...)` (J88-2) | `C.m(...)`, a `@staticmethod` the class declares | a static method's body has no `this` |
 | `x.constructor` (J88-2, read for its `name`) | `_js_constructor_of(x)`, an object whose `name` is the JS constructor's name (`Object`, `Array`, a compiled class's, `TypeError`), or a Python exception's class name | the function itself is never handed out |
 | `process.pid`, `process.env` as a value (J88-2) | `process_pid()`, `process_env_all()` (a snapshot of the environment, only ever read) | each runtime its own process |
-| `a << b` (J88-2) | folded for two small non-negative integer literals (`1 << 20` is `1048576`), else `_js_shl(a, b)` | ToInt32 of the left, the count mod 32, the result wrapped to Int32; `>>` and `>>>` stay refused |
+| `a << b` (J88-2) | folded for two small non-negative integer literals (`1 << 20` is `1048576`), else `_js_shl(a, b)` | ToInt32 of the left, the count mod 32, the result wrapped to Int32; `>>>` stays refused |
+| `a >> b` (J89-4a) | `_js_sar(a, b)` | ToInt32 of the left, the count's low five bits, the sign-propagating shift (Python's `>>` of an Int32 int); a BigInt operand is outside the subset at run time |
+| `new Date().toISOString()` (J89-4a) | `_js_date_to_iso(_js_now())` | `new Date(Date.now())`'s spelling, as `new Date(ms).toISOString()` (J88-2) |
 | `new C(...)` (J86) | `C(...)` for a compiled class; `_JsError(...)` / `_JsTypeError(...)` / `_JsRangeError(...)` (J88-2) for `Error` / `TypeError` / `RangeError`; an adapter class (`new TextDecoder(...)`, `new Date()`) from the adapter module | extra arguments ignored, as JS ignores them |
 | `new RegExp(`...${n}...`)` (J86) | `_js_regexp_dynamic("<pattern>", n, ...)` | the template is checked against the whitelist grammar at compile time with each substitution as a whole `{n}` repeat count, and `n` must be an integer in 0..65535 at run time; a substitution anywhere else is refused |
 | `x instanceof C` (J86) | `isinstance(x, C)` | `C` a compiled class or `Error` / `TypeError`; a primitive is never an instance |
@@ -231,14 +238,23 @@ One line per construct: TypeScript, its Python lowering, and the JS semantic tha
 | `s.codePointAt(i)` (J86) | `_js_m_codePointAt` | UTF-16 position; a lead surrogate followed by a trail gives the astral code point, otherwise the unit; out of range is `undefined` |
 | `s.indexOf(x, from?)`, `s.lastIndexOf(x, from?)` (J86) | `_js_m_indexOf`, `_js_m_lastIndexOf` | UTF-16 positions, `from` clamped as JS clamps it (a NaN `from` of lastIndexOf is +Infinity); strings only |
 | `s.padStart(n, f?)`, `s.padEnd(n, f?)`, `s.repeat(n)` (J86) | `_js_m_padStart`, `_js_m_padEnd`, `_js_m_repeat` | length in UTF-16 units; the filler cut to fit; a negative or infinite count is RangeError |
-| `s.toLowerCase()`, `s.toUpperCase()` (J86) | `_js_m_toLowerCase`, `_js_m_toUpperCase` | ASCII exactly; a non-ASCII string raises (CPython and V8 follow different Unicode versions); J88-2: `toLowerCase` of a non-ASCII string is `str.lower()` unless it holds one of the 55 code points whose mapping the two tables differ on, or U+03A3 (final sigma is contextual), which raise |
+| `s.toLowerCase()`, `s.toUpperCase()` (J86) | `_js_m_toLowerCase`, `_js_m_toUpperCase` | ASCII exactly; a non-ASCII string raises (CPython and V8 follow different Unicode versions); J88-2: `toLowerCase` of a non-ASCII string is `str.lower()` unless it holds one of the 55 code points whose mapping the two tables differ on, or U+03A3 (final sigma is contextual), which raise; J89-7: the 55 are mapped to Node 26.13's answer before `str.lower()`, and a U+03A3 raises only when its Final_Sigma walk (over CPython's Case_Ignorable) reaches a code point CPython has as `Cn`, or U+0295 / U+1171E, the only places the two tables classify a sigma context apart; J89-7b: nothing raises: a U+03A3 is lowered by the Final_Sigma walk itself, over Node's Case_Ignorable / Cased for the 307 code points CPython 3.11's table classifies apart (fewer on later versions) and CPython's own elsewhere, and the 55 are translated only when a precompiled class finds one |
 | `s.trim()`, `s.endsWith(x)` (J88-2) | `_js_m_trim`, `_js_m_endsWith` | JS's WhiteSpace and LineTerminator (U+FEFF trimmed, U+001C-U+001F and U+0085 not: not `str.strip()`); by UTF-16 unit |
 | `m.values()` (J88-2) | `_js_m_values` | a Map's values, a Set's items or an array's elements, as a fresh list (only spread or iterated at once) |
+| `m.keys()` (J89-4a) | `_js_m_keys` | a Map's keys, a Set's items or an array's indexes, as a fresh list (the same snapshot as `values`) |
+| `a.forEach(cb)` (J89-4a) | `_js_m_forEach` | an array: `cb(item, index, a)` for each index below the length read at the start that is still present when reached (a pushed element is not visited, a popped one is skipped); answers `undefined`; a `thisArg` is refused (arity) and a Map's or Set's `forEach` raises at run time |
+| `a.copyWithin(t, s, e?)` (J89-4a) | `_js_m_copyWithin` | an array: each bound ToIntegerOrInfinity, a negative one from the end, clamped; the count the smaller of the source's and the target's room; an overlap copied as through a temporary; answers the array |
+| `a.splice(i, n, ...xs)` (J89-4a) | `_js_m_splice(a, i, n, *xs)` | a spread argument proven a list (a string, a Map or anything unproven is refused) |
 | `new Date(ms).toISOString()` (J88-2) | `_js_date_to_iso(ms)` | TimeClip then toward zero; `+YYYYYY` / `-YYYYYY` outside years 0-9999; a value past 8.64e15 or not finite is the RangeError `Invalid time value`; a string is outside the subset |
 | `Date.now()` (J88-2) | `_js_now()` | whole milliseconds, `time.time_ns() // 1_000_000` |
 | `Object.assign(target, ...sources)` (J88-2) | `_js_object_assign` | each source's own enumerable keys [[Set]] on a plain object or an instance (an Error given a `code`); a source that is not a plain object is outside the subset |
 | `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)` (J88-2) | `_js_sleep_ms(ms)` | the one spelling of a synchronous sleep (nothing can notify a fresh buffer); a wait that never ends is outside the subset; any other `Atomics.wait` is refused |
 | Buffers (J88-2) | `bytes` / `bytearray` (`Buffer.alloc`) / `memoryview` (`subarray`, sharing the bytes as Node's does) | `buf.length`, `buf[i]` (`undefined` out of range), `buf.toString('utf8' / 'hex')`; `Buffer.from(s, 'utf8')`, `Buffer.concat`, `Buffer.alloc` through the adapter seam |
+| `s.charCodeAt(i)` (J89-2) | `_js_m_charCodeAt` | the UTF-16 code unit at `i` (half of an astral pair), NaN outside the string; `i` ToIntegerOrInfinity (missing or NaN is 0) |
+| `s.match(re)` (J89-2, a regex literal) | `_js_m_match` | with `g`: every match's text over UTF-16 code units, an empty match stepping one unit, `null` when none; without `g`: what `re.exec(s)` answers |
+| `x.toFixed(f)` (J89-2) | `_js_m_toFixed` | Number.prototype.toFixed: the integer nearest `x * 10**f` on x's EXACT binary value, the larger on a tie (so a tie rounds away from zero: `(0.0009765625).toFixed(9)` is `0.000976563`, where Python's `format` rounds half to even); `-0` is `0`; NaN, the infinities and `|x| >= 1e21` are the number's `String()`; `f` outside 0..100 is RangeError; a receiver that is not a number is TypeError |
+| `buf.indexOf(byte, offset?)` (J89-2, a Buffer, `byte` a number) | `_js_m_indexOf` | `byte >>> 0` truncated to eight bits; the offset ToNumber (NaN or missing is 0), negative from the end, truncated toward zero |
+| `k in m` (J89-2, `m` a Map or Set) | `_js_in` | false for every key but what `Map.prototype` / `Set.prototype` / `Object.prototype` hold (`'get' in m`, `'size' in m`), as JS's prototype chain answers |
 | `s.replace(p, r)` (J86) | `_js_m_replace` | a string `p` replaces its first occurrence, a regex its first match, a `g` regex every match (empty matches as JS steps over them); `r` must be a string without `$` (JS's substitution patterns are outside the subset) |
 | `re.exec(s)` (J86) | `_js_m_exec` | `null` on no match; else an array of the match and groups (`undefined` for a group that did not take part) with `index` and `input` |
 | `x.toString(radix?)` (J86) | `_js_m_toString` | an instance's own `toString`; `Error.prototype.toString` (`name: message`); a number or BigInt in radix 2..36 (a fraction only in radix 10) |
@@ -261,6 +277,7 @@ One line per construct: TypeScript, its Python lowering, and the JS semantic tha
 | `s.includes(x)`, `a.includes(x)` | `_js_m_includes` | substring (J86: by UTF-16 unit); array membership by SameValueZero |
 | `s.startsWith(p)` | `_js_m_startsWith` | J86: by UTF-16 unit |
 | `s.split(sep)` (string separator) | `_js_m_split` | J86: by UTF-16 unit, so `""` splits into code units |
+| `s.split(re)` (a regex, J89-5c) | `_js_m_split` -> `_js_split_regex` | ECMA-262's `RegExp.prototype[@@split]` with no limit, over UTF-16 code units: the splitter tried at each position from the end of the last piece; an empty match where the last piece ended moves on one unit, a match starting at the end is never taken; each capture group joins the result after its piece (`undefined` when it took no part); `''` is `[]` when the splitter matches it, else `['']`; a `g` flag changes nothing. A limit (a second argument) is refused at compile time |
 | `re.test(s)` | `_js_m_test` | `re.search` on `String(s)` with each astral character split into its surrogates, so the pattern sees UTF-16 code units |
 
 A method above called on a receiver of the wrong runtime type raises
@@ -294,6 +311,7 @@ returns), so nothing reads it.
 |---|---|---|
 | `str` | `type(v) is str` | a string literal or template; `+` of two strings; `typeof`; a method whose result is always a string (`join`, `slice` of a string, ...); a `string` parameter in a typed body; a narrowing |
 | `num` | a plain `int` within +-2^53, or a `float` (what `_js_num` leaves unchanged) | a number literal; `+ - * / %` of two numbers (rounded by `_js_num`); `.length` of a proven string or list; `indexOf`; `Math.*`; a `number` parameter in a typed body |
+| `f64` (J89-3) | `type(v) is float` (so also `num`) | a literal Python spells as a float (`0.75`, `1e+21`, `-0.0`); a Float64Array element read in a proven loop copy; `+ - * /` of two proven numbers one of which is a float |
 | `bool` | `type(v) is bool` | a comparison, `!`, a method or builtin that always returns a boolean; a `boolean` parameter in a typed body |
 | `list` | a Python `list` | an array literal; `split`, `map`, `filter`, `sort`, `reverse`, `entries`; an array or tuple parameter in a typed body |
 | `regex` | a compiled `re.Pattern` without `g` | a regex literal |
@@ -367,11 +385,71 @@ it red).
 | truthiness, `!s` | `str` | `s != ""` | `_js_truthy` |
 | `const [a, b] = e` | `e` a fresh tuple of exactly that length | `a, b = e` | `_js_destructure` |
 | `for (const [a, b] of T)` | `T` frozen, rows of exactly that length | `for a, b in T:` | `_js_get(row, i)` |
+| `a + b`, `a - b`, `a * b` (J89-3) | both `num`, one `f64` | the native operator (IEEE-754; an int within 2^53 converts exactly), a `float` | `_js_num(a + b)`, `_js_mul` ... |
+| `a / b` (J89-3) | both `num`, one `f64` | `a / b if b else _js_div(a, b)` (a name or literal `b`), else `_js_fdiv(a, b)`: Python's `/` but a zero divisor's JS answer | `_js_div` |
 | a `str` binding indexed or `.length`-ed | a parameter or declared local never assigned again | its UTF-16 view `_jsu_<name> = _js_code_units(<name>)` beside the binding; `len(_jsu_s)`, `_jsu_s[i] if type(i) is int and 0 <= i < len(_jsu_s) else _js_str_at(s, i)`, `_js_units_at` / `_js_units_index_of` / `_js_units_slice` | the `_js_str_*` helpers |
 
 Known limits: a binding's facts are met over the whole function, so one unproven assignment
 (`i += used` where `used` is unproven) makes every read of it unproven; narrowing applies to
 `const` bindings only and never across a loop's back edge; methods and closures are untyped.
+
+## Typed arrays and counted loops (J89-3, #316 G3)
+
+**`Float64Array`.** `const t = new Float64Array(n)` is a Python `list` of `float`s
+(`_js_f64_new`: ToIndex of `n`, so `2.7` is 2 and NaN is 0; a negative length, or one past
+2^53 - 1, is the RangeError Node throws with the value in its message; a BigInt is Node's TypeError;
+an object argument, which Node would copy, and a length past 2^26 are refused at run time). A write
+converts its value (ToNumber, then a float), so every element is always a float: that is the proof
+the lowerings below use. The binding may only be
+
+- indexed, `t[k]` (`_js_ta_get`): the element, or `undefined` for a numeric key that is not a valid
+  index (out of range, a fraction, NaN, an infinity, the string `"-0"`); the number `-0` names
+  element 0, as its key is `"0"`;
+- written by index, `t[k] = v` (`_js_ta_put`): ToNumber of `v` first, then the float stored at a
+  valid index and nothing stored otherwise;
+- measured, `t.length` (`len(t)`, fixed when it is made);
+- the keys of the key sort below.
+
+A key that is not a number or a canonical numeric string is refused at run time (JS would read or
+make an ordinary property). Anything else is refused at compile time: the array as a value
+(returned, passed, aliased, iterated, spread, a method called on it), `let t = new Float64Array`,
+`new Float64Array` anywhere but a `const`'s initializer, `t[k] op= v`.
+
+**Counted loops proven once.** `for (let i = a; i < b; i += 1)` (or `i++`, `++i`, `i = i + 1`)
+whose body indexes arrays by `i` itself is lowered twice: a proven copy under a guard, and the
+general loop as before:
+
+```python
+i = <a>
+if type(i) is int and 0 <= i and type(b) is int and b <= len(t) and type(xs) is list and b <= len(xs) and _js_doubles(xs, i, b) and _js_is_double(w):
+    for i in range(i, b):  # noqa: B020
+        t[i] = t[i] + xs[i] * w        # floats and proven numbers, native
+else:
+    while ...:                         # the general loop
+```
+
+The guard checks, once: `i` an int at least 0; `b` an int (a name the body does not assign, a
+literal, or a Float64Array's length) no larger than the length of every Float64Array and every fresh
+array the body indexes at `i`; every plain array the body reads at `i` a list that long whose
+elements over `[i, b)` are proven numbers (`_js_doubles`: floats, and ints within 2^53, nothing
+else); every `const` or parameter the body uses as an operand of arithmetic or a comparison a proven
+number; and every outer `let` the body assigns and uses as an operand, when each assignment the copy
+makes to it is a proven number (else the copy is made without it). It holds for the whole loop
+because the body cannot change any of it: the body holds expression statements, `if`, `const` /
+`let`, `return` and an unlabelled `break` only; it assigns locals, Float64Array elements at `i`
+and fresh-array elements at `i` (a fresh array is a `const` bound to an array literal or to
+`.slice(...)`, which no parameter can alias), pushes onto fresh arrays only, and calls adapters and
+`Math.max/min/abs/floor/ceil/trunc/round/sign/sqrt` only, so no compiled code and no caller's code
+runs while it loops; it reads no member but `x[i]` and a Float64Array's `.length`; it holds no
+closure, no nested loop, no template. In the copy, `i` is a proven number, `t[i]` is a proven float,
+`xs[i]` a proven number, and `t[i] = v` / `fresh[i] = v` are the stores themselves.
+
+**The key sort.** `xs.sort((a, b) => t[b] - t[a] || a - b)` (or `t[a] - t[b] || a - b`) with `t` a
+Float64Array is `_js_sort_by_f64`: when every item is an int index into `t` and no key it names is
+NaN, the comparator is a total order (key, then index), so two stable sorts (by index, then by key)
+are V8's order at C speed; otherwise V8's own sort runs with the comparator (`_js_v8_sort`, V8's
+`Array.prototype.sort` step for step, so even a NaN key's inconsistent comparator leaves V8's
+order). Any other comparator is the general `.sort`.
 
 ## Classes (J86)
 
@@ -382,7 +460,7 @@ Known limits: a binding's facts are met over the whole function, so one unproven
 | `constructor(p) { ... }` | `def __init__(self, p, *_):` (fields first, then the body) | extra `new` arguments ignored |
 | method `m(p) { ... }` | `def m(self, p):` | a body that can run off its end returns `undefined` |
 | getter `get g() { ... }` | `@property def g(self):` | |
-| `class E extends Error {}` (J87-3: or `extends` an adapter Error class such as `BantamError`, or a class declared above that extends one) | `class E(_JsError):` (`class E(BantamError):`) | `e.message` is the argument (as `String()`), `e.name` is `"Error"` (inherited, as JS gives every subclass that does not set its own), `String(e)` is `name: message`; `e.name = "X"` makes an own `name`; a `_JsError` is a Python exception, `_JsTypeError` also a Python `TypeError` |
+| `class E extends Error {}` (J87-3: or `extends` an adapter Error class such as `BantamError`, or a class declared above that extends one) | `class E(_JsError):` (`class E(BantamError):`) | `e.message` is the argument (as `String()`), `e.name` is `"Error"` (inherited, as JS gives every subclass that does not set its own), `String(e)` is `name: message`; `e.name = "X"` makes an own `name`, and so does a class field `override name = 'X'` (J89-5a: set after the base constructor, as JS defines a field once `super` returns); a `_JsError` is a Python exception, `_JsTypeError` also a Python `TypeError` |
 | `Object.freeze(this)` | `_js_freeze(self)` | a later write raises JS's TypeError (`Cannot assign to read only property 'v' of object '#<C>'`) |
 
 Refused in a class: `static` members, computed or `#private` keys, setters, accessor properties,
@@ -415,6 +493,12 @@ array proven a list.
 - An import with no compiled module and no row is a compile error naming it:
   `<path>:<line>:<col>: unsupported import of pyRepr from ./pyfs.js: no compiled module and no declared adapter: pyRepr`.
 - Renamed imports and exports, default and namespace imports, and side-effect imports are refused.
+- J89-4a: an `ImportedClass` row (`HotIndex`, `ColdIndex`) is a class whose methods dispatch
+  (`_js_invoke`, or `_js_dispatch` where a builtin shares the name) only in a module that imports
+  it, so its method names do not turn every `Set.add` of the call into a dispatch; naming one of
+  them as a value is not refused at compile time (`pool.names` of a plain object reads the
+  field), and on an instance the runtime refuses it (`_js_object_get`). `Buffer.byteLength(s,
+  'utf8')` is a global row; `statSync(p, {bigint: true})` answers `BigIntStats`.
 
 ## Names
 
@@ -426,8 +510,11 @@ array proven a list.
   members keep their JS spelling (`self.bestWidth`, `def writeIndent(self)`), because a
   reflective read looks them up by that spelling.
 - A local or parameter is `snake_case(name)`: `nodeId` -> `node_id`.
-- A Python keyword gets a trailing `_` (`lambda` -> `lambda_`); so does a module-level name
-  that would shadow a builtin the runtime support calls (`len` -> `len_`).
+- A Python keyword gets a trailing `_` (`lambda` -> `lambda_`); so does any name (J89-2: a
+  local or parameter too, not only a module-level name) that would shadow a builtin the runtime
+  support or a generated body calls (`len` -> `len_`, `type` -> `type_`): since J87 a function
+  body itself spells `type(x) is str` in its guarded entry, so a parameter named `type` made the
+  guard call the string.
 - Two different source names that fold to one Python name are refused (`name collision`).
 - Identifiers starting `_js`, `_Js` or `_JS` are reserved for the runtime support and refused.
 
@@ -450,24 +537,31 @@ array proven a list.
 
 ## Refused (not exhaustive: anything unlisted above is refused)
 
-Generator functions and `yield`, `async` functions and `await`, `this` outside a class body,
+Generator methods and arrows, `yield*`, a `yield` used as a value or inside a `try`, a generator
+call anywhere but a for-of's iterable or an array spread (J89-4a lowers the rest), `async`
+functions and `await`, `this` outside a class body,
 labelled statements / `break label` / `continue label`, any builtin or method not in the tables
-above (`Object.create`, `Math.round`, `s.trimEnd()`, `s.charCodeAt()`, `String.fromCharCode()`,
-...), `var`, nested `function` declarations, function expressions, an arrow inside a loop, an
+above (`Object.create`, `Math.round`, `Math.log`, `Math.pow`, `s.trimEnd()`, `s.normalize()`,
+`String.fromCharCode()`, ...; J89-2: `Math.log`, `Math.log1p` and `Math.pow` stay refused because
+V8's last bit is not a function of the input across platforms, so a port of CPython's arithmetic
+calls `pysem`'s adapters instead), `var`, nested `function` declarations, function expressions, an arrow inside a loop, an
 arrow inside a callback lambda (J88-2 accepts one anywhere else), a callback that is neither an
 inline arrow nor a module function or adapter named directly,
 destructuring with defaults, rest elements, nesting or computed keys, rest parameters, optional
 chaining other than one member read (J87-3), loose equality `==` other than against
 `null`/`undefined`, `**` other than of two integer literals with an exact result (J87-3), the
-bitwise operators but `<<` (J88-2), `void`, `delete`, unary `+`, `++`/`--`, compound assignment
+bitwise operators but `<<` (J88-2) and `>>` (J89-4a), `void`, `delete`, unary `+`, `++`/`--` anywhere but a C-style
+`for` update on a local name (J89-2), typed arrays (`Float64Array`, `DataView`), compound assignment
 other than `+=` `-=` `*=` on a local, `this.x` or a property of a local (J88-2), assignment inside an expression (other than a chain of `=`
-between locals), assignment to a module-level name, the comma operator, `switch` fallthrough between non-empty cases, a
+between locals), assignment to a module-level name other than a module `let` from a module
+function (J89-2), a module-level `let` without an initializer, the comma operator, `switch` fallthrough between non-empty cases, a
 `break` that does not end its case, a `default` that is not the last case, `do-while`, a C-style
-`for` whose init is not a `let` declaration, whose update is not an assignment or whose body
-`continue`s it (J87-3), `for-in`, `for await`,
+`for` whose init is not a `let` declaration or whose update is not an assignment (J87-3; J89-4a
+lowers a `continue`), `for-in`, `for await`, a write to a regex's `lastIndex` (J89-4a: the subset
+models none),
 computed or integer-like object keys, getters/setters and methods in object literals, tagged
 templates, non-finite number literals, regex flags other than `g`, regex syntax whose meaning
-differs between the engines (`\s`, `\B`, named groups, backreferences, a lookbehind holding
+differs between the engines (`\s` inside a class (J89-4a spells it out elsewhere), `\B`, named groups, backreferences, a lookbehind holding
 anything but single-unit atoms, Annex B leniencies such as a bare `{`, `}` or `]` or an `\x`
 / `\u` without its digits, a quantified lookaround, a class escape as a range endpoint), regexes
 JS itself rejects (a range out of order in UTF-16 code units such as `[😀-😂]`, `{3,2}`, a
@@ -502,11 +596,25 @@ that is not what its annotation says (`any`, an adapter, `JSON.parse`) cannot re
 data. An untyped or `any` receiver, a method signature (`get(): number`), a function-typed field
 (`get: () => number`) and a read through `as` stay refused. A computed key the compiler cannot see
 is checked at run time (below).
+J89-5: the annotating type may also be IMPORTED from a compiled module of the same call (`import {
+type Pool } from './store.js'`, `import type { ... }`): it declares there what it declares in the
+module that declares it. An annotated ARROW parameter (`(o: Omission) => o.count`) declares its
+fields as a function parameter does (`tests/g3_store.rs`, `j89_5_*`, pinned to Node).
+J89-5a: a method name that only a class NO EXPORT NAMES declares (queries.ts's `CountsView`) is a
+method name in its own module only, as an `ImportedClass` adapter's is in a module that imports
+it: there its calls dispatch (`_js_dispatch`) and a read of it as a value is refused; in the other
+modules of the call a builtin call of that name is the builtin's helper (`m.get(k)` is
+`_js_m_get`), which refuses an instance of the class at run time (`ts2py: .get() on _CountsView is
+outside the subset`), and a property read of it is `_js_get`, which `_js_object_get` refuses on an
+instance. Such a class reaches another module only as a value a function returned, so the other
+modules never answer differently from Node: they answer as Node does or refuse. An exported
+class's method names still reach every module (`tests/g3_store.rs`,
+`j89_5a_a_private_class_keeps_its_method_names_in_its_module`, pinned to Node).
 
 Some operations are checked at run time instead, because only the value can tell: each raises
-a `TypeError` naming the subset rather than answering differently from JS. `.toLowerCase()` /
-`.toUpperCase()` on a non-ASCII string; `.replace` with a `$` in the replacement or a function;
-`.test` / `.exec` on a `g` regex; a `new RegExp` repeat count that is not an integer in
+a `TypeError` naming the subset rather than answering differently from JS. `.toUpperCase()` on a
+non-ASCII string; `.replace` with a `$` in the replacement or a function; `.test` / `.exec` on a
+`g` regex; a `new RegExp` repeat count that is not an integer in
 0..65535; reading an `Object.prototype` name (`constructor`, `toString`, ...) that a plain
 object or instance does not own (JS answers with an inherited function); assigning
 `__proto__`; `Object.freeze` of anything but a class instance; `throw` of a value that is not an
@@ -520,4 +628,9 @@ the subset`).
 - J86 removed the J85 limit that strings were indexed and split by code point: every position is
   now a UTF-16 code unit (Strings above).
 - Iterating a `Map` or `Set` sees a snapshot: entries added during the loop are not visited.
+- J89-3: the general `.sort(compare)` (`_js_m_sort`) is CPython's `list.sort`, which orders an
+  INCONSISTENT comparator (one a NaN makes so) differently from V8 (561 of 30,000 seeded sorts); the
+  key sort above uses V8's own algorithm (`_js_v8_sort`) for that case.
+- J89-3: a Float64Array longer than 2^26 elements is refused at run time (Node allocates one of
+  10^10 lazily; Python would build the list).
 - `JSON.stringify` on a cyclic structure raises `RecursionError` (JS raises `TypeError`).
