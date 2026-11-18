@@ -756,6 +756,39 @@ def _removal_plan(path: Path, events: list[str], entries: int) -> str:
     )
 
 
+def _without_markers(table: dict[str, list]) -> dict[str, list]:
+    """`table` as the idempotence test reads it: every hook object WITHOUT the ownership marker.
+
+    THE HOST TAKES THE MARKER OFF, so its absence cannot be a reason to rewrite (0.40.1). The
+    note on `HOOK_MARKER_KEY` measured `/hooks` edits on Claude Code 2.1.278, which put unknown
+    keys back. A settings write that is not a `/hooks` edit does not. MEASURED on 2.1.327 in a
+    scratch `CLAUDE_CONFIG_DIR` holding one marked hook: `claude plugin marketplace add <dir>`
+    re-serialised `settings.json` and the hook came back as `{type, command, timeout}`, the
+    marker gone. Comparing the marker made every such file "not matching": `--install-hooks`
+    then asked for consent to write back seven entries that differed from the file's by this
+    key alone, and with no terminal that is exit 2 on an install that is correct -- the same
+    exit a stale command gets, so a caller could not tell the two apart.
+
+    THE COMMAND, THE TIMEOUT, THE MATCHER AND THE ORDER ARE STILL COMPARED. Only the key whose
+    value is never read is left out, on both sides, so a stale path still fails to match.
+
+    THIS DOES NOT MAKE A MARKER-LESS ENTRY OURS. Whose it is stays `_is_our_hook`'s question,
+    and an entry with no marker is claimed only through `_is_legacy_ours`.
+    """
+
+    def bare(hook: object) -> object:
+        if not isinstance(hook, dict) or HOOK_MARKER_KEY not in hook:
+            return hook
+        return {key: value for key, value in hook.items() if key != HOOK_MARKER_KEY}
+
+    def stripped(entry: object) -> object:
+        if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+            return entry
+        return {**entry, "hooks": [bare(hook) for hook in entry["hooks"]]}
+
+    return {event: [stripped(entry) for entry in entries] for event, entries in table.items()}
+
+
 def install_hooks(
     *,
     ask: Callable[[], bool] | None = None,
@@ -772,7 +805,9 @@ def install_hooks(
          overwritten;
       3. ALREADY-INSTALLED-AND-MATCHING RETURNS HERE, before the gate. There is no write to
          consent to, so a second `--install-hooks` is a no-op at exit 0 whether or not
-         anybody is at a terminal, which is what makes it safe in a setup script;
+         anybody is at a terminal, which is what makes it safe in a setup script. "Matching"
+         is read without the ownership marker, which the host removes (`_without_markers`,
+         0.40.1);
       4. print the plan, then the gate;
       5. dated backup, then one atomic write.
 
@@ -787,7 +822,10 @@ def install_hooks(
     current = _read_hooks(path, data)
     hooks, _touched, _removed = _planned_hooks(current, rendered, remove=False)
 
-    if json.dumps(hooks, sort_keys=True) == json.dumps(current, sort_keys=True):
+    # The marker is left out of this comparison, and `_without_markers` says why (0.40.1).
+    if json.dumps(_without_markers(hooks), sort_keys=True) == json.dumps(
+        _without_markers(current), sort_keys=True
+    ):
         return f"bantamkit hooks are already installed in {path} and match"
 
     say = tell if tell is not None else (lambda _text: None)

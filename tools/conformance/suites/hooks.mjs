@@ -1159,6 +1159,67 @@ export async function run(ctx) {
     );
   }
 
+  // ====================== --install-hooks after the HOST took the marker off: STILL A MATCH
+  //
+  // 0.40.1. Claude Code 2.1.327 re-serialises `settings.json` on a write of its own (measured:
+  // `claude plugin marketplace add`) and drops the `"bantamkit": "hook"` key from the hook
+  // object. The entries are otherwise the ones each runtime wrote, so a second `--install-hooks`
+  // with no terminal and no `--yes` must be the exit-0 no-op, not the exit-2 refusal. The
+  // differential is satisfied by two runtimes that both refuse, so exit and bytes are also
+  // pinned per side against a literal.
+  {
+    const id = 'install-hooks-marker-stripped';
+    const cwd = join(root, id, 'cwd');
+    mkdirSync(cwd, { recursive: true });
+    const homes = { py: home(id, 'py'), node: home(id, 'node') };
+    const settings = (h) => join(h, '.claude', 'settings.json');
+    runPy(ctx, { argv: ['--install-hooks', '--yes'], cwd, home: homes.py });
+    runNode(ctx, { argv: ['--install-hooks', '--yes'], cwd, home: homes.node });
+    const strip = (h) => {
+      const doc = JSON.parse(readFileSync(settings(h), 'utf8'));
+      let stripped = 0;
+      for (const entries of Object.values(doc.hooks ?? {})) {
+        for (const entry of entries) {
+          for (const hook of entry.hooks ?? []) {
+            if ('bantamkit' in hook) stripped += 1;
+            delete hook.bantamkit;
+          }
+        }
+      }
+      writeFile(settings(h), `${JSON.stringify(doc, null, 2)}\n`);
+      return { stripped, bytes: readFileSync(settings(h), 'utf8') };
+    };
+    const before = { py: strip(homes.py), node: strip(homes.node) };
+    const py = runPy(ctx, { argv: ['--install-hooks'], cwd, home: homes.py });
+    const nd = runNode(ctx, { argv: ['--install-hooks'], cwd, home: homes.node });
+    const mask = (buf, h) => dec(buf).split(h).join('<HOME>');
+    cases.push({
+      name: 'install-hooks-marker-stripped: the same report, on the same stream, with the same exit code',
+      kind: 'json',
+      expected: { stdout: mask(py.stdout, homes.py), stderr: mask(py.stderr, homes.py), exit: py.exit },
+      actual: { stdout: mask(nd.stdout, homes.node), stderr: mask(nd.stderr, homes.node), exit: nd.exit },
+    });
+    const side = (h, run, was) => ({
+      strippedFirst: was.stripped,
+      exit: run.exit,
+      stdout: mask(run.stdout, h),
+      fileUnchanged: readFileSync(settings(h), 'utf8') === was.bytes,
+    });
+    cases.push(
+      ...literalCases(
+        side(homes.py, py, before.py),
+        side(homes.node, nd, before.node),
+        'install-hooks-marker-stripped: exit 0, the match sentence, the file byte-unchanged, against a literal',
+        {
+          strippedFirst: 7,
+          exit: 0,
+          stdout: 'bantamkit hooks are already installed in <HOME>/.claude/settings.json and match\n',
+          fileUnchanged: true,
+        },
+      ),
+    );
+  }
+
 
   // ================================================ --remove-hooks: THE SAME GATE, BOTH WAYS
   //

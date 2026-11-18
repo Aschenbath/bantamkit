@@ -297,6 +297,28 @@ and `UserPromptSubmit` fired **twice on both sides**. The control is why that nu
 anything: the same probe driven through `claude mcp list` fires **nothing** on either side and
 would have "passed" vacuously.
 
+**AMENDED 2026-11-18 (0.40.1): the host keeps the key on a `/hooks` edit and drops it on other
+writes.** Measured on Claude Code 2.1.327 in a scratch `CLAUDE_CONFIG_DIR` holding one marked
+hook: `claude plugin marketplace add <dir>` re-serialised `settings.json` and the hook came back
+as `{type, command, timeout}`, the marker gone; `plugin install`, `disable` and `enable` left it
+gone. `--install-hooks` compared the marker, so after any such write a correct install read as
+"not matching": it asked for consent to write back seven entries that differed from the file's
+by that key alone, and with no terminal that is **exit 2 — the exit a stale command gets**, so a
+caller could not tell the two apart. Seen on a real settings file: the `.hooks` diff across the
+rewrite it then asked for was seven added `"bantamkit": "hook"` lines and nothing else.
+
+Since 0.40.1 the already-installed test leaves the marker out on both sides. Command, timeout,
+matcher and order are still compared, so an entry whose command names another install still
+does not match. The marker is still written, and it is still what claims an entry on a path
+that never says `bantamkit`.
+
+**What this does not fix.** Ownership is unchanged: an entry with no marker is ours only
+through the two legacy spellings, which need the command to name bantamkit. On an install path
+that does not, an entry the host has stripped is unclaimable again, so `--install-hooks` adds
+seven beside it and `--remove-hooks` reports none — the J62-22 defect, reached through the host
+instead of through us. Not measured end to end on 2.1.327; an npm install is not affected,
+because its path holds `node_modules/bantamkit-mcp`.
+
 **Nothing already on disk was orphaned by the change.** An entry written by
 `tools/hooks/install.mjs` — the shape in real settings files today — names
 `bantamkit-hook.mjs` in its **filename**, so it is recognised whatever the checkout is called,

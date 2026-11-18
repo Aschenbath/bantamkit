@@ -202,6 +202,59 @@ def test_a_second_identical_install_changes_nothing_says_so_and_never_asks(home)
     assert backups_in(path) == []
 
 
+def as_the_host_rewrites_it(path: Path, mutate=lambda _hook: None) -> bytes:
+    """What the host does to our entries on a settings write of its own (0.40.1).
+
+    MEASURED on Claude Code 2.1.327 in a scratch CLAUDE_CONFIG_DIR: `claude plugin marketplace
+    add` re-serialised `settings.json` and the `"bantamkit": "hook"` key was gone from the hook
+    object, with `type`, `command` and `timeout` kept. `mutate` lets a case change something
+    else in the same pass.
+    """
+    doc = read_json(path)
+    for entries in doc["hooks"].values():
+        for entry in entries:
+            for hook in entry["hooks"]:
+                hook.pop("bantamkit", None)
+                mutate(hook)
+    path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    return path.read_bytes()
+
+
+def test_0_40_1_entries_the_host_took_the_marker_off_still_match_with_no_terminal(home):
+    path = hostinstall.claude_settings_path()
+    hostinstall.install_hooks(tell=lambda _text: None, ask=lambda: True)
+    before = as_the_host_rewrites_it(path)
+    assert b'"bantamkit"' not in before, "the fixture still carries a marker"
+
+    report = hostinstall.install_hooks(tell=refuse("a no-op install printed a plan"), ask=None)
+
+    assert report == f"bantamkit hooks are already installed in {path} and match"
+    assert path.read_bytes() == before
+    assert backups_in(path) == []
+
+
+def _another_command(hook: dict) -> None:
+    hook["command"] = hook["command"].removesuffix(" --hook") + ".old --hook"
+
+
+def _another_timeout(hook: dict) -> None:
+    hook["timeout"] = 99
+
+
+@pytest.mark.parametrize("mutate", [_another_command, _another_timeout])
+def test_0_40_1_a_marker_less_entry_that_differs_does_not_match_and_still_needs_consent(
+    home, mutate
+):
+    path = hostinstall.claude_settings_path()
+    hostinstall.install_hooks(tell=lambda _text: None, ask=lambda: True)
+    before = as_the_host_rewrites_it(path, mutate)
+
+    with pytest.raises(hostinstall.HookConsentUnavailable):
+        hostinstall.install_hooks(tell=lambda _text: None, ask=None)
+
+    assert path.read_bytes() == before
+
+
 def test_yes_writes_with_no_terminal_at_all_and_never_asks(home):
     path = hostinstall.claude_settings_path()
     tell = Recorder()

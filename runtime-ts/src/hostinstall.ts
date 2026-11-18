@@ -900,6 +900,49 @@ function plannedHooks(
   return { hooks, touched, removed };
 }
 
+/**
+ * `table` as the idempotence test reads it: every hook object WITHOUT the ownership marker.
+ *
+ * THE HOST TAKES THE MARKER OFF, so its absence cannot be a reason to rewrite (0.40.1). The note
+ * on {@link HOOK_MARKER_KEY} measured `/hooks` edits on Claude Code 2.1.278, which put unknown
+ * keys back. A settings write that is not a `/hooks` edit does not. MEASURED on 2.1.327 in a
+ * scratch `CLAUDE_CONFIG_DIR` holding one marked hook: `claude plugin marketplace add <dir>`
+ * re-serialised `settings.json` and the hook came back as `{type, command, timeout}`, the marker
+ * gone. Comparing the marker made every such file "not matching": `--install-hooks` then asked
+ * for consent to write back seven entries that differed from the file's by this key alone, and
+ * with no terminal that is exit 2 on an install that is correct — the same exit a stale command
+ * gets, so a caller could not tell the two apart.
+ *
+ * THE COMMAND, THE TIMEOUT, THE MATCHER AND THE ORDER ARE STILL COMPARED. Only the key whose
+ * value is never read is left out, on both sides, so a stale path still fails to match.
+ *
+ * THIS DOES NOT MAKE A MARKER-LESS ENTRY OURS. Whose it is stays {@link isOurHook}'s question,
+ * and an entry with no marker is claimed only through {@link isLegacyOurs}.
+ */
+function withoutMarkers(table: HookTable): PyValue {
+  const bare = (hook: PyValue): PyValue => {
+    if (hook.t !== 'dict' || !hook.v.has(HOOK_MARKER_KEY)) return hook;
+    const copy = pyDict(hook.v);
+    copy.v.delete(HOOK_MARKER_KEY);
+    return copy;
+  };
+  const stripped: HookTable = new Map();
+  for (const [event, entries] of table) {
+    stripped.set(
+      event,
+      entries.map((entry) => {
+        if (entry.t !== 'dict') return entry;
+        const hooks = entry.v.get('hooks');
+        if (hooks === undefined || hooks.t !== 'list') return entry;
+        const copy = pyDict(entry.v);
+        copy.v.set('hooks', { t: 'list', v: hooks.v.map(bare) });
+        return copy;
+      }),
+    );
+  }
+  return asPyValue(stripped);
+}
+
 const EVENT_NAMES = HOOK_EVENTS.map(([event]) => event).join(' ');
 
 /**
@@ -956,7 +999,8 @@ function removalPlan(path: string, events: readonly string[], entries: number): 
  *      overwritten;
  *   3. ALREADY-INSTALLED-AND-MATCHING RETURNS HERE, before the gate. There is no write to
  *      consent to, so a second `--install-hooks` is a no-op at exit 0 whether or not anybody
- *      is at a terminal, which is what makes it safe in a setup script;
+ *      is at a terminal, which is what makes it safe in a setup script. "Matching" is read
+ *      without the ownership marker, which the host removes (`withoutMarkers`, 0.40.1);
  *   4. print the plan, then the gate;
  *   5. dated backup, then one atomic write.
  *
@@ -972,7 +1016,8 @@ export function installHooks(options: HookOptions = {}): string {
   const current = readHooks(path, data);
   const { hooks } = plannedHooks(current, rendered, false);
 
-  if (dumpJson(asPyValue(hooks), { sortKeys: true }) === dumpJson(asPyValue(current), { sortKeys: true })) {
+  // The marker is left out of this comparison, and `withoutMarkers` says why (0.40.1).
+  if (dumpJson(withoutMarkers(hooks), { sortKeys: true }) === dumpJson(withoutMarkers(current), { sortKeys: true })) {
     return `bantamkit hooks are already installed in ${path} and match`;
   }
 
