@@ -1009,6 +1009,70 @@ def test_removal_takes_out_a_neutral_path_entry_the_other_runtime_wrote(home):
     assert read_json(path)["hooks"] == {"PostToolUse": [FOREIGN]}
 
 
+# 0.40.1 -- THE HOST TAKES THE MARKER OFF, AND AT A NEUTRAL PATH NOTHING ELSE NAMES US.
+#
+# `this_command()` here always names bantamkit, so the reference cannot reach this from its own
+# install; it is driven through the seam. The end-to-end reproduction is the port's, from a copy
+# of `dist/` at a neutral path: `hook-ownership-neutral-stripped` in the conformance suite.
+NEUTRAL_COMMAND = ("/opt/vendor/bin/python", ["-m", "vendored.server"])
+# Somebody else's tool with its own `--hook` flag, the same timeout and no marker.
+OTHER_HOOK_TOOL = {
+    "hooks": [{"type": "command", "command": "/opt/vendor/bin/other --hook", "timeout": 10}]
+}
+
+
+def _entries(path: Path) -> int:
+    return sum(len(entries) for entries in read_json(path).get("hooks", {}).values())
+
+
+def test_0_40_1_a_stripped_entry_at_a_neutral_path_is_ours_by_its_exact_command(
+    home, monkeypatch
+):
+    monkeypatch.setattr(hostinstall, "this_command", lambda: NEUTRAL_COMMAND)
+    path = hostinstall.claude_settings_path()
+    seed(path, json.dumps({"hooks": {"PostToolUse": [OTHER_HOOK_TOOL]}}, indent=2) + "\n")
+    hostinstall.install_hooks(tell=lambda _text: None, yes=True)
+    before = as_the_host_rewrites_it(path)
+    assert b"bantamkit" not in before, "the fixture names us somewhere"
+
+    report = hostinstall.install_hooks(tell=refuse("a no-op install printed a plan"), ask=None)
+    assert report == f"bantamkit hooks are already installed in {path} and match"
+    assert path.read_bytes() == before
+    assert _entries(path) == 8, "seven of ours and the other tool's one"
+
+    removed = hostinstall.remove_hooks(tell=lambda _text: None, yes=True)
+    assert removed.startswith("removed bantamkit hooks from ")
+    assert read_json(path)["hooks"] == {"PostToolUse": [OTHER_HOOK_TOOL]}
+
+
+def test_0_40_1_a_marker_less_neutral_entry_from_another_install_is_not_claimed(
+    home, monkeypatch
+):
+    path = hostinstall.claude_settings_path()
+    monkeypatch.setattr(hostinstall, "this_command", lambda: ("/opt/old/python", ["-m", "old"]))
+    hostinstall.install_hooks(tell=lambda _text: None, yes=True)
+    as_the_host_rewrites_it(path)
+
+    monkeypatch.setattr(hostinstall, "this_command", lambda: NEUTRAL_COMMAND)
+    report = hostinstall.remove_hooks(tell=refuse("nothing of ours is here"), ask=None)
+    assert report == f"no bantamkit hooks are installed in {path}"
+    assert _entries(path) == 7
+
+
+def test_0_40_1_the_observation_sees_a_stripped_neutral_entry_of_this_install_only(
+    home, monkeypatch
+):
+    path = hostinstall.claude_settings_path()
+    monkeypatch.setattr(hostinstall, "this_command", lambda: NEUTRAL_COMMAND)
+    hostinstall.install_hooks(tell=lambda _text: None, yes=True)
+    as_the_host_rewrites_it(path)
+
+    assert hostinstall.has_bantamkit_hooks(path) is True
+
+    monkeypatch.setattr(hostinstall, "this_command", lambda: ("/opt/old/python", ["-m", "old"]))
+    assert hostinstall.has_bantamkit_hooks(path) is False
+
+
 def test_reinstalling_over_marked_entries_another_build_wrote_leaves_seven_not_fourteen(home):
     """IDEMPOTENCE, the other half of the same defect -- the half the `21` came from."""
     path = hostinstall.claude_settings_path()

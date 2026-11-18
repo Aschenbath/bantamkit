@@ -83,7 +83,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, join, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 
 export const name = 'hooks';
@@ -1846,6 +1846,98 @@ export async function run(ctx) {
             entriesAfterRemoval: 0,
             removalFoundThem: true,
           }),
+        );
+
+        // ------------------- the same neutral tree AFTER THE HOST TOOK THE MARKER OFF (0.40.1)
+        //
+        // The case above holds only while the marker is in the file, and Claude Code 2.1.327
+        // removes it on a settings write of its own (`install-hooks-marker-stripped` carries
+        // the measurement). At a neutral path that left the port's entries naming nobody: a
+        // reinstall added seven beside them and a removal found none — the defect above,
+        // reached through the host. What claims them now is the entry's command being, to the
+        // byte, the one this install writes.
+        //
+        // THE ORDER IS THE MEASUREMENT: install, strip, a check with no terminal and no
+        // `--yes`, a reinstall, strip again, remove. Before the fix the port's row read
+        // `checkExit: 2`, `observedWhileStripped: 'false'`, `entriesAfterReinstall: 14`,
+        // `removalFoundThem: false`.
+        const stripHomes = { py: home(`${id}-neutral-stripped`, 'py'), node: home(`${id}-neutral-stripped`, 'node') };
+        const stripMarkers = (h) => {
+          const doc = JSON.parse(readFileSync(settings(h), 'utf8'));
+          for (const entries of Object.values(doc.hooks ?? {})) {
+            for (const entry of entries) for (const hook of entry.hooks ?? []) delete hook.bantamkit;
+          }
+          writeFile(settings(h), `${JSON.stringify(doc, null, 2)}\n`);
+        };
+        const sides = {
+          py: (argv) => runPy(ctx, { argv, cwd, home: stripHomes.py }),
+          node: (argv) => runNode(ctx, { argv, cwd, home: stripHomes.node, cli: neutralCli }),
+        };
+        // The observation the capability tiers ask (`hookTier`), from the SAME install: the
+        // port's is imported out of the neutral copy, so the command it compares is the one
+        // that copy wrote. Asked while the entries are stripped and before they are removed.
+        const observed = {
+          py: (h) =>
+            spawnSync(
+              String(ctx.python),
+              ['-c', 'import sys; from pathlib import Path; from bantamkit.hostinstall import has_bantamkit_hooks as f; print("true" if f(Path(sys.argv[1])) else "false")', settings(h)],
+              { encoding: 'utf8', timeout: 120_000 },
+            ).stdout.trim(),
+          node: (h) =>
+            spawnSync(
+              process.execPath,
+              [
+                '--input-type=module',
+                '-e',
+                `const m = await import(${JSON.stringify(pathToFileURL(join(neutralRoot, 'dist', 'hostinstall.js')).href)}); console.log(String(m.hasBantamkitHooks(process.argv[1])));`,
+                settings(h),
+              ],
+              { encoding: 'utf8', timeout: 120_000 },
+            ).stdout.trim(),
+        };
+        const strippedShape = (side) => {
+          const h = stripHomes[side];
+          sides[side](['--install-hooks', '--yes']);
+          stripMarkers(h);
+          const check = sides[side](['--install-hooks']);
+          const reinstall = sides[side](['--install-hooks', '--yes']);
+          const afterReinstall = entriesIn(h);
+          stripMarkers(h);
+          const seen = observed[side](h);
+          const remove = sides[side](['--remove-hooks', '--yes']);
+          return {
+            checkExit: check.exit,
+            observedWhileStripped: seen,
+            reinstallExit: reinstall.exit,
+            entriesAfterReinstall: afterReinstall,
+            removeExit: remove.exit,
+            entriesAfterRemoval: entriesIn(h),
+            removalFoundThem: !dec(remove.stdout).includes('no bantamkit hooks are installed'),
+          };
+        };
+        const strippedPy = strippedShape('py');
+        const strippedNode = strippedShape('node');
+        cases.push({
+          name: 'hook-ownership-neutral-stripped: the host took the marker off — the same answer whatever the tree is called',
+          kind: 'json',
+          expected: strippedPy,
+          actual: strippedNode,
+        });
+        cases.push(
+          ...literalCases(
+            strippedPy,
+            strippedNode,
+            'hook-ownership-neutral-stripped: still a match, still seven, then none, against a literal',
+            {
+              checkExit: 0,
+              observedWhileStripped: 'true',
+              reinstallExit: 0,
+              entriesAfterReinstall: 7,
+              removeExit: 0,
+              entriesAfterRemoval: 0,
+              removalFoundThem: true,
+            },
+          ),
         );
       }
     }
