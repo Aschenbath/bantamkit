@@ -43,7 +43,7 @@ fn package(dir: &Path, modules: &[ts2py::Compiled]) {
     std::fs::write(package.join("_ts2py_runtime.py"), ts2py::RUNTIME).unwrap();
     std::fs::write(
         package.join("_ts2py_adapters.py"),
-        ts2py::adapters_module("._ts2py_runtime"),
+        ts2py_bantamkit::adapters_module("._ts2py_runtime"),
     )
     .unwrap();
     for module in modules {
@@ -58,7 +58,7 @@ fn package(dir: &Path, modules: &[ts2py::Compiled]) {
 fn compile(source: &str) -> Result<Vec<ts2py::Compiled>, Vec<String>> {
     let options = ts2py::Options {
         runtime_module: Some("._ts2py_runtime".to_string()),
-        ..ts2py::Options::default()
+        ..ts2py_bantamkit::options()
     };
     ts2py::compile_modules(&[("m.ts", source)], &options)
 }
@@ -229,7 +229,6 @@ fn j89_3_only_the_exact_key_comparator_is_a_key_sort() {
         "(a, b) => t[b]! - t[a]! || b - a",
         "(a, b) => t[b]! * t[a]! || a - b",
         "(a, b) => t[b]! - t[b]! || a - b",
-        "(a, b) => ks[b]! - ks[a]! || a - b",
         "(a, b) => t[b]! - t[a]! && a - b",
         "(a, b) => (t[b]! - t[a]!) * 2 || a - b",
     ] {
@@ -243,6 +242,12 @@ fn j89_3_only_the_exact_key_comparator_is_a_key_sort() {
         "{head}(a, b) => (t[a]! - t[b]!) || (a - b));\n}}\n"
     ));
     assert!(code.contains("_js_sort_by_f64(xs, t, False, "), "{code}");
+    // J90-P2: over a plain array it is the chain key sort (`_js_sort_lex`), not this one.
+    let code = code_of(&format!("{head}(a, b) => ks[b]! - ks[a]! || a - b);\n}}\n"));
+    assert!(
+        code.contains("_js_sort_lex(xs, ") && !code.contains("_js_sort_by_f64("),
+        "{code}"
+    );
 }
 
 /// A counted loop gets no proven copy when anything in its body could change what the guard
@@ -254,17 +259,29 @@ fn j89_3_a_loop_that_could_break_its_guard_has_no_proven_copy() {
         "for (let i = 0; i < n; i += 1) { t[i] = xs[i]!; g(); }",
         "for (let i = 0; i < n; i += 1) { t[i] = xs[i]!; ys[i] = 1; }",
         "for (let i = 0; i < n; i += 1) { t[i] = xs[i]!; xs.push(1); }",
-        "for (let i = 0; i < n; i += 1) { t[i] = xs[i + 1]!; }",
-        "for (let i = 0; i < n; i += 2) { t[i] = xs[i]!; }",
         "for (let i = 0; i <= n; i += 1) { t[i] = xs[i]!; }",
         "for (let i = 0; i < n; i += 1) { t[i] = xs[i]!; i = n; }",
         "for (let i = 0; i < n; i += 1) { t[i] = xs[i]!; n = 0; }",
-        "for (let i = 0; i < n; i += 1) { for (let j = 0; j < n; j += 1) s = s + 1; }",
         "for (let i = 0; i < n; i += 1) { s = s + xs.length; }",
         "for (let i = 0; i < n; i += 1) { t[i] = `${xs[i]!}`.length; }",
     ] {
         let code = code_of(&format!("{open}  {body}\n  return s + out.length;\n}}\n"));
         assert!(!code.contains("range("), "{body}:\n{code}");
+    }
+    // J90-P3: an offset, a stride and a nested counted loop are copies now, each read in range by
+    // its guard (tests/j90p3.rs pins them).
+    for (body, guard) in [
+        (
+            "for (let i = 0; i < n; i += 1) { t[i] = xs[i + 1]!; }",
+            "n + 1 <= len(xs) and _js_doubles(xs, i, n + 1):",
+        ),
+        (
+            "for (let i = 0; i < n; i += 2) { t[i] = xs[i]!; }",
+            "(n <= i or i + (n - 1 - i) // 2 * 2 < len(xs)) and _js_doubles(xs, i, len(xs)):",
+        ),
+    ] {
+        let code = code_of(&format!("{open}  {body}\n  return s + out.length;\n}}\n"));
+        assert!(code.contains(guard), "{body}:\n{code}");
     }
     // The same loop with nothing that could break it: proven.
     let code = code_of(&format!(

@@ -27,6 +27,7 @@ import { lstatSync, mkdirSync, readdirSync, readFileSync, symlinkSync, utimesSyn
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { gunzipSync, gzipSync } from 'node:zlib';
+import { j90, j90Cases } from '../lib/storage_j90.mjs';
 
 export const name = 'storage-retention';
 export const summary = 'Retention: prune, fold, rotate, archive closed jobs, verify before delete, TTL, opt-out, search';
@@ -348,7 +349,7 @@ function runNode(mods, bed) {
             mtime_ns: '0',
             size: 1,
           };
-          cold.add(new Map([['ghost', doc]]));
+          cold.addDocs(new Map([['ghost', doc]]));
           out.push(null);
           break;
         }
@@ -394,7 +395,8 @@ function mask(value, base) {
 export async function run(ctx) {
   const dist = (p) => pathToFileURL(join(ctx.runtimeTs, 'dist', ...p.split('/'))).href;
   const mods = {
-    retention: await import(dist('storage/retention.js')),
+    // J90-3: `childMain` lives in `retentionmain.js` (the async half retention.ts cannot hold, #316 G4).
+    retention: { ...(await import(dist('storage/retention.js'))), ...(await import(dist('storage/retentionmain.js'))) },
     shiftwork: await import(dist('shiftwork.js')),
     toJs: (await import(dist('pyjson.js'))).toJs,
   };
@@ -541,5 +543,8 @@ export async function run(ctx) {
       keys(nd.beds[linkIdx][linkFile]),
     ),
   );
+  // J90-1 (#316 G4 prep): coverage this suite lacked, and the inputs the hand-written runtimes
+  // disagreed on, settled by J90-1F to agree or ruled (lib/storage_j90.mjs).
+  cases.push(...j90Cases('retention', await j90(ctx, 'retention')));
   return { cases, notes: [`${SCENARIOS.length} scripted scenarios, ${SCENARIOS.reduce((n, s) => n + s.ops.length, 0)} ops per side`] };
 }

@@ -240,10 +240,12 @@ def test_the_hook_log_folds_to_one_row_per_day_and_keeps_newer_lines_as_read(bed
 
 
 def test_an_archive_write_that_fails_deletes_nothing_and_is_refused(bed, monkeypatch):
+    # J90-3: the archive's write is the `retentionFs` adapter (`retention_fs`), swapped here as
+    # Node's test swaps `retentionFs.writeArchive`; was the module function `_write_archive`.
     def boom(target, data):
         raise OSError("disk full")
 
-    monkeypatch.setattr(retention, "_write_archive", boom)
+    monkeypatch.setattr(retention.retention_fs, "writeArchive", boom)
     before = tree(bed)
     report = _run(bed)
     after = tree(bed)
@@ -254,13 +256,72 @@ def test_an_archive_write_that_fails_deletes_nothing_and_is_refused(bed, monkeyp
     assert report["archived"] == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="ulimit is POSIX")
+def test_a_short_archive_write_renames_nothing_into_place_and_is_refused(tmp_path):
+    """J90-3 (the Node twin's reason): one closed job whose archive is past a 512-byte file-size
+    limit. The write fails whole (`ulimit -f 1`: a short write, then EFBIG), so nothing is
+    renamed into place, nothing is deleted, and the job is refused `archive write failed`."""
+    import subprocess
+    import sys
+
+    sw = tmp_path / "a" / ".shiftwork"
+    (sw / "briefs-big").mkdir(parents=True)
+    (tmp_path / "home" / ".bantamkit").mkdir(parents=True)
+    h, lines = b"seed", []
+    for _ in range(64):
+        h = hashlib.sha256(h).hexdigest().encode()
+        lines.append(h.decode())
+    (sw / "checkpoint-big.json").write_bytes(_cp("big", "done"))
+    (sw / "briefs-big" / "U1.md").write_text("\n".join(lines), encoding="utf-8")
+    when = retention.parse_now(NOW) / 1000 - 8 * 86_400
+    for p in (sw / "checkpoint-big.json", sw / "briefs-big" / "U1.md"):
+        os.utime(p, (when, when))
+    before = tree(tmp_path)
+    script = (
+        "import json, sys\nfrom bantamkit.storage import retention\n"
+        "print(json.dumps(retention.run_retention(sys.argv[1], [sys.argv[2]], sys.argv[3])))\n"
+    )
+    env = {**os.environ, "BANTAMKIT_INDEX_DIR": str(tmp_path / "idx")}
+    env.pop("BANTAMKIT_RETENTION", None)
+    out = subprocess.run(
+        [
+            "sh",
+            "-c",
+            'ulimit -f 1; exec "$@"',
+            "sh",
+            sys.executable,
+            "-c",
+            script,
+            str(tmp_path / "home"),
+            str(tmp_path / "a"),
+            NOW,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+        check=False,
+    )
+    assert out.returncode == 0, out.stderr
+    report = json.loads(out.stdout)
+    assert report["refused"] == [
+        {"path": str(sw / "checkpoint-big.json"), "reason": "archive write failed"}
+    ]
+    assert report["archived"] == []
+    after = tree(tmp_path)
+    for rel, digest in before.items():
+        assert after[rel] == digest, rel
+    assert not (sw / "archive" / "big.json.gz").exists()
+    assert not (sw / "archive").exists() or os.listdir(sw / "archive") == []
+
+
 def test_an_archive_that_reads_back_wrong_deletes_nothing(bed, monkeypatch):
-    real = retention._write_archive
+    real = retention.retention_fs.writeArchive
 
     def corrupt(target, data):
-        real(target, data + b" ")
+        real(target, bytes(data) + b" ")
 
-    monkeypatch.setattr(retention, "_write_archive", corrupt)
+    monkeypatch.setattr(retention.retention_fs, "writeArchive", corrupt)
     before = tree(bed)
     report = _run(bed)
     after = tree(bed)
@@ -273,15 +334,15 @@ def test_a_file_written_while_its_job_is_bundled_keeps_the_job_whole(bed, monkey
     """J69-8: a live session that writes a job file between the bundle and the delete. The
     archive no longer holds that file's bytes, so nothing of the job is deleted, the archive
     this run wrote is removed, and the job is refused `changed since bundled`."""
-    real = retention._write_archive
+    real = retention.retention_fs.writeArchive
     note = bed / "a/.shiftwork/notes-closed8/sub/U1.md"
 
     def racing(target, data):
         real(target, data)
-        if target.name == "closed8.json.gz":
+        if os.path.basename(target) == "closed8.json.gz":
             note.write_bytes(note.read_bytes() + b"written by a live session\n")
 
-    monkeypatch.setattr(retention, "_write_archive", racing)
+    monkeypatch.setattr(retention.retention_fs, "writeArchive", racing)
     report = _run(bed)
     after = tree(bed)
     for rel in ARCHIVED_AWAY - {"a/.shiftwork/checkpoint.json"}:
@@ -497,3 +558,53 @@ def test_the_child_is_spawned_when_either_switch_is_on(tmp_path, monkeypatch):
             else:
                 monkeypatch.setenv(env, value)
         assert retention.maybe_spawn(tmp_path, str(tmp_path)) == word, (sweep, audit)
+
+
+def test_an_audit_that_raises_anything_costs_neither_the_exit_nor_the_sweep(tmp_path, monkeypatch):
+    """J90-3F: the shim's `child_main` caught only OSError from the audit, so a TypeError there
+    left the child with a traceback where Node's `catch` answers 0 (red on 2cca2564)."""
+    from bantamkit import skillreport
+
+    monkeypatch.setenv(retention.RETENTION_ENV, "on")
+    monkeypatch.setenv(retention.SKILL_AUDIT_ENV, "on")
+    (tmp_path / "home" / ".bantamkit").mkdir(parents=True)
+    (tmp_path / "root").mkdir()
+
+    def broke(*_a, **_k):
+        raise TypeError("audit broke")
+
+    monkeypatch.setattr(skillreport, "daily", broke)
+    assert retention.child_main([str(tmp_path / "root"), str(tmp_path / "home")], now=NOW) == 0
+    state = json.loads((tmp_path / "home/.bantamkit/retention.json").read_text(encoding="utf-8"))
+    assert state["ran_at"] == NOW and "report" in state and "error" not in state
+
+
+def test_a_run_removes_the_stale_temps_a_killed_run_left_and_nothing_else(tmp_path, monkeypatch):
+    """J90-3F: a writer killed between a temp's write and its rename left `<file>.<pid>.tmp` forever
+    (red on 2cca2564). A run removes the archive and state temps it owns once older than the
+    lock's stale window; a fresh temp (a live writer's), a name it does not write and a name with
+    no pid are kept."""
+    monkeypatch.setenv(retention.RETENTION_ENV, "on")
+    home, root = tmp_path / "home", tmp_path / "root"
+    arch = root / ".shiftwork" / "archive"
+    arch.mkdir(parents=True)
+    (home / ".bantamkit").mkdir(parents=True)
+    old = time.time() - 3600
+    for d, name, stale in (
+        (arch, "a.json.gz.4242.tmp", True),
+        (arch, "b.json.gz.4243.tmp", False),
+        (arch, "notes.md.4242.tmp", True),
+        (arch, "c.json.gz.tmp", True),
+        (home / ".bantamkit", "retention.json.77.tmp", True),
+        (home / ".bantamkit", "retention.json.78.tmp", False),
+    ):
+        (d / name).write_bytes(b"partial")
+        if stale:
+            os.utime(d / name, (old, old))
+    report = retention.run_retention(home, [root], NOW)
+    assert report["deleted"] == [
+        str(home / ".bantamkit" / "retention.json.77.tmp"),
+        str(arch / "a.json.gz.4242.tmp"),
+    ]
+    assert sorted(os.listdir(arch)) == ["b.json.gz.4243.tmp", "c.json.gz.tmp", "notes.md.4242.tmp"]
+    assert sorted(os.listdir(home / ".bantamkit")) == ["retention.json.78.tmp"]

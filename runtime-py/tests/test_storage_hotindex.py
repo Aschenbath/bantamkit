@@ -300,3 +300,81 @@ def test_native_refs_read_description_then_body_200(tmp_path):
     hi = HotIndex(d, "native", tmp_path / "home")
     hi.refresh("full")
     assert hi.docs()["n"]["refs"] == ["src/a.ts", "b.py#f"]
+
+
+def test_a_persist_removes_its_own_stale_temps_and_no_other_index_s(tmp_path):
+    """J90-3F: a writer killed between a temp's write and its rename left `<file>.<pid>.tmp`
+    forever (red on 2cca2564). The next persist removes this index's own once older than the
+    lock's stale window; a fresh one and another index's stay."""
+    _fact(tmp_path / "s", "a", "x")
+    hi = _hi(tmp_path)
+    d, head = hi.path.parent, hi.path.name
+    sha = head[:-5]
+    old = os.stat(hi.path).st_mtime - 3600
+    plant = {
+        f"{head}.31.tmp": True,
+        f"{sha}.postings-00.json.32.tmp": True,
+        f"{head}.33.tmp": False,
+        "0000000000000000.json.34.tmp": True,
+    }
+    for name, stale in plant.items():
+        (d / name).write_bytes(b"partial")
+        if stale:
+            os.utime(d / name, (old, old))
+    _fact(tmp_path / "s", "b", "y")
+    assert hi.refresh("full") in ("patched", "rebuilt") and "b" in hi.docs()
+    assert sorted(n for n in os.listdir(d) if n.endswith(".tmp")) == [
+        "0000000000000000.json.34.tmp",
+        f"{head}.33.tmp",
+    ]
+
+
+def test_a_head_replaced_with_the_same_mtime_and_size_is_reloaded(tmp_path):
+    """J90-P4: the held-head check is the head's (mtime_ns, size, inode), as Node's
+    `${mtimeNs}:${size}:${ino}`. The generated module read `ino` off an adapter `Stats` that did
+    not carry it (`undefined`), so a head renamed over by one of the same mtime and size stayed
+    held on Python and was reloaded on Node (red on efda7291)."""
+    _fact(tmp_path / "s", "a", "first fact AAAA")
+    hi = _hi(tmp_path)
+    assert hi.doc("a")["description"] == "first fact AAAA"
+    head = hi.path
+    raw, st = head.read_bytes(), os.stat(head)
+    swap = head.with_name("swap")
+    swap.write_bytes(raw.replace(b"AAAA", b"BBBB"))
+    os.utime(swap, ns=(st.st_atime_ns, st.st_mtime_ns))
+    os.replace(swap, head)
+    now = os.stat(head)
+    assert (now.st_mtime_ns, now.st_size) == (st.st_mtime_ns, st.st_size)
+    assert now.st_ino != st.st_ino
+    hi.refresh("fast")
+    assert hi.doc("a")["description"] == "first fact BBBB"
+
+
+def test_a_refresh_leaves_the_collector_on(tmp_path):
+    """J90-PF2 (#316 G4): `refresh` does not switch the cyclic collector off. J90-PF did, and it
+    only moved the collections a refresh owed into the caller's next operation (docs/porting.md,
+    *after J90-PF2*); the JSON parses inside it still run with it off, as 9c6bc181's did."""
+    import gc
+
+    _fact(tmp_path / "s", "a", "release tag")
+    hi = HotIndex(tmp_path / "s", "facts", tmp_path / "home")
+    seen = []
+
+    class Spy:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def refresh(self, mode):
+            seen.append(gc.isenabled())
+            return self.inner.refresh(mode)
+
+    hi._js = Spy(hi._js)
+    was = gc.isenabled()
+    gc.enable()
+    try:
+        assert hi.refresh("fast") == "rebuilt"
+        assert hi.refresh("full") == "fresh"
+    finally:
+        if not was:
+            gc.disable()
+    assert seen == [True, True]

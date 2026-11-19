@@ -53,7 +53,7 @@ fn package(dir: &Path, modules: &[ts2py::Compiled]) {
     std::fs::write(package.join("_ts2py_runtime.py"), ts2py::RUNTIME).unwrap();
     std::fs::write(
         package.join("_ts2py_adapters.py"),
-        ts2py::adapters_module("._ts2py_runtime"),
+        ts2py_bantamkit::adapters_module("._ts2py_runtime"),
     )
     .unwrap();
     for module in modules {
@@ -68,7 +68,7 @@ fn package(dir: &Path, modules: &[ts2py::Compiled]) {
 fn compile_package(sources: &[(&str, &str)]) -> Vec<ts2py::Compiled> {
     let options = ts2py::Options {
         runtime_module: Some("._ts2py_runtime".to_string()),
-        ..ts2py::Options::default()
+        ..ts2py_bantamkit::options()
     };
     ts2py::compile_modules(sources, &options)
         .unwrap_or_else(|lines| panic!("refused:\n{}", lines.join("\n")))
@@ -87,7 +87,7 @@ fn g3_constructs_answer_like_node() {
     let modules = compile_package(&[("j89_g3_probe.ts", source)]);
     let code = &modules[0].code;
     // The lowerings themselves.
-    assert!(code.contains("COUNTER = 0\n"), "{code}");
+    assert!(code.contains("COUNTER: _JsAny = 0\n"), "{code}");
     assert!(code.contains("    global COUNTER\n"), "{code}");
     assert!(code.contains("def named(type_, len_):"), "{code}");
     assert!(
@@ -173,6 +173,10 @@ fn g3_modules_compile_together() {
         "runtime-ts/src/memory/usage.ts",
         "runtime-ts/src/memory/retrieval.ts",
         "runtime-ts/src/memory/store.ts",
+        // J90-2 (#316 G4): the store imports the compiled lock and hot index; J90-3 the cold index.
+        "runtime-ts/src/storage/lock.ts",
+        "runtime-ts/src/storage/hotindex.ts",
+        "runtime-ts/src/storage/coldindex.ts",
     ];
     let sources: Vec<String> = paths
         .iter()
@@ -186,7 +190,8 @@ fn g3_modules_compile_together() {
     let modules = compile_package(&pairs);
     let code = |stem: &str| -> &str { &modules.iter().find(|m| m.py_module == stem).unwrap().code };
     assert!(code("usage").contains("from .logsegment import ROTATE_BYTES, LogSegment\n"));
-    assert!(code("usage").contains("create_hash(\"sha256\")"));
+    // J90-P2: `createHash(..).update(.., 'utf8').digest('hex')` is one adapter call.
+    assert!(code("usage").contains("hash_hex(\"sha256\", "));
     assert!(code("usage").contains("py_pow(0.5, "));
     for module in &modules {
         let committed = root
@@ -207,7 +212,7 @@ fn g3_modules_compile_together() {
 fn g3_a_module_let_is_not_importable() {
     let options = ts2py::Options {
         runtime_module: Some("._ts2py_runtime".to_string()),
-        ..ts2py::Options::default()
+        ..ts2py_bantamkit::options()
     };
     let lines = match ts2py::compile_modules(
         &[

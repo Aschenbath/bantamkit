@@ -213,7 +213,7 @@ One line per construct: TypeScript, its Python lowering, and the JS semantic tha
 | `a * b`, `a / b`, `a % b` (J86) | `_js_mul(a, b)`, `_js_div(a, b)`, `_js_mod(a, b)` | Numbers above |
 | `a + b` | `_js_num(...)` of `a + b` when both are known numbers, `a + b` when both known strings (`_js_cat(a, b)` when neither edge is a known-safe literal, J86), else `_js_add(a, b)` | string concatenation via `String()` when either side is a string (two surrogate halves meeting form one character); numbers as doubles; two BigInts exactly |
 | `f(args)` (a module function or a local) | `f(args)` | |
-| `new Map(entries?)`, `new Set(items?)` | `_JsMap(...)`, `_JsSet(...)` | insertion order; SameValueZero keys, so `true` and `1` are different keys and `1.0` and `1` the same |
+| `new Map(entries?)`, `new Set(items?)` | `_JsMap(...)`, `_JsSet(...)` | insertion order; SameValueZero keys, so `true` and `1` are different keys and `1.0` and `1` the same; a `-0` key or item is stored as `0`, as JS stores `+0` (J90-RF2) |
 | `/pattern/` (no flags, or `g`, J86) | `_JS_RE_<n> = re.compile(<translated>, re.ASCII)`; with `g`, wrapped in `_JsGlobalRegExp` (only `.replace` accepts it: `.test` / `.exec` on a `g` regex read `lastIndex`, which is not modelled, and raise) | `\d`, `\w`, `\b` are ASCII; `$` is end of input (`\Z`); `.` excludes `\n`, `\r`, U+2028, U+2029; an astral literal is written as its two surrogates (Strings above). The pattern is parsed against a whitelist grammar, so every accepted pattern is valid JS and compiles under `re`; anything else is refused at compile time with its reason, never an `re.error` at import (Refused below). J86 adds `\xHH` and `\uHHHH` (one code unit each, in and out of a class) and a lookbehind `(?<=...)` / `(?<!...)` holding only single-unit atoms, so its width is fixed (as `re` requires) and reading it backwards (JS) or forwards (`re`) is the same |
 | an arrow used as a value (J88-2): passed to a function or method (`exclusive(p, (held) => {...})`), a block-bodied callback, or bound by `let` | a nested `def _js_fnN(p=_JS_UNDEFINED, ..., *_)` emitted just before the statement, closing over the enclosing locals (`nonlocal` for each it assigns) | a JS function called with fewer arguments sees `undefined`, with more ignores them; refused inside a loop (as any closure) and inside a callback lambda (the `def` could not see the lambda's parameters) |
 | a module function named as a callback (J88-2, `rows.map(dumpsLine)`) | `lambda _js_a0=_JS_UNDEFINED, ..., *_: f(_js_a0, ...)` with as many arguments as `f` declares | JS binds the first N of `(item, index, array)` to a function of N parameters |
@@ -265,6 +265,9 @@ One line per construct: TypeScript, its Python lowering, and the JS semantic tha
 | `JSON.stringify(x, replacer, space)` (J88-2) | `_js_json_stringify_with(x, replacer, space)` | SerializeJSONProperty in ECMA-262 order: a function replacer called `(key, value)` on every value, the root under `""`, before the type is read; `space` a count (at most 10) or a string (its first 10 units); `"key": value` and one value per line when indented, `[]` / `{}` when empty; a cycle is JS's TypeError; an array-of-keys replacer and nesting past the recursion limit are outside the subset |
 | `JSON.stringify(x)` (one argument) | `_js_json_stringify(x)` | byte for byte: compact, non-ASCII unescaped, lone surrogates and control characters `\u00xx`, integral floats as `3`, `1e21` as `1e+21`, an int beyond 2^53 as the double it rounds to, non-finite as `null`, `undefined` members skipped (`null` in arrays), object keys in JS own-property order (array-index keys ascending first, then insertion order) |
 | `m.has(k)`, `m.get(k)`, `m.set(k, v)` | `_js_m_has` / `_js_m_get` / `_js_m_set` | `Map`; `get` of a missing key is `undefined`; `set` keeps the original position |
+| `buf.equals(other)` (J90-3) | `_js_m_equals` | two Buffers (`bytes`, `bytearray`, a `memoryview`): whether they hold the same bytes; a second argument that is not one is outside the subset; `equals` joins `JS_METHOD_NAMES` (read as a value it is refused) |
+| `buf.toString('base64')` (J90-3) | `_js_buffer_to_string` | RFC 4648 with `=` padding, Node's `base64` encoder; `utf8`, `latin1` and `hex` as before |
+| `m.delete(k)` (J90-2) | `_js_m_delete` | a `Map` or a `Set`: whether the key was there; a later `set` of it appends at the end; anything else raises at run time (`.delete() on <type> is outside the subset`). An iteration of the same Map or Set skips an entry deleted before it is reached (Known limits) |
 | `s.has(x)`, `s.add(x)` | `_js_m_has` / `_js_m_add` | `Set` |
 | `a.every(cb)`, `a.some(cb)` | `_js_m_every` / `_js_m_some` | callback result through ToBoolean |
 | `a.find(cb)` | `_js_m_find` | no match is `undefined`, never `None` |
@@ -451,6 +454,92 @@ are V8's order at C speed; otherwise V8's own sort runs with the comparator (`_j
 `Array.prototype.sort` step for step, so even a NaN key's inconsistent comparator leaves V8's
 order). Any other comparator is the general `.sort`.
 
+## Storage speed (J90-P, #316 G4)
+
+Each lowering below is pinned TAKEN and answering as Node does in `tests/j90p.rs` (the probe and a
+30,000-input digest of `tests/fixtures/j90p_probe.ts`); each runtime fast path is held to the
+general path it shortcuts by that file's seeded fuzz.
+
+| Construct | Lowering | Otherwise |
+|---|---|---|
+| `Array.isArray(x)` true, `x` a `const`, a callback parameter, or a parameter or local no assignment rebinds | narrows `x` to a list (in an `if`, the right side of `&&` / `\|\|`, a `?:` branch) | no narrowing |
+| `typeof x === 'string'` / `'boolean'` / `'number'` / `'undefined'` (or `!==`) | `isinstance(x, str)` / `isinstance(x, bool)` / `_js_is_number(x)` / `x is _JS_UNDEFINED`: the one test `_js_typeof` answers that name for | `_js_typeof(x) == ...` |
+| `xs.sort((a, b) => k(a) - k(b))` or `k(b) - k(a)`, `k` reads only its parameter, other bindings, members and `.get()` (no compiled class declares `get`), never a Float64Array | `_js_sort_keyed`: a stable sort by the keys when every key is a number JS holds exactly and none is NaN | the general `.sort` with the comparator |
+| `new Map(Object.entries(x))`, or through a module `const` arrow `(v) => Object.entries(v)` | `_js_map_entries(x)`: a plain object's entries copied at once; when a key may be an array index, the order is settled at the first walk or write | `_JsMap(_js_object_entries(x))` |
+| `for (const [a, b, , d] of xs)` (rows not proven) | `for a, b, _js_hole, d in _js_rows(xs, 4, (0, 1, 3))`: a list that long sliced at once, anything else `_js_get` of each named index | — |
+| a counted loop that reads another array's `.length` (and is proven for another reason) | that array checked a list in the guard; `len(x)` in the proven copy | the general loop |
+
+A `Map` keeps each key's `_js_key` tag mapped to its value; a key that is not its own tag (a bool,
+NaN, an object, an int past 2^53) is kept beside it in `_keys`.
+
+## Storage speed and size (J90-P2, #316 G4)
+
+Each lowering below is pinned TAKEN and answering as Node does in `tests/j90p2.rs` (the probe and
+a 3,000-input digest of `tests/fixtures/j90p2_probe.ts`, compiled as `runtime-ts/src/j90p2_probe.ts`
+so `./pysem.js` is the `cmpCodepoint` adapter); each runtime fast path is held to the general path
+by that file's seeded fuzz.
+
+| Construct | Lowering | Otherwise |
+|---|---|---|
+| `xs.sort(compare)`, any comparator the rows below do not take | `_js_m_sort`, which runs V8's own sort (`_js_v8_timsort`): V8's order for an inconsistent comparator (a NaN key, a parity comparator) and V8's comparator calls, pair for pair | — (until J90-P2: CPython's `list.sort`, whose order differs on CPython 3.13+ and whose calls differ on every version) |
+| `xs.sort((a, b) => c1 \|\| c2 \|\| ...)`, each `ci` a key difference `k(a) - k(b)` / `k(b) - k(a)` or `cmpCodepoint(k(a), k(b))` / `cmpCodepoint(k(b), k(a))` (the adapter, not a local), two parts or more, or one `cmpCodepoint` part; every `k` pure as for `_js_sort_keyed` | `_js_sort_lex`: stable sorts by each key, the last first, when every number key is a number JS holds exactly and none is NaN and every code-point key is a `str` | the general `.sort` with the comparator |
+| `createHash('sha256' \| 'sha1').update(x, 'utf8').digest('hex')`, `createHash` the node:crypto adapter | `hash_hex(alg, x)`: an ASCII `str` hashed as its bytes at once, anything else the three calls with their refusals | the three calls |
+| `xs.every((x) => e)` / `.some` / `.map` / `.filter`, one plain parameter, an expression body with no function (`=>`, `function`, `class`) in it | `all(e for x in xs)` / `any(...)` / `[e for x in xs]` / `[x for x in xs if e]` (a receiver not proven a list through `_js_array`), the comprehension the helper runs, `e` inline | the helper with a lambda |
+| `x.length === N` (N a literal 0..16) on the left of `&&`, `x` proven a list and a `const` / stable binding, the right side `pure_test` (names, literals, member reads, `typeof`, `!`, `-`, comparisons, arithmetic, `&&` / `\|\|` / `??`, `?:`, `Number.isInteger` / `Number.isNaN` / `Array.isArray`) | the right side reads `x[k]` (k < N) as `x[k]` | `_js_list_at(x, k)` |
+| a wrapped function whose guarded entry's body is the typed body line for line | one body under the function's name, the typed name bound to it (`_f__typed = f`) | both bodies |
+
+`Number.isInteger` answers a plain int within 2^53 at once (`_js_number_is_integer`).
+
+**The shipped support modules.** `--emit-runtime` and `--emit-adapters` write the support modules
+in their SHIPPED form (`ts2py::shipped`): the leading comment block and one note line, then every
+line but the full-line comments and the docstring of each function or class whose body goes on
+after it; nothing inside a triple-quoted string is touched. `tests/shipped.rs` holds the shipped
+runtime, and the host's `tests/shipped_adapters.rs` (bantamkit's, under `tools/ts2py-bantamkit/`)
+the shipped adapters, to the source's `ast.dump` (docstrings aside), and
+`runtime-py/tests/test_ts2py_fresh.py` spells the same rule. The documentation stays in the
+sources, the only copies anyone edits: `tools/ts2py/python/ts2py/runtime.py` for the runtime and
+the host's adapter module (bantamkit's `tools/ts2py-bantamkit/adapters.py`) for the adapters
+(J90-PKG).
+
+## Proven shapes for JSON-derived arrays (J90-P3, #316 G4)
+
+A value read from JSON proves nothing (SUBSET.md, *Not proof*), and a TypeScript check on it
+(`Array.isArray`, `every(Number.isInteger)`, a length test) proves less than a lowering needs
+(`Number.isInteger` admits an int past 2^53, which `<` and `+` must round). So the shape is proven
+the way the counted loop proves it (J89-3): by a guard made once, at run time, before the loop,
+that checks the STRONGER property the direct reads need; a value that fails it (a string, `null`,
+`-0`, a float, an int past 2^53, a length that is no multiple of the stride) takes the general
+loop, which answers what JS answers. Every rule below is pinned TAKEN and answering as Node does in
+`tests/j90p3.rs` (`probe()` and a 3,000-input digest over seeded malformed segment arrays read from
+JSON text, `tests/fixtures/j90p3_probe.ts`), with a mutation of each shown red.
+
+| Construct | Proven copy | Guard (once, before the loop) |
+|---|---|---|
+| `for (let j = a; j < b; j += S)`, `S` a whole-number literal from 1 to 1024 or a module `const` bound to one | `for j in range(j, b, S)` | as J89-3 |
+| `x[j + c]`, `c` a whole-number literal or such a `const` | `x[j + c]` | `x` a list; `b <= j or j + (b - 1 - j) // S * S + c < len(x)` (the last group's read in range); with `S == 1`, `b + c <= len(x)` |
+| an array some read of which (or a `const` read from it) is an operand of arithmetic, a comparison, `===`, an index, a return, or anything but a sink | its reads proven numbers | `_js_doubles(x, j, len(x))` (`_js_doubles(x, j, b)` for `x[j]` at stride 1, as before) |
+| an array every read of which lands only in a SINK: a `const`'s initializer whose name then lands only in sinks, an array literal's element, `push`'s argument, a bare name tested by `if` | its reads `x[j + c]` as they are, proving nothing | bounds alone (no element check: a string array is read directly) |
+| a counted loop nested in the body (`for (let k = s; k < e; k += S2)`) | lowered with its own guard and copy, per entry, inside the copy; the outer copy's proven bindings stay proven in it | the outer guard checks every array the inner loop reads by `k` is a list |
+| `throw new Error('literal')`, array literals, `push` of an array literal onto a fresh array | in the copy (no compiled code runs) | — |
+
+The general loop of a copy (what a failed guard runs) holds no copy of a nested loop of its own:
+it is the rare path, lowered once. Two smaller rules ride with these: `Array.isArray(x)` is
+`isinstance(x, list)` inline (`_js_is_array`'s own test; a match array is a list subclass), and a
+proven number named once is tested `x != 0 and x == x` (falsy for `0`, `-0` and NaN) instead of
+`_js_truthy(x)`.
+
+**One body up to temporaries.** J90-P2's one body for a wrapped function whose guarded entry is
+its typed body line for line now compares the two bodies up to the compiler's own temporaries
+(`_js_caught`, `_js_error`, `_js_fn`, `_js_arg`, `_js_t`, `_js_first`, `_js_obj`, `_js_switch`,
+`_js_item` followed by digits, renumbered in order of first appearance): each is local to its
+body, so two bodies that differ only in those numbers are one function. It removed about 25 KB of
+committed `_generated` source (a typed body with a `try` differed only there).
+
+`decodeSegments` (storage/hotindex.ts) is written for the strided copy: a segment's five numbers
+read once at `j + 0..4`, the run one nested counted loop, `names` read only as values
+(`ArrayLike<string>`, so it has one body); Node's answers before and after are equal over 20,000
+seeded inputs, malformed ones included.
+
 ## Classes (J86)
 
 | Construct | Lowering | Preserved |
@@ -473,7 +562,7 @@ runtime's own attributes do), and on an Error subclass a member named `args`, `w
 ## Modules and the adapter seam (J86)
 
 J88-2: `import * as fs from 'node:fs'` (a namespace import of a `node:` builtin) is accepted, and
-`fs.name(...)` is that module's adapter row (`adapters.rs`); a name with no row is refused at
+`fs.name(...)` is that module's adapter row (the host's table); a name with no row is refused at
 compile time, and a namespace import of anything else stays refused. An adapter may be a
 constant (`LOCK_STALE_MS`), read by name. An adapter function may be called with `...xs` of an
 array proven a list.
@@ -483,11 +572,28 @@ array proven a list.
   `runtime-ts/src/memory/m.ts`; if that is one of the inputs, the import is
   `from .m import <a's Python name>` (classes keep their name). The modules form a package, so
   `--runtime-module` (and the adapter module) must be importable from it.
-- Any other import resolves only through the table in `src/adapters.rs`: a row names the
-  TypeScript module (or a Node global such as `TextDecoder`), the name, the Python name in
-  `src/adapters.py` (`--emit-adapters <file>` writes it, importing the runtime from
-  `--runtime-module`), and the reason the hand-written Python is the same function. Every row and
-  its measurement is in `RULES.md`, Adapters.
+- J90-2: two (or more) modules of one run may import each other (an import cycle: `hotindex.ts`
+  and `memory/store.ts`). An import whose module imports this one back, directly or not (value
+  imports only), is written at the END of the Python module (`from .m import a  # noqa: E402`), on
+  every side of the cycle, so Python can import the cycle from either side with no name unbound. A
+  name of the cycle may not be read while a module is executed (a module-level `const` / `let`
+  initializer): refused, `module-level use of <name>, imported in an import cycle`.
+- J90-3: a RE-EXPORT, `export { a, type T } from './m.js'` (`storage/index.ts`), binds each value
+  name as `import { a } from './m.js'` would (a compiled module of the run, at the end of the module
+  when it is in a cycle, or an adapter row) and exports it; a type is dropped. A renamed re-export,
+  `export *`, and a name neither a compiled module nor an adapter row provides are refused. Another
+  compiled module cannot import a name THROUGH the re-export (the re-exporting module's export table
+  lists only what it declares): such an import is refused as one the module does not export.
+- J90-3: a CONSTANT of a namespace-imported Node module (`path.sep` under `import * as path from
+  'node:path'`) is its adapter row of kind `Constant`, read by name; any other member read of the
+  namespace stays refused.
+- Any other import resolves only through the HOST's adapter table (#337): the `[[adapter]]` rows
+  of the file `--config` names (`src/host.rs`; the compiler declares no row of its own). A row
+  names the TypeScript module (or a Node global such as `TextDecoder`), the name, the Python name
+  in the host's `adapter_source` (`--emit-adapters <file>` writes it, importing the runtime from
+  `--runtime-module`), and the reason the hand-written Python is the same function; a row with no
+  reason is refused when the file is read. bantamkit's rows and their measurements:
+  `tools/ts2py-bantamkit/ts2py.toml` and `RULES.md`, Adapters.
 - J87-3: a Node builtin module (`import { join } from 'node:path'`) is looked up in the same table
   under its specifier (`node:fs`, `node:path`); `process.env` is a global row.
 - An import with no compiled module and no row is a compile error naming it:
@@ -627,7 +733,10 @@ the subset`).
 
 - J86 removed the J85 limit that strings were indexed and split by code point: every position is
   now a UTF-16 code unit (Strings above).
-- Iterating a `Map` or `Set` sees a snapshot: entries added during the loop are not visited.
+- Iterating a `Map` or `Set` sees a snapshot: entries added during the loop are not visited. (J90-2:
+  an entry DELETED before the loop reaches it is skipped, and a value set meanwhile is the one
+  visited, as JS's iterator does; a key deleted and set again during the loop is visited at its old
+  place, where JS visits it at the end.)
 - J89-3: the general `.sort(compare)` (`_js_m_sort`) is CPython's `list.sort`, which orders an
   INCONSISTENT comparator (one a NaN makes so) differently from V8 (561 of 30,000 seeded sorts); the
   key sort above uses V8's own algorithm (`_js_v8_sort`) for that case.

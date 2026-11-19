@@ -179,7 +179,7 @@ helper changed.
 
 ## J87-3 rules (#316 G1: `pricing`, `jobbudget`)
 
-Census estimate for G1 (`node tools/ts2py/census.mjs`, `docs/roadmap-1.0.0.md`, #315): 5 new
+Census estimate for G1 (`node tools/ts2py-bantamkit/census.mjs`, `docs/roadmap-1.0.0.md`, #315): 5 new
 syntax kinds, 5 new builtin calls, 3 Node adapters, 9-11 rules. Rerun on the sources J87-3
 compiled (`jobbudget.ts` grew in J87-1F): 560 lines, 5 kinds, 6 calls, 3 adapters, 10-12 rules.
 Actual: **11 new rules, 6 extended, the rest reused unchanged; 9 adapter rows** (the census counts
@@ -218,7 +218,7 @@ helper changed. Generated: `pricing.py` 340 lines, `jobbudget.py` 179 (519, agai
 
 ## J88-2 rules (#316 G2: `eventlog`, `tokenledger`, `storage/logsegment`)
 
-Census estimate for the three modules (J88-1, `node tools/ts2py/census.mjs` restricted to them):
+Census estimate for the three modules (J88-1, `node tools/ts2py-bantamkit/census.mjs` restricted to them):
 1,208 lines, 2 new syntax kinds, 11 new builtin calls, 22 Node adapters, 11-14 rules. Actual:
 **16 new rules, 9 extended; 37 new adapter rows, 3 extended.** The census undercounts for the
 reason J87-3 gave (an import of an uncompiled `src` module, here `pyfs`, `store` and `lock`, reads
@@ -267,7 +267,7 @@ byte for byte unchanged but for the `# ruff: noqa` header, which gains E741 (a T
 
 ## J89-2 rules (#316 G3 U1: `memory/usage`; `memory/retrieval` lowered, then kept hand-written)
 
-Census (J89-1, `node tools/ts2py/census.mjs` over the two modules): retrieval 5 new kinds and 13
+Census (J89-1, `node tools/ts2py-bantamkit/census.mjs` over the two modules): retrieval 5 new kinds and 13
 calls, usage 5 calls, among them `>>`, postfix `++`/`--`, `.charCodeAt`, `.match`, `.normalize`,
 `Math.round`, `Math.log1p`, `Object.is`, `Float64Array`, `DataView`. Actual: **8 new rules, 3
 extended, 1 compiler defect fixed, 6 exact runtime fast paths; 5 new adapter rows** (usage's).
@@ -461,7 +461,7 @@ and compares every answer (a file, a directory, a symlink to one, invalid UTF-8,
 | `process.pid`, `process.env` (a value) | `os.getpid()`, `dict(os.environ)` | each runtime its own process | `--suite eventlog` |
 | `cmpCodepoint`, `pyExists`, `pyIsDir`, `pyJoin`, `pyParent`, `pyName`, `osErrorClassName`, `PyOSError` (`memory/pyfs.ts`) | the CPython call each ports (`Path.exists`, `Path.is_dir`, `str(PurePath(...))`, `.parent`, `.name`, the errnomap table, `OSError`) | Python is the reference (`pyfs.ts` is the CPython OS seam) | `--suite eventlog` (beds: a never-saved store, a parent that is a file, the errno names), `--suite store` |
 | `bantamkitDirFor`, `ensureBantamkitGitignore` (`memory/store.ts`) | `bantamkit.memory.store`'s functions (since J89-4b the shim over the generated ones) | reached only by a call that compiles the event log WITHOUT store.ts (ts2py's G2 tests); the committed event log imports the compiled store (`from .store import ...`, J89-4b) | `--suite eventlog` (`.gitignore` beds), `--suite store` |
-| `exclusive`, `LOCK_STALE_MS`, `LOCK_POLL_MS` (`storage/lock.ts`) | `bantamkit.storage.lock` (the context manager around `body(held)`) | Python is the reference; #316 G4 is not generated yet | `--suite storage-lock`, `--suite storage-log` (#208 beds) |
+| `exclusive`, `LOCK_STALE_MS`, `LOCK_POLL_MS` (`storage/lock.ts`) | **RETIRED by J90-2 (#316 G4):** compiled, `_generated/lock.py` (`from .lock import ...`); was `bantamkit.storage.lock` (the context manager around `body(held)`) while G4 was not generated | the same TypeScript, compiled | `--suite storage-lock`, `--suite storage-log` (#208 beds) |
 
 `existsSync` changed with them: a NUL in the path answers `false` (Node validates inside its
 `try`), and a lone surrogate is looked up as the U+FFFD Node's encoding writes, where J87-3 refused
@@ -512,8 +512,8 @@ recall: identical answers, identical store trees and index file lists.
 |---|---|---|
 | `homedir` (`node:os`) | `str(Path.home())` | Python is the reference: store.py passes `Path.home()` in each place store.ts calls `homedir()`; the two differ only for a set but empty `HOME` |
 | `pySearchWord` (`pysem.ts`, new: store.ts's `DONE_WORD_RE` moved there) | group 1 of `re.compile(r'\b(' + alternatives + r')\b', re.IGNORECASE).search(text)` | Python is the reference: store.py's `_DONE_WORD_RE`; J89-1F and J89-2 swept the Node regex against it (`--suite store`) |
-| `HotIndex`, `INDEX_DIR_ENV` (`storage/hotindex.ts`) | `bantamkit.storage.hotindex`, imported when the first index is built; `names()` / `segments()` / `skipped` as read-only Maps over its dicts (`_JsReadMap`), `parseFile` answering the doc or the reason, a native `BantamError` restated as the adapter's | Python is the reference: hotindex.ts ports it (#316 G4 later) |
-| `ColdIndex`, `ColdIndexError` (`storage/coldindex.ts`) | `bantamkit.storage.coldindex`, `add` taking a Map, `query` answering lists; its `ColdIndexError` restated as a JS Error | Python is the reference: coldindex.ts ports it |
+| `HotIndex`, `INDEX_DIR_ENV` (`storage/hotindex.ts`) | **RETIRED by J90-2 (#316 G4):** compiled, `_generated/hotindex.py` (the store imports it at its end: an import cycle); was `bantamkit.storage.hotindex`, imported when the first index was built, with Map faces over its dicts (`_JsReadMap`) | the same TypeScript, compiled |
+| `ColdIndex`, `ColdIndexError` (`storage/coldindex.ts`) | **RETIRED by J90-3 (#316 G4):** compiled, `_generated/coldindex.py` (`from .coldindex import ColdIndex, ColdIndexError`, at the end of the store: an import cycle through the hot index); was `bantamkit.storage.coldindex`, `add` taking a Map, `query` answering lists, its `ColdIndexError` restated as a JS Error | the same TypeScript, compiled |
 | `PyScalar` (`memory/pyyaml.ts`); `extraOf`, `formatFact`, `lifecycleOf`, `parseFrontmatter`, `pyList`, `pySplit`, `pyTruthy`, `todayLocal`, `VALID_OUTCOMES` (`memory/factfile.ts`); `pyStrip` (re-exported from `pysem.ts`) | the class, functions and constant ts2py compiled from the same TypeScript (`_generated/pyyaml.py`, `_generated/factfile.py`, the #315 call kept apart), imported lazily | the same TypeScript, compiled; J89-4b decides `parseFrontmatter` / `formatFact`'s Python boundary (factcodec's PyYAML fallback, #315's owner ruling) |
 | `asPyOSError`, `matchesMd`, `pyLexists`, `pyMkdirParents`, `pyMtimeDate`, `pyParents`, `pyReadText`, `pyReplace`, `pyScandirNames`, `pyScandirProbe`, `pySuffix`, `pyUnlink`, `pyWriteText`, `pyWriteTextAtomic`, `sortedPathNames`, `PyUnicodeDecodeError` (`memory/pyfs.ts`) | the CPython call each ports (its doc comment): `OSError` passed through, `fnmatch(name, '*.md')`, `os.path.lexists`, `Path.mkdir(parents=True, exist_ok=True)`, `date.fromtimestamp(st_mtime)`, `PurePath.parents`, `Path.read_text` (a `UnicodeDecodeError` as `PyUnicodeDecodeError`, a JS Error with CPython's message), `os.replace`, `os.scandir` names / probe, `PurePath.suffix`, `Path.unlink`, `Path.write_text`, store.py's `_write_text_atomic` carried statement for statement, a stable sort by `os.path.normcase` | Python is the reference: pyfs.ts is the CPython OS seam |
 | `Buffer.byteLength(s, 'utf8')` (Node global) | `len(s.encode('utf-8', 'surrogatepass'))` | a lone surrogate is three bytes either way (U+FFFD's, as `Buffer.from` writes it); `g3_store.rs` holds it to `len(buffer_from(s))` over 20,000 seeded strings and the probe to Node over 9 |
@@ -550,8 +550,8 @@ DECLARED TYPE makes it a data field), and both constructs only widen where a dec
 
 | TypeScript | Python | Why it is the same function |
 |---|---|---|
-| `DUPLICATE` (`storage/hotindex.ts`) | `bantamkit.storage.hotindex.DUPLICATE`, imported lazily | Python is the reference: the same `duplicate name` sentence head the port declares |
-| `parseNative` (`storage/hotindex.ts`) | `divergence.parse_fact`, answering `{name, description, type, body}` (`meta` is read by no compiled caller and not carried), its `MemoryValidationError` restated as the adapter's `BantamError` with the same message | Python is the reference: `parseNative` is `divergence.parse_fact` for the native shape (its doc comment). The layer reads every file through exactly the function the hand-written layer called, so `--suite recall-strings` (the native pool), `skill-layer` and `hooks` compare the same reads |
+| `DUPLICATE` (`storage/hotindex.ts`) | **RETIRED by J90-2 (#316 G4):** compiled (`from .hotindex import DUPLICATE`); was `bantamkit.storage.hotindex.DUPLICATE`, imported lazily | the same TypeScript, compiled |
+| `parseNative` (`storage/hotindex.ts`; since J90-2 `storage/nativefact.ts`) | `divergence.parse_fact`, answering `{name, description, type, body}` and, since J90-2, `meta` (see *J90-2 rules*), its `MemoryValidationError` restated as the adapter's `BantamError` with the same message | Python is the reference, kept by the #228 ruling (`docs/porting.md`): `parseNative` is `divergence.parse_fact` for the native shape (its doc comment). The layer reads every file through exactly the function the hand-written layer called, so `--suite recall-strings` (the native pool), `skill-layer` and `hooks` compare the same reads |
 
 TS refactors (Node's answers unchanged; types and a guard only): native.ts's two `skipped?.push(...)`
 are `if (skipped != null) skipped.push(...)` (optional chaining on a call is outside the subset; `!=
@@ -583,7 +583,7 @@ refactors for the rest of J89-5's census; no runtime helper was added.
 | `parseJson` (`pyjson.ts`) | `parse_json`: `json.loads`, the value tagged as `PyValue` (`{t, v}`, an int a BigInt, a dict a Map in the dict's order), a refusal `PyJSONDecodeError` (a JS Error) with CPython's message; a text nested past 512 (`_PARSE_JSON_DEPTH`, counted as `JSON.parse` nests, found without recursing) the RangeError `Maximum call stack size exceeded` (J89-5e), and `json.loads`'s `RecursionError` the same RangeError as the backstop (J89-5d) | Python is the reference: pyjson.ts is the port of CPython's json module. The RangeError is what the recursive `parseJson` throws past its stack, so a compiled `catch` sees it as it sees Node's (J89-5d, ruled: a crash is a bug). The depth is Python's own because CPython's moves with the version (3.11: the recursion limit less the caller's frames, ~980; 3.12 and 3.13: ~9,994; 3.14: none) (J89-5e, ruled: the answer must not depend on it); between 512 and Node's stack the two differ by ruling (docs/porting.md). Checked against 3.11's `json.loads` with the recursion limit set to read exactly 512: 20,000 seeded texts, 0 differences in outcome but the 31 where 3.11 itself raised `RecursionError` building a decode error within two frames of its limit (the texts are malformed no deeper than 512, and `parse_json` refuses them with `json.loads`'s message) |
 | `dumpJson` (`pyjson.ts`) | `dump_json`: `json.dumps` of the untagged value with `indent`, `sort_keys`, `ensure_ascii`, `separators`; any other option refused | Python is the reference, as above; the hand-written queries module wrote the sidecar with `hotindex.dumps`, which is this call |
 | `encodeBasestringAscii` (`pyjson.ts`) | `json.encoder.encode_basestring_ascii` | Python is the reference: its doc comment names `py_encode_basestring_ascii` |
-| `sha16` (`storage/hotindex.ts`) | `bantamkit.storage.hotindex.sha16` | Python is the reference (#204), the key the hand-written module used |
+| `sha16` (`storage/hotindex.ts`) | **RETIRED by J90-2 (#316 G4):** compiled (`from .hotindex import sha16`), its realpath the `nodeRealpath` adapter row (*J90-2 rules*); was `bantamkit.storage.hotindex.sha16` | the same TypeScript, compiled |
 | `pyDecodeUtf8` (`memory/pyfs.ts`) | `bytes.decode('utf-8')`, strict, BOM kept; a refusal `PyUnicodeDecodeError` with CPython's message | Python is the reference: its doc comment, measured over 64,028,929 sequences |
 | `fs.writeFileSync(path, string, 'utf8')` | opened `w` (O_TRUNC, O_CREAT, O_WRONLY, mode 0o666, binary), every byte of Node's UTF-8 (a lone surrogate U+FFFD) written, closed; a Buffer, another encoding or an options object refused | Node builtin; the flags and mode `Path.write_text` opened with |
 | `createHash('sha1')`, `hash.update(buffer)` (the `createHash` / `Hash` rows, widened) | `hashlib.sha1`; a Buffer's bytes hashed as they are | Node builtin |
@@ -801,3 +801,438 @@ differ between two runs of one dist are masked (the hot index's meta file, a `la
 ledger, a commit sha).
 
 Runtime names added: 0. Adapter names added: 15.
+
+## J90-2 rules (#316 G4: `storage/lock.ts` and `storage/hotindex.ts` generated)
+
+`lock.ts` and `hotindex.ts` join the G1/G2/G3 call and ship as `_generated/lock.py` and
+`_generated/hotindex.py` (the shims are `bantamkit.storage.lock` and `bantamkit.storage.hotindex`).
+The `exclusive` / `LOCK_*` / `HotIndex` / `INDEX_DIR_ENV` / `DUPLICATE` / `sha16` adapter rows are
+retired (above): every compiled importer (logsegment, queries, native, store) imports the compiled
+modules. Two compile rules, one builtin method, five adapter rows and one widened, and TS refactors
+for the rest; J86-R finding 3 and J89-4a's clash ruling are kept (a compiled class's method name is
+still refused wherever a property of that name is read: the clashes are typed or renamed, below).
+
+| Construct | Lowering | Why it is the same | Measurement |
+|---|---|---|---|
+| an IMPORT CYCLE between compiled modules of the call (`hotindex.ts` reads facts with `MemoryStore`'s reader and `store.ts` builds a `HotIndex`) | `lib.rs` builds the import graph of the call (value imports only: `compiled_imports`); an import whose target reaches back to the importer is written at the END of the Python module (`late_imports`, `# noqa: E402`), after every name of the module is bound, on both sides of the cycle | ES modules bind a cycle's names live; Python's `from .m import x` copies a value when it runs. With each side importing the other last, whichever module Python imports first is complete before the other asks it for a name, so every name is bound before any function of either runs. A name of the cycle read WHILE a module is executed (a module-level initializer: `module_eval_use`) is refused, since the other side may not have bound it; a base class is read then too, but an imported compiled class is never an `extends` target (only `Error` and the Error classes declared here or by an adapter are) | `g4.rs` `j90_2_an_import_cycle_imports_from_either_side` (Node: `[10,22,104,103,219]`, Python the same importing either module first), `j90_2_an_import_cycle_refuses_a_name_read_at_import`; both red with the cycle undetected (every import at the top) |
+| `xs.every((x) => Number.isInteger(x))`, `xs.every((x) => typeof x === 'string')` (exactly that one-parameter arrow, `Number` the global) | `_js_every_integer(xs)` / `_js_every_string(xs)`: a list whose elements are all of exactly Python type `int` (`str`) answers true at C speed (`set(map(type, xs))`); any other list runs `Number.isInteger` (`typeof`) on each element, as the general `_js_m_every` with that callback does | a Python `int` in the runtime is always an integral JS number (`bool` is its own type, so it takes the per-element path), a `str` always a string; the callback has no side effect to keep. The hot index's shape checks ran 200,000 such callbacks per 20 recalls at 5,000 facts (the #204 bar) | `g4.rs` `j90_2_constructs_answer_like_node` (`everies`: 17 arrays, Node's 34 answers: `[]`, ints, `-0`, `1e21`, NaN, Infinity, 2**53+1, a bool, null, nested, strings with a null) |
+| `JSON.parse` (`_js_json_parse`, runtime: a fast path) | an integer token is read by CPython's own `int` unless the text may hold one `int` would not read as JS does: `-0` or a run of 16 digits (2**53 has 16); then the per-token `_js_json_number`, as before. The test is two C-speed scans (`'-0' in text`, a 16-digit run after mapping every digit to `0`) and only then a token-shaped search (`[\[,:]\s*(-0|-?[1-9]\d{15})`, or at the start) | below 16 digits an integer token is exact both as a double and as a Python int, so `int(t)` IS `_js_json_number(t)`; a string that only looks like such a token sends the text the per-token way, never the reverse | `g4.rs` (`parses`: ten texts with `-0`, 15 to 20 digits, a string holding both, key order; `parseFuzz(20000)`: seeded texts of 1- to 22-digit tokens, signed, `-0`, in arrays, objects and strings, Node's digest `494242382`) |
+| `new Map(entries)`, `Object.entries(o)`, `Object.keys(o)` (runtime: fast paths) | `_JsMap.__init__` sets a `[key, value]` list entry with a string key inline (a string is its own `_js_key`), anything else through `set`; `_js_own_keys` answers the insertion order at once when no key starts with an ASCII digit (an array index is a canonical decimal) and tests only the digit-led keys otherwise; `_js_object_entries` of a dict of string keys reads `o[k]` for each own key | the same entries, keys and order as before, without a call per entry (a 5,000-term shard is one `new Map(Object.entries(terms))`) | the `parses` / `parseFuzz` key order above; every suite that reads an index |
+| `m.delete(k)` (a Map or a Set) | `_js_m_delete` -> `_JsMap.delete` / `_JsSet.delete`: whether the key was there, the entry dropped (a later `set` appends it at the end); anything else `_js_outside`. `delete` was already a method name (`JS_METHOD_NAMES`), so a read as a value stays refused | SameValueZero keys as `has`/`set` (`_js_key`). An iteration of the same Map or Set now skips an entry deleted before the loop reaches it and visits a value set meanwhile, as JS's iterator does (SUBSET.md, Known limits: an entry ADDED during the loop is still not visited) | `g4.rs` `j90_2_constructs_answer_like_node` (the probe's `deletes`: Node's answers, the visited entry deleted as `patch` does, a later one deleted and one set before they are reached); `j90_2_delete_is_a_map_or_set_method_only` |
+
+| TypeScript | Python | Why it is the same function |
+|---|---|---|
+| `performance.now()` (Node global) | `time.monotonic() * 1000` (`performance_now`) | a monotonic millisecond clock read only as the difference of two readings (lock.ts's deadline, J90-1F); the reference's lock read `time.monotonic()` |
+| `nodeRealpath` (`storage/realpath.ts`, new: hotindex.ts's `realpath` moved out unchanged) | **since J90-3 (the orchestrator's ruling: Node's answer):** `nodeRealpath` statement for statement: `path.resolve` (`path_resolve`), then `realpath(3)` through ctypes (libuv's `uv_fs_realpath`; `os.path.realpath(strict=True)` where ctypes is missing, and on Windows, where both are `GetFinalPathNameByHandleW`), the answer decoded as Node decodes a name; where it throws, the parent resolved the same way joined with the name as spelled. J90-2 had `os.path.realpath`, which followed a DANGLING symlink to its missing target (J90-2 found it, `docs/porting.md`) and kept a case-folded macOS name as spelled where `realpath(3)` answers the filesystem's spelling | Node's function, ported; `g4b.rs` `j90_3_builtins_answer_like_node` (a dangling link, a path below one, a live link, `..` through a link, a missing tail: Node's answers; red with `os.path.realpath`); `--suite storage-index` (`J90-3 a source through a dangling symlink`, `below`, `spelled in another case`, each with a literal per side; the six red on 743b54b9's adapter) |
+| `dumpJsValue` (`pyjson.ts`, new: hotindex.ts's `toPy` + `dumpJson` moved there unchanged) | `dump_js_value`: `json.dumps` of the value as `fromJs` reads it (`_lifted`): a number that is `Number.isSafeInteger` and not -0 an int, any other a float; a Map or a plain object a dict keyed by `String(key)` in `Object.entries` order; an array a list; null and undefined None; a BigInt an int; anything else refused; `floatKey` of a top-level plain object holding a number written as a float | `dumpJson` is `json.dumps` (its row above); the adapter skips building the tagged tree. `g4.rs` holds it to Node over the probe's 37 values two ways and a 20,000-value seeded fuzz (nested lists, plain objects with integer-like keys, Maps with number keys, -0, 2**53, 1e21, NaN, astral and lone-surrogate strings): Node's digest `896189796`; `--suite storage-index` compares every index file byte for byte |
+| `extractRefs`, `factRefs` (`touch/refs.ts`) | `bantamkit.touch.refs.extract_refs` / `fact_refs` | Python is the reference: refs.ts is the port (#200; `--suite touch-refs`), the functions the reference's index called |
+| `parseNative`'s `meta` (the row above, widened) | `hotindex._secondary`'s read of the native frontmatter (`load_frontmatter`, `{}` where it refuses or reads no mapping), each mapping a dict of its text keys, each list a list, each string or null itself and any other scalar opaque (`factcodec._Opaque`: not a string to `strList`, its `str()` to `pyText`); `{}` when the frontmatter names no `tags` / `links` line (the TypeScript reads `meta` only then) | what the reference's index read a native file's `links` and `tags` with, so `[str(x) for x in links]` and `_str_list(tags)` are what the compiled `fl.map(pyText)` and `strList` read; `--suite storage-index` (`native: read-only, the native shape and its refusals`, links and tags nested under `metadata:`), and the #228 ruling stays green |
+
+TS refactors (Node's answers unchanged; `npm test` 2,460 of 2,460 and every Node side of the suites
+below unchanged):
+- hotindex.ts: `parseNative` / `parseNativeFront` / `outdentSequences` moved to `nativefact.ts` and
+  `realpath` to `realpath.ts` (both adapters, above), `toPy` to `pyjson.ts` (`dumpJsValue`); the
+  `IndexData` raw-or-derived fields split (`dfRaw`, `lensRaw`, `tailBytes`, `tailObj`) so no field
+  is tested with `instanceof Map` / `Buffer.isBuffer`; reads of a field a `HotIndex` method also
+  names (`docs`, `cols`, `df`, `avgdl`, `lens`, `lensTotal`, `postings`) through typed bindings
+  (`IndexData`, `HeadParts`, `ShardPrints`, `TailParts`; J89-5's declared-type rule), and
+  `size()` renamed `docCount()` (J89-4a's ruling: every Map's `.size` is a read of that name; the
+  Python shim keeps `size()`); `ageS` as arithmetic (`daysFromCivil`; the old `Date.UTC` /
+  `getUTC*` round trip answered exactly this on 760,087 stamps at five clocks); `/^…/m` regexes
+  spelled `(?:^|[\n\r\u2028\u2029])…` (the same `test` on every string); `matchAll` over the
+  wiki-link regex as `match` with `g` and the brackets sliced off; `forEach`-in-a-loop,
+  `Array.from({length})`, nested destructuring, object rest, `??=`, assignment in an expression and
+  `x! += 1` spelled out; `basename(p, '.json')` as `basename(p).slice(0, -5)` (the path is always
+  `<sha16>.json`); `e instanceof Error && 'code' in e` as `typeof e.code === 'string'` (a compiled
+  catch of an fs error holds CPython's `OSError`, whose `code` it reads as Node's; the same test on
+  everything that block throws); a `PyOSError`'s message through `pyOSErrorText` (J89-4b).
+- lock.ts: `exclusive` split into `acquireLock` / `releaseLock` (exported), which it calls, so the
+  Python shim's context manager runs the same loop.
+- store.ts: `factPaths` / `readFact` no longer `private` (the index called them through `['…']`);
+  two `Pool` reads typed. component.ts: one callback parameter typed `(i: number, p: Pool)`.
+
+Runtime names added: 3 (`_js_m_delete`, `_js_every_integer`, `_js_every_string`) and the private
+constants of the fast paths. Adapter names added: 5 (`performance_now`,
+`node_realpath`, `dump_js_value`, `extract_refs`, `fact_refs`); retired: 3 (`exclusive`, `HotIndex`,
+`sha16`) and the lazy constants `LOCK_*`, `INDEX_DIR_ENV`, `DUPLICATE`.
+
+
+## J90-3 rules (#316 G4: `storage/coldindex.ts`, `storage/retention.ts`, `storage/tiers.ts`, `storage/index.ts` generated)
+
+The four modules join the G1/G2/G3/G4 call and ship as `_generated/coldindex.py`,
+`_generated/retention.py`, `_generated/tiers.py` and `_generated/index.py` (the shims are
+`bantamkit.storage.coldindex`, `.retention`, `.tiers`; the package file `bantamkit/storage/__init__.py`
+stays hand-written over the shims, and `_generated/index.py` is the re-export table compiled, held by
+the F4 compare). `storage/retention-child.ts` is NOT generated: it is the Node child's entry script
+(a hyphenated module name and a top-level `await`), and its Python counterpart is the shim's
+`python -m bantamkit.storage.retention` entry. The `ColdIndex` / `ColdIndexError` adapter rows are
+retired (above); no "#316 G4 not generated" row remains.
+
+| Construct | Lowering | Why it is the same | Measurement |
+|---|---|---|---|
+| a RE-EXPORT, `export { a, type T } from './m.js'` | each value name imported as `import { a }` would be (a compiled module of the call, late in a cycle, or an adapter row) and exported; a type dropped; a renamed re-export, `export *` and an unknown name refused | an ES re-export binds the same live binding an import does; the Python name is the one the import would bind | `g4b.rs` `j90_3_a_re_export_binds_what_an_import_would` (red when the names are not exported), `j90_3_re_export_and_namespace_refusals` |
+| `path.sep` (a namespace member that is an adapter `Constant` row) | the row's Python name | the platform's separator, as `os.name` says which `path` Node's is | `g4b.rs` (`/` on POSIX) |
+| `buf.equals(other)` | `_js_m_equals`: `bytes(a) == bytes(b)`; anything but two Buffers refused | Buffer.prototype.equals compares the bytes | `g4b.rs` probe (three pairs; red when it answers true always) |
+| `buf.toString('base64')` | `base64.b64encode` | RFC 4648 with padding is Node's `base64` | `g4b.rs` probe (four strings incl. an astral one and a NUL; red without padding) |
+| `_js_code_units` (runtime: a fast path) | a string longer than `_JS_UNITS_LONGEST` (65,536) is held by identity, the last one only, as `(text, units)` replaced whole | a str is immutable, so the same object has the same units; nothing else changes. Before it, a loop over one long text that is not ASCII (`charCodeAt` / `slice` at every index: the tokenizer over an archived job's text) rescanned the whole text at every call: quadratic, shared with 743b54b9 (a 640 KB real job did not finish in 120 s there; 0.93 s here) | `g4b.rs` `longScan(200000)`: every unit of a 200,000-character non-ASCII string through `charCodeAt` and `slice`, Node's digest `282233859`; without the fast path the test ran past 150 s and was killed |
+
+| TypeScript | Python | Why it is the same function |
+|---|---|---|
+| `unlinkSync`, `rmdirSync` (`node:fs`) | `os.unlink` / `os.rmdir` of the path as `_node_path` hands it over | the syscalls Node's binding makes (`g4b.rs`: ENOENT, ENOTEMPTY, ENOTDIR, a removal; red when either is changed) |
+| `lstatSync(p, {bigint: true})` (widened) | `BigIntStats` of `os.lstat`, as `statSync`'s row | (`g4b.rs`: `typeof mtimeNs` `bigint`, a link's type; red with the option ignored) |
+| `path.relative` (`node:path`) | `path.posix.relative` ported statement for statement over `_posix_resolve`; on Windows `ntpath.relpath` (the same path for a `to` under `from`, the one shape compiled code passes; unmeasured on Windows) | `g4b.rs` `relFuzz(20000)`: seeded absolute paths over `..`, `.`, empty, non-ASCII and astral parts, Node's digest `499719387`; red with `os.path.relpath` |
+| `path.join` of `undefined` / `null` (widened) | Node's `validateString` TypeError (`code` ERR_INVALID_ARG_TYPE, `The "path" argument must be of type string. Received undefined`), which a compiled `catch` sees; any other non-string stays a subset refusal | retention.ts joins a cold-index doc's `file`, which a doc may lack (J90-1F #13/#14: `runRetention` goes on, `searchArchived` raises) — `g4b.rs` (both messages); `--suite storage-retention` (`a doc with no file`) |
+| `coldFs` (`storage/coldfs.ts`, new: coldindex.ts's object moved out unchanged) | one object whose `readFileSync(p)` is the builtin `open(p, encoding="utf-8").read()` (`_store_path`; a decode failure `PyUnicodeDecodeError`) | Python is the reference: its `_read_json` read, which `pyReadText` ports; `open` is looked up when called, so `test_storage_coldindex.py`'s `builtins.open` spy still counts every shard read (unchanged test). `ImportedClass(["readFileSync"])`: the method dispatches in coldindex.ts only |
+| `coldErrorText` (`storage/coldfs.ts`, new: coldindex.ts's `errMessage`) | `str(e)` | Python is the reference (`f"... unreadable: {e}"`); an OSError and a strict-UTF-8 refusal are worded alike on both sides (pinned, `--suite storage-cold`). A JSON syntax error never reaches it since J90-3F: `coldindex.ts` throws its own `COLD_NOT_JSON` (`the file is not JSON`) on both sides; until then it was V8's wording on Node and CPython's `json` here, pinned `ruling: UNRULED DIVERGENCE (J90-3)` |
+| `retentionFs` (`storage/retentionfs.ts`, new: retention.ts's object and `fsyncDir` moved out unchanged) | one object: `writeArchive(target, data)` is the reference's `_write_archive` (`gzip_sync(data)` made before the temp is opened since J90-3F, as Node's; temp, write, `os.fsync`, `os.replace`, the directory fsynced on POSIX, the temp removed on a failure); `syncs` counts | Python is the reference; `os.*` looked up when called (`test_the_archive_reaches_the_disk_before_any_original_is_deleted` patches `os.fsync` / `os.unlink`, unchanged). Three Python tests that swapped `_write_archive` swap `retention_fs.writeArchive`, as Node's tests swap `retentionFs.writeArchive` |
+| `spawnRetentionChild` (`storage/retentionspawn.ts`, new: maybeSpawn's spawn, `import.meta` and `CHILD` moved out unchanged) | `subprocess.Popen([sys.executable, "-m", "bantamkit.storage.retention", cwd, home])`, stdio to the null device, a new session (POSIX) or a detached process group (Windows); False on any failure | Python is the reference: each runtime starts its own child, which claims the day and runs the same sweep (`test_the_spawned_child_runs_detached_against_the_given_home` and its Node twin) |
+| `touchReducer` (`touch/log.ts`) | `touch.log.touch_reducer` | Python is the reference (#200; `--suite touch-log`) |
+| `nativeMemoryDir` (`hookadapter.ts`), `hasBantamkitHooks` (`hostinstall.ts`) | `hookadapter.native_memory_dir`, `hostinstall.has_bantamkit_hooks(Path(p))` | Python is the reference: the probes the reference's tiers called (`--suite storage-tiers`, `hooks`, `install`) |
+| `process.cwd()` (Node global) | `os.getcwd()` (a deleted directory FileNotFoundError, which a compiled `catch` sees) | the reference's `current_cwd` |
+
+**The child's async half stays in Node.** `childMain` awaited the experience miner (`skillmine`'s
+`daily` may draft through an endpoint) after a dynamic `import()`. retention.ts keeps the sweep half,
+`childSweep(argv, now)` (claim the day under the lock, run, record; the stamp when the audit is to run,
+else `null`), which is compiled; `storage/retentionmain.ts` (new, NOT compiled) holds the async
+`childMain`: `childSweep`, then `skillreport.daily` and the miner, inside the `try` the old function
+had (a throw in the sweep half skipped the audit, as `null` does). `retention-child.ts` imports it.
+The Python shim's `child_main` is the same two halves, the second synchronous (`skillreport.daily`,
+`skillmine.daily`, `except OSError` as the reference had). No `async` / `await` / `import()` is
+lowered.
+
+TS refactors (Node's answers unchanged; `npm test` and every Node side of the suites unchanged):
+- coldindex.ts: `ColdIndex.add` renamed `addDocs` (J89-4a's clash rule: an exported compiled class's
+  `add` would make every `Set.add` of the call a run-time dispatch; it removed four the J89-4a
+  adapter row had caused in the store); reads of `segments` / `docs` / `id` / `terms` through a typed
+  `JsonTop` binding (J89-5); the manifest-entry test as `isSegment`; `Object.values(terms).every(isRows)`
+  as `Object.keys(terms).every((k) => isRows(terms[k]))` (an own data property either way);
+  `Array.from({length})` and assignment-in-an-expression spelled out; `e instanceof Error && e.code ===
+  'ENOENT'` as `e.code === 'ENOENT'` (only a failed read carries a `code`; a compiled catch holds
+  CPython's OSError, no JS `Error`). The Python surface keeps `add` (`bantamkit.storage.coldindex`).
+- retention.ts: `parseNow` as arithmetic (`daysFromCivil`, exported from hotindex.ts unchanged; the
+  old `setUTCFullYear` / `getUTC*` round trip answered exactly the range test: 1,246,410 inputs
+  through 743b54b9's `dist` and this tree's, 0 differences, value or refusal sentence: over 41
+  years (0000, 0001, 0002, 0099, 0100, 1600, 1700, 1900, 1969, 1970, 1999, 2000, 2001, 2004, 2023,
+  2024, 2026, 2100, 2400, 9999 and 21 seeded), every month x day `00`..`99` at two times, every hour
+  x minute `00`..`99`, every second `00`..`99` with four fractions, and ten malformed values); the three `[\s\S]` regexes as
+  `startsWith` / `endsWith` / length tests (`isLedger`, `checkpointJob`, `isTopCheckpoint`; the
+  regex and the function gave the same answer on 300,000 seeded names built from the patterns'
+  own pieces, line terminators and astral characters); the fold callbacks made in a loop as a word per log (`hook`,
+  `usage`, `touch`, `none`) and `foldUsage`; `compactCold`'s per-index callbacks as `[dir, sub]` held
+  in the loop and `keepUnder(dir, sub)` (the same `path.join` arguments); `.map(Number)` and the
+  `childMain` split above.
+- tiers.ts: `import fs from` / `import path from` as namespace imports; one nested destructuring
+  spelled out.
+- index.ts: `coldFs` re-exported from `coldfs.ts`.
+
+
+## J90-P4 rules (#316 G4: the last speed gap, and one adapter divergence)
+
+**A divergence found and fixed: `Stats.ino`.** `hotindex.ts` keys its held head on
+`${st.mtimeNs}:${st.size}:${st.ino}`. Neither adapter `Stats` nor `BigIntStats` carried `ino`, and a
+read of a member an adapter object does not list answers `undefined`, so the generated Python keyed
+the head on mtime and size alone: a head renamed over by one of the same mtime and size stayed held
+on Python and was reloaded on Node (and on the hand-written 9c6bc181, which used `st_ino`). Both
+classes now carry it, Node's way: the BigInt form `st_ino` exactly, the number form `_js_num(st_ino)`
+(a double, as libuv's `ino` is one past 2^53). Red before the fix: `tests/j90p4.rs`
+`stats_carry_node_s_ino` (Python printed `undefined:undefined:undefined:undefined`),
+`runtime-py/tests/test_storage_hotindex.py` and its Node twin
+`a head replaced with the same mtime and size is reloaded` (Python answered the old description on
+efda7291). No other `fs.Stats` member is read by compiled code (`grep` of runtime-ts/src).
+
+| Change | Why it is the same answer | Measurement |
+|---|---|---|
+| `shardOf` memoized (hotindex.ts: a module `Map`, replaced by an empty one at 4,096 terms) | a pure function of the term | lookup of six terms 13.2 -> 9.6 us (Python), the hash alone 4.0 -> 0.4 us |
+| `removeStaleTemps` drops every name but `*.tmp` before the sort (lock.ts) | `tempBase` answers `null` for any other name, so the same names are visited in the same order | the sweep of a 462-file index directory x14: 3.6 -> 2.4 ms |
+| `statListing` states a native `*.md` once (`mdPaths`; a non-file skipped off that stat) where `listing` stated it for `isFile` and `statListing` again | the same `statSync` (symlinks followed) answers both questions | x14 sources: 6.2 -> 4.4 ms |
+| `readdir_sync` (adapter): an all-ASCII listing returned as `os.listdir(str)` gives it | an ASCII byte is itself under UTF-8 with `replace` and under the filesystem encoding | — |
+| `Stats` / `BigIntStats` fields set through `__dict__.update` (adapter) | the instance is not frozen while it is made, so `__setattr__`'s test has nothing to refuse | the constructor's share of `stat_sync` (2.0 us) |
+| `_js_int_to_radix` base 10 is `str(int)` below 10^4000 (runtime) | the loop's digits; CPython's digit cap is far above | a BigInt mtime's `toString()` |
+| `_js_m_endsWith` two ASCII `str`s first; `_JsSet` of a list of `str`s at once (runtime) | each the branch below's answer for exactly those types | — |
+
+Measured and NOT taken: lowering a fresh local `Map`'s `get` / `set` inline
+(`m._entries.get(k, _JS_UNDEFINED) if type(k) is str else ...`) in the cold query's row loop moved
+20 queries' time 2.30 -> 2.23 ms (3%) in a hand-edited copy, and a faster `_lifted` (map/zip
+instead of comprehensions) did not move the 14 heads' 2.7 ms at all: the keys are terms and names
+read from JSON (unproven), so no Map fact or typed method body reaches the per-row helpers that are
+the gap. See docs/porting.md (*J90-P4*) for the floor.
+
+## J90-P5 rules (#316 G4: the adapter member audit; per-call shape guards in the adapters)
+
+**Adapter members are audited, not assumed.** `Stats.ino` (J90-P4) hid because a read of a member
+an adapter object does not list answers `undefined`. `--suite ts2py` now walks every property read
+in the compiled sources with the TypeScript checker (`tools/conformance/lib/adaptermembers.mjs`),
+keeps the reads whose member is declared OUTSIDE the compiled sources (2,254 on this tree), and
+sorts each into a row: an adapter class (`Stats`, `BigIntStats`, `Hash`, `TextDecoder`, `Date`,
+`SkillStore`, `coldFs`, `retentionFs`), whose `_js_own` must list the member; a dict an adapter or
+shim builds (`parseNative`, `pyRelativeScan`, `parseConfigDocument`, `parseJson`, `fileLinks`,
+the component's `_context_in`), which `ref/ts2py_ref.py` calls on sample inputs and whose dicts
+must carry the member (matched on a discriminant such as `kind` / `t`); or a read the runtime
+answers itself (a JS builtin, a module name the adapter table resolves at compile time, a Buffer
+method, an exception's `code`). A read no row claims is red (`adapter/every read of an adapter
+type has a row`), and so is a member a row's provider lacks. Today none is missing. Red proof (a
+scratch worktree of this change): `ino` removed from `Stats` / `BigIntStats` as efda7291 had them
+-> `adapter/BigIntStats provides every member compiled code reads (ino, isFile, mtimeNs, size)`
+answers `["ino"]`; `meta` dropped from `parse_native`'s dict -> the `parse_native` row red.
+
+**Per-call shape guards (adapters.py).** Each checks a value's shape once, at C speed, and hands
+the value over as it is; anything that fails takes the general path, which is unchanged.
+
+| Guard | Holds when | Otherwise |
+|---|---|---|
+| `_lift_values_same` in `_lifted` (`dumpJsValue`): a list, a plain dict, or a plain `_JsMap` (not a subclass, `_keys is None`, every key a `str`) handed to `json.dumps` unconverted (the Map as `dict(_entries)`) | every value, a level at a time over all values at once: a str / bool / None, a safe int, a list whose items all are, a dict whose keys are all `str`, none all digits (so `_js_own_keys` is its own order), and whose values all are | value by value, as before (`fromJs`): a float, `-0`, an unsafe int, a BigInt, `undefined`, a Map waiting to be settled or with a key that is not its own tag, an index-like key |
+| `_hash_bytes` (`hash_hex`, `Hash.update`): any `str` hashed as its strict UTF-8 | the strict codec encodes it (it refuses exactly the surrogate code points, the only ones `_os_text` changes) | `_os_text`, then UTF-8 with surrogateescape, per character |
+| `_os_text` / `_node_path` | as `_hash_bytes` | the per-character join |
+
+Pinned in `tests/j90p5.rs`: `probe()` and `fuzz(3000)` of `tests/fixtures/j90p5_probe.ts` equal to
+what Node v26.13.0 printed (canonical-index keys, `'01'` / `'-1'` / `'4294967295'` / `'٣'`, an own
+`__proto__`, a Map's number key colliding with its string, a Map from an object's entries, `-0`,
+`2^53` and past it, NaN, `1e21`, `undefined`, the `avgdl` float key), and 20,000 seeded Python
+values through `_lifted` equal to the value-by-value algorithm it shortcuts, with the fast path
+TAKEN for rows, docs and a Map of lists; 20,000 strings (Thai, astral, every lone-surrogate kind)
+through `hash_hex`, `Hash.update`, `_os_text` and `_node_path` equal to the per-character path.
+Mutations, each red: the digit-key test dropped, the `_keys is None` test dropped, the safe-int
+test dropped, the str-key test of the Map dropped, the list items unchecked, `_hash_bytes`
+encoding with surrogatepass, `_os_text` without its strict-codec test. Two are equivalent on
+every reachable input and stay green: the dict's str-key test (a dict reaching `_lifted` has
+string keys) and `type(...) is _JsMap` widened to `isinstance` (`_JsReadMap` iterates as its base).
+
+**Where each guard is gated (J90-RF F3).** The mutations above were red in `cargo test`
+(`tests/j90p5.rs`) only; the conformance suites stayed green under the two below, so they were
+checked against what bantamkit can reach:
+- *The safe-int test* (`_js_lift_ints_safe` answering True): **not equivalent; now a case.** An
+  index file read back holds a JSON integer past 2^53 only by a hand edit, and `_js_json_parse`
+  reads it as `JSON.parse` does, as the Python int 2^53, which is not a safe integer. A patch then
+  writes the doc back through `dumpJsValue`: `9007199254740992.0` on Node and on the real guard,
+  `9007199254740992` under the mutant. `--suite storage-index`, `J90-RF a head doc holding an
+  integer past 2^53 is written back as fromJs lifts it (a float)` and its python literal, both red
+  under the mutant (2 of 277), green on the guard.
+- *The digit-key test* (`any(map(str.isdigit, keys))` dropped): **equivalent on every reachable
+  input, so gated by `cargo test` alone.** It exists because a dict whose `_js_own_keys` order is
+  not its insertion order must not be handed to `json.dumps` as it is. The only `dumpJsValue` call
+  in the compiled sources (`hotindex.ts`, `dumps`) passes `sortKeys: true`, so `json.dumps` sorts
+  the keys and both paths write the same bytes, whatever order the dict holds. A digit key does
+  reach it (a `df` term such as `2026`), and the bytes are the same. It becomes reachable, and needs
+  a conformance case, the day a compiled caller passes `dumpJsValue` without `sortKeys`.
+
+**Measured and NOT taken: a per-row guarded copy of `for (const [a, b, , d] of rows)`.** On the
+cold query's row loop (3,324 rows, `micro_loop.py`): the general loop 727 us; a per-row guard
+proving `a`, `b` str and `d` a number with the body otherwise as lowered 761 us (facts alone move
+nothing: the body's cost is the Map reads and `+` on a Map value, which no row guard proves);
+the guard plus `Map.get` / `set` / `??` inline 610 us; everything inline with a runtime-checked
+int `+` 314-374 us; the hand-written loop, which checks nothing, 173 us; the body alone with no
+check at all 167 us. The check itself (about 45-65 ns a row, a separate pass or fused) is the
+floor, and a per-row fallback that stores an unproven sum into the same Map rules out a Map value
+fact. Not worth a compiler rule for at most 13% of one query.
+
+## J90-P6 rules (#316 G4: guarded inline expansion of hot helpers)
+
+**Where.** `Lowerer::hot` rewrites a lowered expression inside a loop body of a function (a
+`for`, `for-of`, `while` or `do` body, `breaks` holding a loop), never in a comprehension element
+(an inline `.map` / `.filter` / `.every` / `.some` callback) and never at module level. Three
+helpers, each written as a conditional expression whose fast arm is the helper's OWN first branch
+under a guard at least as strict, and whose slow arm is the unchanged call:
+
+| Call | Expansion |
+|---|---|
+| `_js_m_get(m, k)` | `(m._entries.get(k, _JS_UNDEFINED) if type(m) is _JsMap and type(k) is str else _js_m_get(m, k))` (the key test dropped for a string literal) |
+| `_js_strict_eq(a, b)` / `not _js_strict_eq(a, b)` | `(a == b if type(a) is type(b) is str else _js_strict_eq(a, b))` / `!=` and `not` |
+| `_js_add(a, b)` | `(a + b if type(a) is int and type(b) is int and -2**52 <= b <= 2**52 and -2**52 <= a <= 2**52 else _js_add(a, b))` (the type and range test of `b` dropped for an int literal under 16 digits) |
+
+`_js_add`'s own first branch takes two ints within ±2^53 and rounds their sum with `_js_num`; the
+expansion takes addends within ±2^52 only, so their exact sum is within ±2^53 and `_js_num` would
+return it unchanged. No `_js_num` is written.
+
+**Literals.** The first operand is never a literal, and a literal second operand must be of the
+fast arm's own type (a string key for `Map.get`, an int under 16 digits for `+`; never for `===`,
+where a string literal is already `==` and any other could not take the fast arm), so no guard
+tests a literal's type. Every generated module's header adds `UP034` to its `ruff: noqa` line: the
+expansion is parenthesized also where it is a call's sole argument.
+
+**Evaluation order.** Every operand but the first must be a name or a literal (`simple_operand`):
+read again in the slow arm with no code run in between, it gives the same value. The first, when it
+is anything else, is bound by `:=` to a fresh `_js_h<N>` (`type(_js_h1 := ...)`) in the guard's FIRST test, which always
+runs, so it is evaluated once and before the others, as in the call. Where `:=` cannot stand
+(a comprehension's iterable is lowered with `no_walrus` set; a lambda body has `in_callback`), the
+first operand must be simple too, or the call is left as it is. A call whose text is not exactly
+`helper(arg, arg)` (a keyword or starred argument, an unbalanced text) is left as it is.
+
+**Not taken, measured** (docs/porting.md, *Guarded inline expansion*): `_js_get`, `_js_num`,
+`_js_coalesce_value`, `_js_list_at` and comprehension elements. With all seven helpers and
+comprehensions the wheel grew 12.4 KB (cap +4.8 KB) and no path moved more than the three-helper
+form by more than its spread.
+
+Pinned in `tests/j90p6.rs`: `probe()` and `fuzz(3000)` of `tests/fixtures/j90p6_probe.ts` equal to
+what Node v26.13.0 printed (every pair of a 31-value pool through `===`, `!==` and `+`, a Map read
+by every pool value including `true`, `NaN`, `-0`, `2^53`, `'__proto__'`, a running Map sum
+through ints past 2^52); every expansion called from Python with values JS code cannot build (ints
+past 2^53, bools, BigInts, `-0.0`, NaN, a lone surrogate, a `_JsMap` subclass, an object with
+`_entries` that is not a Map, a dict, `None`) equal to the helper, value and type or the same
+exception; the fast arms TAKEN with the helpers patched to raise; a comprehension iterable in a
+loop compiles. Mutations, each red (a scratch copy of `tools/ts2py`): the addend bound 2^52 ->
+2^53; the second addend's type test dropped; the first addend's bound dropped; the `===` fast arm
+for any same type; `Map.get` without the key type test; `Map.get` on any receiver with
+`_entries`; the comprehension iterable's `no_walrus` dropped (SyntaxError).
+
+## J90-P7 rules: generated Python that mypyc compiles as it stands (#316 G4)
+
+The runtime and every generated module compile with mypyc (mypy 2.4.1) with no step between ts2py
+and `mypyc`: no file is rewritten, moved or annotated by hand. The adapter module is never
+compiled. Interpreted, each form below is the code ts2py wrote before (`tests/j90p7.rs` holds the
+probe to Node's answer both ways); compiled, each one is what keeps the answer the same.
+
+- **Classes are non-native.** Every class ts2py writes is `@_mypyc_attr(native_class=False)`: its
+  base (`_JsObject`, an Error class) is a Python class with a `__dict__` that `_js_object_get` reads
+  and a `__setattr__` that `Object.freeze` relies on. `_js_name`, `_js_own` and `_js_own_methods`
+  are `_ClassVar`; a getter is `-> object` (mypyc compiles no property without one). In the runtime,
+  `_JsObject`, the Error classes and `_JsMatchArray` (a `list` subclass) are non-native, `_JsMap`
+  allows interpreted subclasses (`_JsReadMap`), the rest are native. `_mypyc_attr` is
+  `mypy_extensions.mypyc_attr` where that is installed and an identity stand-in where not.
+- **A method holding a closure is a module function.** mypyc 2.4.1 cannot compile a method of a
+  non-native class whose body holds a `def` or `lambda` that captures a variable (an internal
+  error, mypyc/mypyc#1205, fixed by python/mypy#22237 after the 2.4.1 release). Such a method is
+  written as `_js_method_<Class>_<name>(self, ...)` after the class, with the method's parameters
+  and body, and the method forwards to it (`lower.rs`, `hoist_closure_methods`). ts2py emits no
+  `super()`, and refuses source names starting with `_js_`.
+- **`instanceof` is `_js_instanceof(x, C)`.** Compiled, `isinstance(x, C)` of a non-native class C
+  tests the exact type (mypyc takes C for a native class and counts no subclass), so an interpreted
+  subclass (`_Core(MemoryStore)`, `_Opaque(PyScalar)`, every adapter class under `_JsObject`) was
+  not an instance. The helper's `isinstance` is the builtin. The runtime's own checks of its
+  non-native classes read `type` variables (`_JS_OBJECT_CLASS`, ...) for the same reason. The
+  helper is `-> bool`: compiled, an unannotated function returning the builtin's answer gives the
+  int 1 or 0 (mypy 2.4.1), which `JSON.stringify` writes as `1`; `tests/j90p7.rs` was red on it.
+- **A module-level variable is `_JsAny`** (a ts2py `_JS_` constant, a hoisted regex, is `_Final`).
+  mypy types an unannotated one by its first value and mypyc then refuses any other type, which JS
+  allows: a shim forwarding `GATE_FLOOR = 1.5` over `1`, or a module `let` that goes from `3` to
+  `1.5`. A typed body's second name (`_f__typed = f`) is left as it is.
+- **A name a shim rebinds is read at call time** (`lib.rs`, `REBOUND`, one row per name with its
+  reason). mypyc binds a module's own functions and the functions and classes it imports; a row's
+  function is decorated `@_js_late` (the identity; mypyc calls a decorated function through the
+  module's globals) and a row's import is bound to an `_JsAny` variable of the same name.
+- **The runtime's constants are `_Final`**, and no lone surrogate is spelled as a literal (mypyc
+  writes literals as UTF-8): `_JS_LEAD_MIN` and its three siblings are `chr()` values.
+- **The adapters declare `BantamError` to a type checker** (`if _typing.TYPE_CHECKING:`): it is
+  built by the module's `__getattr__`, a base mypy cannot see is `Any`, and mypyc builds a class on
+  an `Any` base on `object` alone, silently (a compiled `MemoryValidationError` refused its message).
+- `fromJs` (`_lifted`) moved from the adapters to the runtime as `_js_lifted`, unchanged, so a
+  compiled build compiles it.
+
+Not taken, measured (docs/porting.md, *mypyc*): compiling the adapter module (it needs a concrete
+`BantamError`, a `cmp_codepoint` without a function attribute and a native `_JsReadMap`; built that
+way it segfaulted on the first index build); native generated classes (they would need
+`_js_object_get` and `Object.freeze` rewritten off `__dict__` and `__setattr__`).
+
+## J90-P7B rules: three shortcuts beside the generated modules, each equal to what it shortcuts (#316 G4)
+
+No lowering changed. Three pieces of the Python ts2py writes beside the generated modules answer
+faster, each pinned equal to the code it shortcuts in `tests/j90p7b.rs`:
+
+- **`pyRoundFloat9` is the runtime's `_js_py_round_float9`** (the adapters' `py_round_float9` is
+  that function), so a compiled build compiles it, and it carries `pysem.ts`'s own J68-5 fast path:
+  a float `0 < x` with `y = x * 1e9 < 2**40` whose fraction is more than 1e-3 from one half is the
+  nearer whole over 1e9. Every other value is CPython's `round(x, 9)`. Pinned equal (value, sign,
+  type) over 400,000 seeded values, near-ties included; a mutant without the 1e-3 band differs on
+  19,314 of 40,000 exact ties.
+- **`path.basename` / `path.dirname` on POSIX** answer a path that does not end in `/` from its last
+  `/` (`rfind`, in C): `basename` everything after it, `dirname` everything before it when it is
+  past the second unit. Any other path takes the statement-for-statement port. Pinned equal to the
+  port over every path of up to seven units drawn from `a`, `/`, `.`, `é`.
+- **`pyReadText`** opens a path `_pure_as_is` accepts (POSIX, non-empty, no doubled `/`, no `.`
+  part, no trailing `/`: a sufficient test of `str(PurePath(p)) == p`) with `io.open`, as
+  `Path.read_text` itself does, without building the `Path`. Pinned: `_pure_as_is` never accepts a
+  path `PurePath` rewrites, and the answer (text, or exception type and message) equals
+  `Path(p).read_text(encoding='utf-8')` for a file, a CRLF file, a non-UTF-8 file, a directory and
+  a missing path, each spelled five ways.
+
+`fs.statSync` / `fs.lstatSync` check their one option without building a set, and `BigIntStats`
+stores its five fields one by one: the same dict, in the same order.
+
+
+## J90-PF rules: the pure build's speed, without a changed answer (#316 G4)
+
+Every rule below writes, where it fires, the helper's own first branch under a guard at least as
+strict as the helper's test for it, and the unchanged helper call otherwise; or a runtime fast path
+that answers exactly what the general path answers for the inputs it admits. Pinned in
+`tools/ts2py-bantamkit/tests/j90pf.rs` (below); measured in docs/porting.md (*after J90-PF*).
+
+**Expressions in a loop body (`hot`, as J90-P6).**
+
+| Call | Expansion |
+|---|---|
+| `_js_m_get(m, k)` | the J90-P6 form, its key test widened: `(type(k) is str or type(k) is int and -9007199254740992 <= k <= 9007199254740992)` (a safe int is its own `_js_key` too); no key test for a string literal or an index literal (a non-negative int under 16 digits) |
+| `_js_m_has(m, k)` | `(k in m._entries if type(m) is _JsMap and <key test> else k in m._items if type(m) is _JsSet and <key test> else _js_m_has(m, k))` |
+| `_js_strict_eq(a, b)` / `not ...` | the J90-P6 form, and two safe ints (`_js_strict_eq`'s second branch): `... if type(a) is type(b) is str or type(a) is type(b) is int and -2^53 <= a <= 2^53 and -2^53 <= b <= 2^53 else ...` |
+| `_js_list_at(xs, i)` (a proven list) | `(xs[i] if type(i) is int and 0 <= i < len(xs) else _js_list_at(xs, i))`; both names (the guard tests no receiver) |
+| `_js_m_push(xs, x)` as a value | `(xs.append(x) or len(xs) if type(xs) is list else _js_m_push(xs, x))`; `xs` a name and `x` a name or a literal, so `len(xs)` reads the list the item went to |
+
+**Statements in a loop body (`hot_stmt`).** Each is an `if`/`else` whose `else` is the call as
+written; the result is discarded, as the statement discards the call's.
+
+| Statement | First arm, under its guard |
+|---|---|
+| `m.set(k, v)` | `m._entries[k] = v` if `type(m) is _JsMap`, the key test above and `m._keys is None` (`_js_m_set`'s own first branch); `m` a name, `k` a name or a literal, `v` a name, a literal or a list display of them (`[row]`), so nothing runs between the guard and the store |
+| `xs.push(x)` | `xs.append(x)` if `type(xs) is list`; `xs` a name, `x` anything: `xs.append` reads the list before `x` is evaluated, as JS reads the receiver first |
+| `xs[i] = v` | `xs[i] = v` if `type(xs) is list and type(i) is int and 0 <= i < len(xs)` (`_js_put`'s first branch); `xs` and `i` names (or `i` an index literal), `v` a name or a literal |
+
+**Reads by a number (member lowering).** In a loop body, `o[k]` with `o` a name and `k` a name the
+compiler proved a number, or an index literal: `(o[k] if type(o) is list and type(k) is int and 0 <=
+k < len(o) else _js_get(o, k))`, `_js_get`'s own branch for a list and an int. A key not proven a
+number is left to `_js_get` (a dict read would pay a list test for nothing).
+
+**Anywhere.**
+
+- `[...new Set(xs)].sort(cmp)`, `cmp` an adapter whose row promises `compare-codepoints` (not a
+  local) and `Set` the builtin, with the receiver lowered as exactly `[*_JsSet(<xs>)]`:
+  `_js_sort_unique(xs, cmp)`, which answers `sorted(set(xs))` for a list of `str`s (and
+  `cmp._js_codepoint_order`, as `_js_m_sort` checks it) and the general lowering otherwise.
+- `xs.sort((a, b) => a - b)` (or `b - a`), the key the first parameter itself:
+  `_js_sort_num(xs, descending, compare)`: a list of two or more safe ints sorts by value (ties are
+  equal ints, so every stable order is the same), anything else is `_js_sort_keyed` as before.
+- `s.endsWith(lit)` / `s.startsWith(lit)`, `lit` an ASCII string literal: `s.endswith(lit)` for a
+  proven `str`, else `(s.endswith(lit) if type(s) is str else _js_m_endsWith(s, lit))` with `s` a
+  name. An ASCII unit is its own code point and no surrogate unit equals one, so comparing code
+  points is comparing code units; a literal that is not ASCII (`'\ude00'`) keeps the helper.
+- `xs.push(a, b, ...)` as a statement on a proven list: `xs.extend((a, b, ...,))`, the helper's own
+  `extend`, the receiver read first.
+
+**Runtime fast paths.** `_js_str` of a safe int is `str(v)`; `_js_m_get` / `_js_m_set` /
+`_js_m_has` take a safe-int key as its own tag; `_js_rows(m, 2, ...)` of a plain Map with no kept
+keys walks `_JsMap.__iter__`'s own snapshot and yields each pair as a tuple (always unpacked at
+once); `_js_json_stringify` of a list of strings, booleans, nulls, safe ints and lists of them (64
+levels, no list twice in a level) is `json.dumps(ensure_ascii=False, separators=(",", ":"))` when
+the text holds no lone surrogate (strict UTF-8 encodes it); `_js_json_ints_exact` counts a `-0`
+only after `[`, `,`, `:` or the start (past blanks), as it already counted a 16-digit run; and
+`_js_json_parse` takes that scan for a text of 513-2048 characters with a comma every eight or fewer
+(an index shard) as well as past 2048. Which decoder parses is a cost: both read every text the
+scan admits to one value.
+
+**Adapters** (`ts2py.toml`): `statStamp`, `statMtimeNs` and `statFile`
+(`runtime-ts/src/storage/statstamp.ts`) answer the hot index's three stat reads from `os.stat`
+without a `BigIntStats` object; `parseNative` also returns `front`, the text it split.
+
+Pinned in `tests/j90pf.rs`: `probe()` and `fuzz(3000)` of `tests/fixtures/j90pf_probe.ts` equal to
+what Node v26.13.0 printed (a pool of 30 values through `===` / `!==`, a Map and a Set by every pool
+value with `-0`, NaN, `true`, 2^53 and 2^53 + 1 from JSON, a Map keyed by ints, `push` as a value,
+as a statement and of several items, stores at and past the end, reads by a counted and a literal
+index of a list, a string with an astral character and an object, `[...new Set(xs)]` with duplicates
+and a lone surrogate, `a - b` sorts with a tie, `-0`, big ints and NaN, `endsWith` / `startsWith`
+with astral and lone surrogates and a non-ASCII needle, `JSON.stringify` with every escape, a lone
+surrogate, shared lists and big ints, `JSON.parse` with `-0` in slugs, as tokens, in an exponent,
+and long texts); every expansion called from Python with values JS cannot build and held to the
+helper (value and type, or the same exception); the fast arms TAKEN with the helpers patched to
+raise; each runtime fast path against its general path over seeded inputs (4,000 sorts each way,
+2,000 Map walks deleting mid-walk, 3,000 Map and Set reads and writes, 6,000 stringified values,
+6,000 JSON texts); the stat adapters against `BigIntStats` over a file, a directory, a symlink, a
+dangling symlink and missing paths; `front` against the split text (CRLF, a nested `---`).
+
+Mutations, each red in `cargo test --test j90pf` (a scratch copy of both crates and
+`runtime-py/src`, one at a time): `_js_sort_num` without the safe range; `_js_sort_unique` without
+its `str`-only test; `_js_json_plain` without the int range, and with a list twice in a level
+allowed; `_js_json_stringify` without the lone-surrogate check; `_js_json_ints_exact` treating no
+`-0` as a token; `_js_rows`' Map path taken with kept keys; `_js_m_get` and `_js_str` with an
+unbounded int; the `get` / `has` key test with an unbounded int; the `===` int arm unbounded; the
+store without `0 <=`; the push value without its length; the member read on any receiver; `endsWith`
+of any literal (red once the probe's receiver was a name, which the rule requires); the statement
+`set` with kept keys allowed; the `has` Set arm on any receiver with `_items`; `statFile` through
+`lstat`; `statStamp` with `st_dev` for `st_ino`; `parseNative`'s `front` split from the text read
+without universal newlines.

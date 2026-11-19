@@ -269,7 +269,7 @@ test('postings are run-length segments over doc ids', () => {
     ['c', 'keywords', 1],
   ]);
   assert.deepEqual(hi.cols().length, [4, 3, 6, 3]);
-  assert.equal(hi.size(), 4);
+  assert.equal(hi.docCount(), 4);
 });
 
 test("a recall reads the head's first line only", async () => {
@@ -351,4 +351,46 @@ test('native refs read the description, then the body (#200)', () => {
   const hi = new HotIndex(d, 'native', path.join(t, 'home'));
   hi.refresh('full');
   assert.deepEqual(hi.docs().get('n').refs, ['src/a.ts', 'b.py#f']);
+});
+
+test('a persist removes its own stale temps and no other index\'s (J90-3F)', () => {
+  // a writer killed between a temp's write and its rename left `<file>.<pid>.tmp` forever (red on
+  // 2cca2564); the next persist removes this index's own once older than the lock's window
+  const t = tmp();
+  fact(path.join(t, 's'), 'a', 'x');
+  const hi = hiOf(t);
+  const d = path.dirname(hi.path);
+  const head = path.basename(hi.path);
+  const sha = head.slice(0, -5);
+  const old = fs.statSync(hi.path).mtimeMs / 1000 - 3600;
+  const plant = { [`${head}.31.tmp`]: true, [`${sha}.postings-00.json.32.tmp`]: true, [`${head}.33.tmp`]: false, '0000000000000000.json.34.tmp': true };
+  for (const [name, stale] of Object.entries(plant)) {
+    fs.writeFileSync(path.join(d, name), 'partial');
+    if (stale) fs.utimesSync(path.join(d, name), old, old);
+  }
+  fact(path.join(t, 's'), 'b', 'y');
+  assert.ok(['patched', 'rebuilt'].includes(hi.refresh('full')) && hi.docs().has('b'));
+  assert.deepEqual(fs.readdirSync(d).filter((n) => n.endsWith('.tmp')).sort(), ['0000000000000000.json.34.tmp', `${head}.33.tmp`]);
+});
+
+test('a head replaced with the same mtime and size is reloaded (J90-P4)', () => {
+  // the held-head check is `${mtimeNs}:${size}:${ino}`; the generated Python read `ino` off an
+  // adapter Stats that did not carry it, so such a head stayed held there (red on efda7291)
+  const t = tmp();
+  fact(path.join(t, 's'), 'a', 'first fact AAAA');
+  const hi = hiOf(t);
+  const head = hi.path;
+  const T0 = 1_700_000_000; // whole seconds: utimes sets them exactly
+  fs.utimesSync(head, T0, T0);
+  hi.refresh('fast');
+  assert.equal(hi.doc('a').description, 'first fact AAAA');
+  const st = fs.statSync(head, { bigint: true });
+  const swap = path.join(path.dirname(head), 'swap');
+  fs.writeFileSync(swap, fs.readFileSync(head, 'latin1').replace('AAAA', 'BBBB'), 'latin1');
+  fs.utimesSync(swap, T0, T0);
+  fs.renameSync(swap, head);
+  const now = fs.statSync(head, { bigint: true });
+  assert.ok(now.mtimeNs === st.mtimeNs && now.size === st.size && now.ino !== st.ino);
+  hi.refresh('fast');
+  assert.equal(hi.doc('a').description, 'first fact BBBB');
 });

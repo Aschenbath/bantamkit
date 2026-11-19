@@ -14,7 +14,11 @@ fn python() -> String {
 
 fn run_python(script: &str, args: &[&Path]) -> String {
     let python = python();
+    // J90-P8F: the adapters answer CPython 3.12's json and timestamp sentences through
+    // `bantamkit/stdlib312.py`, found on this path WITHOUT importing the package (whose
+    // `__init__` needs its dependencies), so `TS2PY_PYTHON` may be a bare 3.13 or 3.14.
     let run = Command::new(&python)
+        .env("PYTHONPATH", repo_root().join("runtime-py").join("src"))
         .arg("-c")
         .arg(script)
         .args(args)
@@ -52,7 +56,7 @@ fn package(dir: &Path, modules: &[ts2py::Compiled]) {
     std::fs::write(package.join("_ts2py_runtime.py"), ts2py::RUNTIME).unwrap();
     std::fs::write(
         package.join("_ts2py_adapters.py"),
-        ts2py::adapters_module("._ts2py_runtime"),
+        ts2py_bantamkit::adapters_module("._ts2py_runtime"),
     )
     .unwrap();
     for module in modules {
@@ -67,7 +71,7 @@ fn package(dir: &Path, modules: &[ts2py::Compiled]) {
 fn options() -> ts2py::Options {
     ts2py::Options {
         runtime_module: Some("._ts2py_runtime".to_string()),
-        ..ts2py::Options::default()
+        ..ts2py_bantamkit::options()
     }
 }
 
@@ -226,28 +230,31 @@ fn j89_4a_a_method_name_still_refuses_a_property_read_of_that_name() {
 /// property of the same name on anything else still reads.
 #[test]
 fn j89_4a_imported_class_methods_stay_in_their_module() {
-    let importer = "import { ColdIndex } from './storage/coldindex.js';\nimport { HotIndex } from './storage/hotindex.js';\nexport function f(c: ColdIndex, h: HotIndex, seen: Set<string>, pool: { names: string[] }): unknown {\n  seen.add('x');\n  c.add(new Map());\n  return [pool.names, h.names()];\n}\n";
-    let other = "export function g(seen: Set<string>): unknown {\n  return seen.add('x');\n}\n";
-    let modules = compile_package(&[
+    // J90-2: `HotIndex` is compiled since #316 G4; J90-3: so is `ColdIndex`, whose `add` (renamed
+    // `addDocs`) was the method here that a builtin shares. The adapter class now is `SkillStore`
+    // (`lookup`): it is a method in the module that imports the class and nowhere else, and a
+    // property of the same name on anything else still reads.
+    let importer = "import { SkillStore } from './memory/skills.js';\nexport function f(c: SkillStore, seen: Set<string>, pool: { lookup: string[] }): unknown {\n  seen.add('x');\n  return [pool.lookup, c.lookup('x')];\n}\n";
+    let other = "export function g(seen: Set<string>, o: { lookup(k: string): string }): unknown {\n  seen.add('x');\n  return o.lookup('y');\n}\n";
+    let modules = compile_package(&[("runtime-ts/src/importer.ts", importer)]);
+    let code = &modules[0].code;
+    assert!(code.contains("_js_m_add(seen, \"x\")"), "{code}");
+    assert!(
+        code.contains("_js_get(pool, \"lookup\")")
+            && code.contains("_js_invoke(c, \"lookup\", \"x\")"),
+        "{code}"
+    );
+    // In a module that does not import it, `lookup` is no method anyone declares: refused.
+    let lines = refusals(&[
         ("runtime-ts/src/importer.ts", importer),
         ("runtime-ts/src/other.ts", other),
     ]);
-    let code = |stem: &str| -> &str { &modules.iter().find(|m| m.py_module == stem).unwrap().code };
     assert!(
-        code("importer").contains("_js_dispatch(seen, \"add\", _js_m_add, \"x\")"),
-        "{}",
-        code("importer")
-    );
-    assert!(
-        code("importer").contains("_js_get(pool, \"names\")")
-            && code("importer").contains("_js_invoke(h, \"names\")"),
-        "{}",
-        code("importer")
-    );
-    assert!(
-        code("other").contains("_js_m_add(seen, \"x\")"),
-        "{}",
-        code("other")
+        lines
+            .iter()
+            .any(|l| l
+                .starts_with("runtime-ts/src/other.ts:3:10: unsupported builtin method .lookup")),
+        "{lines:?}"
     );
 }
 
@@ -265,6 +272,11 @@ fn j89_4a_store_compiles_with_the_committed_modules() {
         "runtime-ts/src/memory/usage.ts",
         "runtime-ts/src/memory/retrieval.ts",
         "runtime-ts/src/memory/store.ts",
+        // J90-2 (#316 G4): the store imports the compiled lock and hot index; J90-3 the cold index
+        // (its adapter row retired).
+        "runtime-ts/src/storage/lock.ts",
+        "runtime-ts/src/storage/hotindex.ts",
+        "runtime-ts/src/storage/coldindex.ts",
     ];
     let sources: Vec<String> = paths
         .iter()
@@ -830,6 +842,9 @@ fn j89_6_component_compiles_with_the_g3_call() {
         "runtime-ts/src/memory/layers.ts",
         "runtime-ts/src/memory/dream.ts",
         "runtime-ts/src/memory/component.ts",
+        "runtime-ts/src/storage/lock.ts",
+        "runtime-ts/src/storage/hotindex.ts",
+        "runtime-ts/src/storage/coldindex.ts",
     ];
     let sources: Vec<String> = paths
         .iter()

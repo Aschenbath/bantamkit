@@ -13,12 +13,18 @@
 import './_sandbox.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import * as retention from '../dist/storage/retention.js';
+// J90-3 (#316 G4): retention.ts is compiled by ts2py; its archive write (`retentionFs`) and the
+// child's async half (`childMain`) moved to two modules it cannot hold, re-gathered here.
+import * as retentionCore from '../dist/storage/retention.js';
+import { retentionFs } from '../dist/storage/retentionfs.js';
+import { childAudit, childMain } from '../dist/storage/retentionmain.js';
+const retention = { ...retentionCore, retentionFs, childMain };
 import { ColdIndex } from '../dist/storage/index.js';
 import * as shiftwork from '../dist/shiftwork.js';
 import { toJs } from '../dist/pyjson.js';
@@ -243,6 +249,40 @@ test('every archive written is synced to the disk (J69-8)', (t) => {
   assert.equal(retention.retentionFs.syncs - before, per * report.archived.length);
 });
 
+test('a short archive write (ulimit -f) renames nothing into place and is refused (J90-3)', { skip: process.platform === 'win32' }, (t) => {
+  // One closed job whose archive is past a 512-byte file-size limit: write(2) answers a SHORT
+  // count, then EFBIG. The write must loop and fail, leaving no archive (it renamed a truncated
+  // one into place, which failed to verify and was then refused forever as `archive exists and
+  // differs`). Run in a child under `ulimit -f 1`, as the reference's twin test does.
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'retention-short-')));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const sw = path.join(base, 'a', '.shiftwork');
+  fs.mkdirSync(path.join(sw, 'briefs-big'), { recursive: true });
+  fs.mkdirSync(path.join(base, 'home', '.bantamkit'), { recursive: true });
+  let h = 'seed';
+  const lines = [];
+  for (let i = 0; i < 64; i += 1) lines.push((h = createHash('sha256').update(h).digest('hex')));
+  fs.writeFileSync(path.join(sw, 'checkpoint-big.json'), cp('big', 'done'));
+  fs.writeFileSync(path.join(sw, 'briefs-big', 'U1.md'), lines.join('\n'));
+  for (const p of [path.join(sw, 'checkpoint-big.json'), path.join(sw, 'briefs-big', 'U1.md')]) {
+    fs.utimesSync(p, NOW_S - 8 * DAY, NOW_S - 8 * DAY);
+  }
+  const before = tree(base);
+  const dist = new URL('../dist/storage/retention.js', import.meta.url).href;
+  const script = `import { runRetention } from ${JSON.stringify(dist)};\nconsole.log(JSON.stringify(runRetention(process.argv[1], [process.argv[2]], process.argv[3])));`;
+  const env = { ...process.env, BANTAMKIT_INDEX_DIR: path.join(base, 'idx') };
+  delete env.BANTAMKIT_RETENTION;
+  const out = spawnSync('sh', ['-c', 'ulimit -f 1; exec "$@"', 'sh', process.execPath, '--input-type=module', '-e', script, path.join(base, 'home'), path.join(base, 'a'), NOW], { encoding: 'utf8', env });
+  assert.equal(out.status, 0, out.stderr);
+  const report = JSON.parse(out.stdout);
+  assert.deepEqual(report.refused, [{ path: path.join(sw, 'checkpoint-big.json'), reason: 'archive write failed' }]);
+  assert.deepEqual(report.archived, []);
+  const after = tree(base);
+  for (const r of Object.keys(before)) assert.equal(after[r], before[r], r);
+  assert.ok(!fs.existsSync(path.join(sw, 'archive', 'big.json.gz')), 'no archive renamed into place');
+  assert.deepEqual(fs.existsSync(path.join(sw, 'archive')) ? fs.readdirSync(path.join(sw, 'archive')) : [], []);
+});
+
 test('an archive that reads back wrong deletes nothing', (t) => {
   const base = bed(t);
   const real = retention.retentionFs.writeArchive;
@@ -337,7 +377,7 @@ test('compact prunes names whose file is gone, and search finds archived lines',
   assert.equal('search' in toJs(shiftwork.status(cpPath)), false);
   const cold = retention.shiftworkCold(path.join(base, 'home'), path.join(base, 'a'));
   assert.deepEqual([...cold.docs().keys()].sort(), ['checkpoint', 'clash', 'closed8']);
-  cold.add(new Map([['ghost', { ...cold.doc('closed8'), name: 'ghost', file: '.shiftwork/archive/ghost.json.gz' }]]));
+  cold.addDocs(new Map([['ghost', { ...cold.doc('closed8'), name: 'ghost', file: '.shiftwork/archive/ghost.json.gz' }]]));
   const report = run(base);
   assert.ok(report.compacted.includes(cold.name));
   assert.deepEqual([...cold.docs().keys()].sort(), ['checkpoint', 'clash', 'closed8']);
@@ -348,7 +388,7 @@ test('compact without keep is unchanged', () => {
   const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'retention-c-')));
   const cold = new ColdIndex('t', d);
   const doc = { file: 'x', name: 'x', description: 'd', type: 't', keywords: [], links: [], tags: [], refs: [], mtime_ns: '0', size: 0 };
-  cold.add(new Map([['x', doc]]));
+  cold.addDocs(new Map([['x', doc]]));
   assert.equal(cold.compact(), null);
   assert.equal(cold.compact(() => true), null);
   assert.equal(cold.compact(() => false), '000002');
@@ -420,4 +460,55 @@ test('the child is spawned when either switch is on', (t) => {
     }
     assert.equal(retention.maybeSpawn(home, home), word, `${sweep} ${audit}`);
   }
+});
+
+test('an audit that throws anything costs neither the exit nor the sweep (J90-3F)', async (t) => {
+  // the twin of the Python shim's test: its `child_main` let all but an OSError out (red there on 2cca2564)
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'retention-audit-')));
+  fs.mkdirSync(path.join(base, 'home', '.bantamkit'), { recursive: true });
+  fs.mkdirSync(path.join(base, 'root'));
+  const saved = [process.env.BANTAMKIT_RETENTION, process.env.BANTAMKIT_SKILL_AUDIT, childAudit.daily];
+  process.env.BANTAMKIT_RETENTION = 'on';
+  process.env.BANTAMKIT_SKILL_AUDIT = 'on';
+  childAudit.daily = () => {
+    throw new TypeError('audit broke');
+  };
+  t.after(() => {
+    const put = (k, v) => (v === undefined ? delete process.env[k] : (process.env[k] = v));
+    put('BANTAMKIT_RETENTION', saved[0]);
+    put('BANTAMKIT_SKILL_AUDIT', saved[1]);
+    childAudit.daily = saved[2];
+  });
+  assert.equal(await retention.childMain([path.join(base, 'root'), path.join(base, 'home')], NOW), 0);
+  const state = JSON.parse(fs.readFileSync(path.join(base, 'home/.bantamkit/retention.json'), 'utf8'));
+  assert.ok(state.ran_at === NOW && 'report' in state && !('error' in state));
+});
+
+test('a run removes the stale temps a killed run left and nothing else (J90-3F)', (t) => {
+  // a writer killed between a temp's write and its rename left `<file>.<pid>.tmp` forever (red on 2cca2564)
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'retention-tmp-')));
+  const home = path.join(base, 'home');
+  const root = path.join(base, 'root');
+  const arch = path.join(root, '.shiftwork', 'archive');
+  fs.mkdirSync(arch, { recursive: true });
+  fs.mkdirSync(path.join(home, '.bantamkit'), { recursive: true });
+  const saved = process.env.BANTAMKIT_RETENTION;
+  process.env.BANTAMKIT_RETENTION = 'on';
+  t.after(() => (saved === undefined ? delete process.env.BANTAMKIT_RETENTION : (process.env.BANTAMKIT_RETENTION = saved)));
+  const old = Date.now() / 1000 - 3600;
+  for (const [d, name, stale] of [
+    [arch, 'a.json.gz.4242.tmp', true],
+    [arch, 'b.json.gz.4243.tmp', false],
+    [arch, 'notes.md.4242.tmp', true],
+    [arch, 'c.json.gz.tmp', true],
+    [path.join(home, '.bantamkit'), 'retention.json.77.tmp', true],
+    [path.join(home, '.bantamkit'), 'retention.json.78.tmp', false],
+  ]) {
+    fs.writeFileSync(path.join(d, name), 'partial');
+    if (stale) fs.utimesSync(path.join(d, name), old, old);
+  }
+  const report = retention.runRetention(home, [root], NOW);
+  assert.deepEqual(report.deleted, [path.join(home, '.bantamkit', 'retention.json.77.tmp'), path.join(arch, 'a.json.gz.4242.tmp')]);
+  assert.deepEqual(fs.readdirSync(arch).sort(), ['b.json.gz.4243.tmp', 'c.json.gz.tmp', 'notes.md.4242.tmp']);
+  assert.deepEqual(fs.readdirSync(path.join(home, '.bantamkit')).sort(), ['retention.json.78.tmp']);
 });

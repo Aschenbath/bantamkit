@@ -1,12 +1,13 @@
 # ts2py adapters: hand-written Python for the imports and Node globals ts2py does not compile.
-# Every name here is declared in tools/ts2py/src/adapters.rs with the reason it is faithful, and
-# RULES.md (Adapters) records how each was measured. Nothing else may be imported this way.
+# Every name here is declared in tools/ts2py-bantamkit/ts2py.toml with the reason it is faithful,
+# and RULES.md (Adapters) records how each was measured. Nothing else may be imported this way.
 import datetime as _datetime
 import errno as _errno
 import fnmatch as _fnmatch
 import functools as _functools
 import gzip as _gzip
 import hashlib as _hashlib
+import io as _io
 import json as _json
 import math as _math
 import os as _os
@@ -14,13 +15,17 @@ import pathlib as _pathlib
 import re as _re
 import secrets as _secrets
 import stat as _stat
+import time as _time
+import typing as _typing
 import unicodedata as _unicodedata
 import zlib as _zlib
 
 from __RUNTIME__ import (
     _JS_UNDEFINED,
+    _js_lifted,
     _js_m_toLowerCase,
     _js_num,
+    _js_py_round_float9,
     _js_truthy,
     _JsBigInt,
     _JsError,
@@ -30,18 +35,74 @@ from __RUNTIME__ import (
     _JsTypeError,
 )
 
-# `BantamError` (and J88-2's `LOCK_*_MS`; J89-4a's `PyScalar`, `VALID_OUTCOMES`, `INDEX_DIR_ENV`;
-# J89-5's `DUPLICATE`)
+# J90-P8F: the CPython 3.12 answers the Node port reproduces, on 3.13 and 3.14 too
+# (`bantamkit/stdlib312.py` names each change). Looked up on first use, as the other bantamkit
+# names here are. Inside the package it is always there. A module compiled OUTSIDE it (the host
+# crate's tests, `--suite ts2py-codec`) loads the file from wherever `bantamkit` is on the path,
+# without importing the package; with no bantamkit anywhere it gets `_LiveLibrary`, the
+# interpreter's own answers, which is what every adapter asked before J90-P8F.
+_STDLIB312 = None
+
+
+class _LiveLibrary:
+    """The standard library's own answers, under the names `stdlib312` gives its 3.12 pins."""
+
+    path_exists = staticmethod(lambda path: _pathlib.Path(path).exists())
+    path_is_dir = staticmethod(lambda path: _pathlib.Path(path).is_dir())
+    path_is_file = staticmethod(lambda path: _pathlib.Path(path).is_file())
+    path_resolve = staticmethod(lambda path, strict=False: _pathlib.Path(path).resolve(strict))
+    path_suffix = staticmethod(lambda path: _pathlib.PurePath(path).suffix)
+    win_is_absolute = staticmethod(lambda path: _pathlib.PureWindowsPath(path).is_absolute())
+    json_loads = staticmethod(_json.loads)
+    pin_datetime_error = staticmethod(lambda error: error)
+
+
+def _stdlib312_by_path():
+    """`bantamkit/stdlib312.py` from wherever `bantamkit` would be imported from, loaded as a module
+    of its own: the package's `__init__` (and its dependencies) never runs. `None` if not found."""
+    import importlib.machinery
+    import importlib.util
+
+    spec = importlib.machinery.PathFinder.find_spec("bantamkit")
+    for directory in (spec.submodule_search_locations or []) if spec is not None else []:
+        source = _os.path.join(directory, "stdlib312.py")
+        if _os.path.isfile(source):
+            found = importlib.util.spec_from_file_location("_bantamkit_stdlib312", source)
+            module = importlib.util.module_from_spec(found)
+            found.loader.exec_module(module)
+            return module
+    return None
+
+
+def _stdlib312():
+    global _STDLIB312
+    if _STDLIB312 is None:
+        try:
+            from .. import stdlib312 as module
+        except ImportError:
+            module = _stdlib312_by_path() or _LiveLibrary
+        _STDLIB312 = module
+    return _STDLIB312
+
+# J90-P7 (#316 G4): mypyc reads this module (it is never compiled) to know the base of a compiled
+# `class E extends BantamError`. A base it cannot see is `Any`, and mypyc then builds the class on
+# `object` alone, silently; this declaration, which only a type checker reads, names the class
+# `__getattr__` builds.
+if _typing.TYPE_CHECKING:
+
+    class BantamError(_JsError):
+        pass
+
+
+# `BantamError` (and J89-4a's `PyScalar`, `VALID_OUTCOMES`; J90-2 retired the lock's and the hot
+# index's constants, now compiled)
 # are provided lazily by `__getattr__` below and are not listed, so a star import does not build
 # them (and import `bantamkit.client` / `storage.lock` / the codec / the hot index).
 __all__ = [
-    "ColdIndex",
-    "ColdIndexError",
     "BigIntStats",
     "CountsView",
     "Date",
     "Hash",
-    "HotIndex",
     "PyOSError",
     "PyUnicodeDecodeError",
     "Stats",
@@ -55,23 +116,29 @@ __all__ = [
     "buffer_concat",
     "buffer_from",
     "close_sync",
+    "coldFs",
+    "cold_error_text",
+    "dump_js_value",
     "dump_json",
     "encode_basestring_ascii",
+    "extract_refs",
     "cmp_codepoint",
     "create_hash",
     "ensure_bantamkit_gitignore",
-    "exclusive",
     "exists_sync",
     "extra_of",
+    "fact_refs",
     "format_fact",
     "fstat_sync",
     "gunzip_sync",
     "gzip_sync",
+    "hash_hex",
     "homedir",
     "lifecycle_of",
     "link_sync",
     "lstat_sync",
     "matches_md",
+    "node_realpath",
     "mkdir_sync",
     "open_sync",
     "os_error_class_name",
@@ -81,6 +148,7 @@ __all__ = [
     "path_basename",
     "path_dirname",
     "path_join",
+    "performance_now",
     "process_env",
     "process_env_all",
     "process_pid",
@@ -125,7 +193,16 @@ __all__ = [
     "readdir_sync",
     "rename_sync",
     "rm_sync",
-    "sha16",
+    "rmdir_sync",
+    "retentionFs",
+    "spawn_retention_child",
+    "touch_reducer",
+    "native_memory_dir",
+    "has_bantamkit_hooks",
+    "process_cwd",
+    "unlink_sync",
+    "path_relative",
+    "PATH_SEP",
     "sorted_path_names",
     "stat_sync",
     "today_local",
@@ -377,6 +454,17 @@ def _normalize_string(path, allow_above_root, separator, is_separator):
     return res
 
 
+def _posix_normalized(path, allow_above_root):
+    """`normalizeString(path, allowAboveRoot, '/', isPosixPathSeparator)`. J90-P: a path with no
+    `.` or `..` segment is its non-empty segments joined by one `/` (`normalizeString` skips an
+    empty segment and keeps every other one as it is; only `.` and `..` do anything else), in C;
+    any other path through the port."""
+    segments = path.split("/")
+    if "." not in segments and ".." not in segments:
+        return "/".join(filter(None, segments))
+    return _normalize_string(path, allow_above_root, "/", lambda c: c == "/")
+
+
 def _posix_join(parts):
     """`path.posix.join` (lib/path.js): the non-empty parts joined by `/`, then normalised."""
     joined = "/".join(part for part in parts if part)
@@ -384,7 +472,7 @@ def _posix_join(parts):
         return "."
     absolute = joined[0] == "/"
     trailing = joined[-1] == "/"
-    joined = _normalize_string(joined, not absolute, "/", lambda c: c == "/")
+    joined = _posix_normalized(joined, not absolute)
     if not joined:
         return "/" if absolute else ("./" if trailing else ".")
     if trailing:
@@ -498,6 +586,15 @@ def path_join(*parts):
     on POSIX, `path.win32` on Windows (where it raises outside the colon and device-name subset)."""
     for part in parts:
         if not isinstance(part, str):
+            if part is _JS_UNDEFINED or part is None:
+                # J90-3: Node's `validateString` refusal, a TypeError a compiled `catch` sees
+                # (`retention.ts` joins a cold-index doc's `file`, which may be missing).
+                error = _JsTypeError(
+                    'The "path" argument must be of type string. Received '
+                    + ("undefined" if part is _JS_UNDEFINED else "null")
+                )
+                error.code = "ERR_INVALID_ARG_TYPE"
+                raise error
             raise TypeError("ts2py: path.join of anything but strings is outside the subset")
     if _os.name == "nt":
         return _win32_join(list(parts))
@@ -535,25 +632,29 @@ def _node_path(path, what):
         error = _JsTypeError("The argument 'path' must be a string without null bytes")
         error.code = "ERR_INVALID_ARG_VALUE"
         raise error
-    if not path.isascii() and any(0xD800 <= ord(c) <= 0xDFFF for c in path):
-        path = "".join(_os_char(c) if 0xD800 <= ord(c) <= 0xDFFF else c for c in path)
-    return path
+    return _os_text(path)
 
 
 class Stats(_JsObject):
     """`fs.Stats` from `statSync`/`lstatSync`/`fstatSync`: `size`, `mtimeMs` (libuv's seconds and
-    nanoseconds as Node combines them, `sec * 1e3 + nsec / 1e6`), and the type tests. On Windows a
+    nanoseconds as Node combines them, `sec * 1e3 + nsec / 1e6`), `ino` (J90-P4: libuv's `st_ino`
+    as a double, which the hot index's held-head check reads), and the type tests. On Windows a
     junction is a symbolic link to `lstat`, as libuv reports one."""
 
     _js_name = "Stats"
-    _js_own = frozenset({"size", "mtimeMs", "isDirectory", "isFile", "isSymbolicLink"})
+    _js_own = frozenset({"size", "mtimeMs", "ino", "isDirectory", "isFile", "isSymbolicLink"})
     _js_own_methods = frozenset({"isDirectory", "isFile", "isSymbolicLink"})
 
     def __init__(self, st, *_):
-        object.__setattr__(self, "_js_st", st)
-        self.size = st.st_size
         ns = st.st_mtime_ns
-        self.mtimeMs = (ns // 1_000_000_000) * 1e3 + (ns % 1_000_000_000) / 1e6
+        # J90-P4: the fields set at once (the instance is not frozen yet, so `__setattr__`'s test
+        # has nothing to refuse).
+        self.__dict__.update(
+            _js_st=st,
+            size=st.st_size,
+            mtimeMs=(ns // 1_000_000_000) * 1e3 + (ns % 1_000_000_000) / 1e6,
+            ino=_js_num(st.st_ino),
+        )
 
     def isDirectory(self, *_):
         return _stat.S_ISDIR(self._js_st.st_mode)
@@ -575,16 +676,23 @@ class Stats(_JsObject):
 class BigIntStats(Stats):
     """`fs.Stats` from `statSync(path, {bigint: true})` (J89-4a): `size`, `mtimeMs` and `mtimeNs`
     as BigInts (`mtimeNs` is libuv's `sec * 1e9 + nsec` exactly, which `st_mtime_ns` is;
-    `mtimeMs` that floored to milliseconds), and the same type tests."""
+    `mtimeMs` that floored to milliseconds; J90-P4: `ino`, `st_ino` exactly), and the same type
+    tests."""
 
     _js_name = "BigIntStats"
-    _js_own = frozenset({"size", "mtimeMs", "mtimeNs", "isDirectory", "isFile", "isSymbolicLink"})
+    _js_own = frozenset(
+        {"size", "mtimeMs", "mtimeNs", "ino", "isDirectory", "isFile", "isSymbolicLink"}
+    )
 
     def __init__(self, st, *_):
-        object.__setattr__(self, "_js_st", st)
-        self.size = _JsBigInt(st.st_size)
-        self.mtimeNs = _JsBigInt(st.st_mtime_ns)
-        self.mtimeMs = _JsBigInt(st.st_mtime_ns // 1_000_000)
+        # J90-P7B: the five fields stored one by one (no keyword dict built per stat).
+        ns = st.st_mtime_ns
+        fields = self.__dict__
+        fields["_js_st"] = st
+        fields["size"] = _JsBigInt(st.st_size)
+        fields["mtimeNs"] = _JsBigInt(ns)
+        fields["mtimeMs"] = _JsBigInt(ns // 1_000_000)
+        fields["ino"] = _JsBigInt(st.st_ino)
 
 
 def stat_sync(path, *rest):
@@ -593,7 +701,9 @@ def stat_sync(path, *rest):
     bigint = False
     if rest:
         options = rest[0]
-        if len(rest) > 1 or not isinstance(options, dict) or set(options) != {"bigint"}:
+        # J90-P7B: "exactly the key `bigint`" without a set built per call.
+        only = len(rest) == 1 and isinstance(options, dict) and len(options) == 1
+        if not (only and "bigint" in options):
             raise TypeError("ts2py: fs.statSync options other than bigint are outside the subset")
         bigint = _js_truthy(options["bigint"])
     st = _os.stat(_node_path(path, "fs.statSync"))
@@ -601,10 +711,42 @@ def stat_sync(path, *rest):
 
 
 def lstat_sync(path, *rest):
-    """`fs.lstatSync(path)`: `os.lstat`; a failure is CPython's OSError."""
+    """`fs.lstatSync(path)`: `os.lstat`; a failure is CPython's OSError. J90-3: `{bigint: true}`
+    (or `false`) as the one option, the BigInt fields (`BigIntStats`), as `statSync` takes it."""
+    bigint = False
     if rest:
-        raise TypeError("ts2py: fs.lstatSync options are outside the subset")
-    return Stats(_os.lstat(_node_path(path, "fs.lstatSync")))
+        options = rest[0]
+        # J90-P7B: "exactly the key `bigint`" without a set built per call.
+        only = len(rest) == 1 and isinstance(options, dict) and len(options) == 1
+        if not (only and "bigint" in options):
+            raise TypeError("ts2py: fs.lstatSync options other than bigint are outside the subset")
+        bigint = _js_truthy(options["bigint"])
+    st = _os.lstat(_node_path(path, "fs.lstatSync"))
+    return BigIntStats(st) if bigint else Stats(st)
+
+
+def stat_stamp(path, *_):
+    """`statStamp` (runtime-ts/src/storage/statstamp.ts, J90-PF): `${mtimeNs}:${size}:${ino}` of
+    `statSync(path, {bigint: true})`, the decimals of the three integers `BigIntStats` holds, from
+    the same `os.stat` without building it. The path and the failure are `stat_sync`'s."""
+    st = _os.stat(_node_path(path, "fs.statSync"))
+    return f"{st.st_mtime_ns}:{st.st_size}:{st.st_ino}"
+
+
+def stat_mtime_ns(path, *_):
+    """`statMtimeNs` (runtime-ts/src/storage/statstamp.ts, J90-PF): `statSync(path, {bigint:
+    true}).mtimeNs.toString()`, the decimal of `st_mtime_ns`. The path and the failure are
+    `stat_sync`'s."""
+    return str(_os.stat(_node_path(path, "fs.statSync")).st_mtime_ns)
+
+
+def stat_file(path, *_):
+    """`statFile` (runtime-ts/src/storage/statstamp.ts, J90-PF): `[mtimeNs.toString(),
+    Number(size), isFile()]` of `statSync(path, {bigint: true})`: the decimal of `st_mtime_ns`, the
+    size as the number `Number` makes of its BigInt (`_js_num`: an int up to 2^53, else the nearest
+    double) and `BigIntStats.isFile`'s answer. The path and the failure are `stat_sync`'s."""
+    st = _os.stat(_node_path(path, "fs.statSync"))
+    return [str(st.st_mtime_ns), _js_num(st.st_size), _stat.S_ISREG(st.st_mode)]
 
 
 def fstat_sync(fd, *rest):
@@ -621,6 +763,12 @@ def readdir_sync(path, *rest):
     if rest:
         raise TypeError("ts2py: fs.readdirSync options are outside the subset")
     path = _node_path(path, "fs.readdirSync")
+    # J90-P4: a listing of ASCII names only is the same list whichever way it is decoded (an
+    # ASCII byte is itself under UTF-8 with "replace" and under the filesystem encoding), so it is
+    # returned as `os.listdir` gives it; any other is listed again and decoded below.
+    names = _os.listdir(path)
+    if "".join(names).isascii():
+        return names
     if _os.name == "nt":
         # A NAME comes back as Node reports it: every lone surrogate U+FFFD (only a path handed
         # IN keeps what Python's `os` can encode, J88-RF F4b).
@@ -768,7 +916,13 @@ def read_file_bytes(path):
 
 
 def _posix_dirname(path):
-    """`path.posix.dirname` (lib/path.js), statement for statement."""
+    """`path.posix.dirname` (lib/path.js), statement for statement. J90-P7B: a path that does not
+    end in `/` and whose last `/` is past its second unit is everything before that `/` (the loop
+    stops there, at its first slash after a non-slash), found in C."""
+    if path and path[-1] != "/":
+        cut = path.rfind("/")
+        if cut > 1:
+            return path[:cut]
     if not path:
         return "."
     has_root = path[0] == "/"
@@ -789,7 +943,11 @@ def _posix_dirname(path):
 
 
 def _posix_basename(path):
-    """`path.posix.basename` (lib/path.js) with no suffix argument."""
+    """`path.posix.basename` (lib/path.js) with no suffix argument. J90-P7B: a path that does not
+    end in `/` is everything after its last `/` (the loop's `end` is its length, `start` one past
+    that slash), found in C."""
+    if path and path[-1] != "/":
+        return path[path.rfind("/") + 1 :]
     start = 0
     end = -1
     matched_slash = True
@@ -974,13 +1132,15 @@ def process_pid():
 
 
 def py_exists(path):
-    """`pyExists` (runtime-ts/src/memory/pyfs.ts): `Path.exists()`, which it ports."""
-    return _pathlib.Path(path).exists()
+    """`pyExists` (runtime-ts/src/memory/pyfs.ts): `Path.exists()`, which it ports — 3.12's, whose
+    EACCES raises (3.14 answers `False`; `stdlib312.path_exists`)."""
+    return _stdlib312().path_exists(_pathlib.Path(path))
 
 
 def py_is_dir(path):
-    """`pyIsDir` (runtime-ts/src/memory/pyfs.ts): `Path.is_dir()`, which it ports."""
-    return _pathlib.Path(path).is_dir()
+    """`pyIsDir` (runtime-ts/src/memory/pyfs.ts): `Path.is_dir()`, which it ports — 3.12's
+    (`stdlib312.path_is_dir`)."""
+    return _stdlib312().path_is_dir(_pathlib.Path(path))
 
 
 @_functools.lru_cache(maxsize=8192)
@@ -1055,40 +1215,13 @@ def ensure_bantamkit_gitignore(directory, created, *_):
     return _JS_UNDEFINED
 
 
-def _lock_constant(name):
-    from ..storage import lock as _lock
-
-    return getattr(_lock, name)
-
-
-def exclusive(target, body, options=_JS_UNDEFINED, *_):
-    """`exclusive(target, body, options)` (runtime-ts/src/storage/lock.ts): the hand-written Python
-    lock it ports (`bantamkit.storage.lock.exclusive`, #316 G4 not generated yet; `--suite
-    storage-lock` compares the two), with `body(held)` run inside it and its answer returned. An
-    option left out takes the lock's default, as `?? LOCK_*_MS` does."""
-    from ..storage.lock import exclusive as _exclusive
-
-    kwargs = {}
-    if options is not _JS_UNDEFINED and options is not None:
-        if not isinstance(options, dict) or set(options) - {"waitMs", "staleMs", "pollMs"}:
-            raise TypeError(
-                "ts2py: lock options other than waitMs/staleMs/pollMs are outside the subset"
-            )
-        for js, py in (("waitMs", "wait_ms"), ("staleMs", "stale_ms"), ("pollMs", "poll_ms")):
-            value = options.get(js, _JS_UNDEFINED)
-            if value is not _JS_UNDEFINED and value is not None:
-                kwargs[py] = value
-    # J88-RF F4a: the lock file is named from the path every fs adapter hands the OS.
-    with _exclusive(_node_path(target, "exclusive"), **kwargs) as held:
-        return body(held)
-
-
 # ---------------------------------------------------------------- J89-2 (#316 G3): usage, retrieval
 
 
-def py_round_float9(x, *_):
-    """`pyRoundFloat9` (runtime-ts/src/pysem.ts): CPython's `round(x, 9)`, which it ports."""
-    return round(x if type(x) is float else _js_num(x), 9)
+# `pyRoundFloat9` (runtime-ts/src/pysem.ts), CPython's `round(x, 9)`: moved to the runtime as
+# `_js_py_round_float9`, unchanged (#316 G4, J90-P7B), so a compiled build compiles it (a recall
+# rounds every score: 10,000 calls at 5,000 facts, each a call into this interpreted module).
+py_round_float9 = _js_py_round_float9
 
 
 def py_log(x, *_):
@@ -1127,10 +1260,16 @@ def py_wordchar(ch, *_):
 
 
 def _os_text(text):
-    """`text` with each lone surrogate as the OS receives it (`_os_char`)."""
+    """`text` with each lone surrogate as the OS receives it (`_os_char`). J90-P5: a text the strict
+    UTF-8 codec encodes holds no surrogate code point (it refuses exactly those), so it is its own
+    answer, found at C speed."""
     if text.isascii():
         return text
-    return "".join(_os_char(c) if 0xD800 <= ord(c) <= 0xDFFF else c for c in text)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return "".join(_os_char(c) if 0xD800 <= ord(c) <= 0xDFFF else c for c in text)
+    return text
 
 
 def py_realpath(path, *_):
@@ -1176,7 +1315,7 @@ class Hash(_JsObject):
             )
         # Node's UTF-8, a lone surrogate as U+FFFD, under the G2 path policy (`_os_char`): a POSIX
         # surrogateescape code point is the real byte it stands for.
-        self._live().update(_os_text(data).encode("utf-8", "surrogateescape"))
+        self._live().update(_hash_bytes(data))
         return self
 
     def digest(self, encoding=_JS_UNDEFINED, *_):
@@ -1185,6 +1324,28 @@ class Hash(_JsObject):
         out = self._live().hexdigest()
         object.__setattr__(self, "_js_hash", None)
         return out
+
+
+def _hash_bytes(text):
+    """The bytes `Hash.update(text, 'utf8')` hashes: `_os_text(text)` as UTF-8 with
+    surrogateescape. J90-P5: a string with no surrogate code point is its own `_os_text` (only a
+    surrogate is changed there), and its strict UTF-8 is what surrogateescape writes, so strict
+    `encode()` answers it at C speed; the strict codec refuses exactly the surrogates, which take
+    the per-character path."""
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError:
+        return _os_text(text).encode("utf-8", "surrogateescape")
+
+
+def hash_hex(algorithm, data):
+    """J90-P2: `createHash(algorithm).update(data, 'utf8').digest('hex')` in one call (ts2py
+    lowers that chain, `algorithm` a literal `'sha256'` or `'sha1'`, to it): a `str` is hashed as
+    its bytes at once (J90-P5: any `str`, through `_hash_bytes`, not only an ASCII one); anything
+    else is the three calls, with their refusals."""
+    if type(data) is str:
+        return _HASHES[algorithm](_hash_bytes(data)).hexdigest()
+    return Hash(algorithm).update(data, "utf8").digest("hex")
 
 
 def create_hash(algorithm, *_):
@@ -1234,11 +1395,6 @@ def __getattr__(name):
         from .pyyaml import PyScalar as value
     elif name == "VALID_OUTCOMES":
         from .factfile import VALID_OUTCOMES as value
-    elif name == "INDEX_DIR_ENV":
-        from ..storage.hotindex import INDEX_DIR_ENV as value
-    elif name == "DUPLICATE":
-        # J89-5: the native layer's duplicate-name sentence head.
-        from ..storage.hotindex import DUPLICATE as value
     elif name == "SKILL_LAYER":
         # J89-6: the skill layer's label, and the two recall-file sentences component.ts says.
         from ..memory.skills import SKILL_LAYER as value
@@ -1249,11 +1405,6 @@ def __getattr__(name):
     else:
         value = None
     if value is not None:
-        globals()[name] = value
-        return value
-    # J88-2: `storage/lock.ts`'s constants, read from the hand-written lock on first import.
-    if name in ("LOCK_POLL_MS", "LOCK_STALE_MS", "LOCK_WAIT_MS"):
-        value = _lock_constant(name)
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -1326,33 +1477,15 @@ class _JsReadMap(_JsMap):
     __slots__ = ()
 
     def __init__(self, data):
-        object.__setattr__(self, "_entries", _DictEntries(data))
+        # J90-P: a dict with string keys is already a Map's entries (each key its own tag).
+        object.__setattr__(self, "_entries", data)
+        object.__setattr__(self, "_keys", None)
 
     def set(self, key, value):
         raise TypeError("ts2py: writing a Map an index adapter answered is outside the subset")
 
-
-class _DictEntries:
-    # `_JsMap._entries`' face over a dict: a string key is its own `_js_key`; any other key (a
-    # number, a bool) can equal none of the dict's string keys, as in a JS Map of string keys.
-    __slots__ = ("_data",)
-
-    def __init__(self, data):
-        self._data = data
-
-    def __contains__(self, tag):
-        return isinstance(tag, str) and tag in self._data
-
-    def get(self, tag, default=None):
-        if isinstance(tag, str) and tag in self._data:
-            return (tag, self._data[tag])
-        return default
-
-    def values(self):
-        return [(key, value) for key, value in self._data.items()]
-
-    def __len__(self):
-        return len(self._data)
+    def delete(self, key):
+        raise TypeError("ts2py: writing a Map an index adapter answered is outside the subset")
 
 
 def _native_bantam_error(error):
@@ -1367,112 +1500,53 @@ def _native_bantam_error(error):
     return cls(str(error))
 
 
-class HotIndex(_JsObject):
-    """`HotIndex` (runtime-ts/src/storage/hotindex.ts): `bantamkit.storage.hotindex.HotIndex`,
-    which it ports (#204), with the TypeScript spelling of the methods store.ts calls. Imported
-    when the first one is built (late-bound: the hand-written index imports the store lazily)."""
+def _native_meta(front):
+    """J90-2: the reference's `hotindex._secondary` read of a native frontmatter
+    (`load_frontmatter`, `{}` where it refuses or reads no mapping), as values the compiled index
+    reads the way the reference read the Python ones: a mapping a dict (its text keys), a list a
+    list, a string or None itself, and any other scalar opaque (`factcodec._Opaque`: not a
+    string to `strList`, its `str()` to `pyText`, as `[str(x) for x in links]` and `_str_list`
+    read them)."""
+    import yaml
 
-    _js_name = "HotIndex"
-    _js_own = frozenset(
-        {
-            "cols",
-            "exists",
-            "fileOf",
-            "invalidate",
-            "lensTotal",
-            "loose",
-            "names",
-            "parseFile",
-            "refresh",
-            "segments",
-            "skipped",
-        }
-    )
-    _js_own_methods = frozenset(
-        {
-            "cols",
-            "exists",
-            "fileOf",
-            "invalidate",
-            "lensTotal",
-            "names",
-            "parseFile",
-            "refresh",
-            "segments",
-        }
-    )
+    from ..memory.factcodec import _Opaque, load_frontmatter
 
-    def __init__(self, source, kind, home, index_dir=None, *_):
-        from ..storage.hotindex import HotIndex as _Hot
+    def held(value):
+        if value is None or type(value) is str:
+            return value
+        if type(value) is list:
+            return [held(item) for item in value]
+        if type(value) is dict:
+            return {key: held(item) for key, item in value.items() if type(key) is str}
+        return _Opaque(value)
 
-        if index_dir is _JS_UNDEFINED:
-            index_dir = None
-        if isinstance(source, str):
-            # J89-4b: the store's root as the store's file calls hand it to the OS (`_store_path`).
-            source = _os_text(source)
-        object.__setattr__(self, "_js_hot", _Hot(source, kind, home, index_dir=index_dir))
+    try:
+        meta = load_frontmatter(front)
+    except (ValueError, yaml.YAMLError):
+        return {}
+    return held(meta) if isinstance(meta, dict) else {}
 
-    @classmethod
-    def _of(cls, hot):
-        """J89-4b: this adapter over a hand-written `HotIndex` already built (a caller that hands a
-        store its own index, as `tools/conformance/ref/storage_ref.py` does)."""
-        adapter = cls.__new__(cls)
-        object.__setattr__(adapter, "_js_hot", hot)
-        return adapter
 
-    def _call(self, method, *args):
-        from ..client import BantamError as _Native
-
-        try:
-            return getattr(self._js_hot, method)(*args)
-        except _Native as error:
-            raise _native_bantam_error(error) from None
-
-    def cols(self, *_):
-        return self._call("cols")
-
-    def exists(self, *_):
-        return self._call("exists")
-
-    def fileOf(self, name, *_):
-        return self._call("file_of", name)
-
-    def invalidate(self, *_):
-        self._call("invalidate")
-        return _JS_UNDEFINED
-
-    def lensTotal(self, *_):
-        return self._call("lens_total")
-
-    def names(self, *_):
-        # `Map<name, doc id>`: the dict `names()` is the key view of.
-        self._call("names")
-        return _JsReadMap(self._js_hot._ids())
-
-    def parseFile(self, path, mtime_ns, size, *_):
-        doc, reason = self._call("parse_file", path, mtime_ns, size)
-        return reason if doc is None else doc
-
-    def refresh(self, mode="fast", *_):
-        return self._call("refresh", "fast" if mode is _JS_UNDEFINED else mode)
-
-    def segments(self, terms, *_):
-        return _JsReadMap(self._call("segments", list(terms)))
-
-    @property
-    def skipped(self):
-        return _JsReadMap(self._call("__getattribute__", "skipped"))
-
-    @property
-    def loose(self):
-        return self._call("__getattribute__", "loose")
+# J90-2: `hotindex.ts`'s NATIVE_EXTRA_LINE, the `m` flag spelled out (JS's four line terminators).
+_NATIVE_EXTRA_LINE = _re.compile("(?:^|[\n\r\u2028\u2029])[ \t]*(?:tags|links):")
 
 
 def parse_native(path, *_):
-    """`parseNative` (runtime-ts/src/storage/hotindex.ts): `divergence.parse_fact`, which it ports
-    for the native shape (J89-5). The name, description, type and body it read, as the object the
-    TypeScript returns; its `MemoryValidationError` (a `bantamkit.client.BantamError`) restated as
-    the adapter's `BantamError` with the same message."""
+    """`parseNative` (runtime-ts/src/storage/nativefact.ts): `divergence.parse_fact`, which it ports
+    for the native shape (J89-5; kept by the #228 ruling). The name, description, type and body it
+    read, as the object the TypeScript returns; its `MemoryValidationError` (a
+    `bantamkit.client.BantamError`) restated as the adapter's `BantamError` with the same message.
+
+    J90-2: and `meta`, which the generated hot index reads a native file's `links` / `tags` from
+    when the frontmatter names one of them (`NATIVE_EXTRA_LINE`): what the reference's index read
+    them with (`hotindex._secondary`: `load_frontmatter` of the same frontmatter, `_native_meta`),
+    `{}` where that refuses. A frontmatter naming neither key is not read twice: its `meta` is
+    `{}`, which nothing reads.
+
+    J90-PF: and `front`, the frontmatter's text (the second of `split("---\\n", 2)`'s three parts
+    of the file read as `pyReadText` reads it, `""` without them), which the hot index tests for
+    `NATIVE_EXTRA_LINE` instead of reading the file a third time; the TypeScript returns the text
+    it parsed."""
     from ..client import BantamError as _Native
     from ..memory.divergence import parse_fact
 
@@ -1482,63 +1556,22 @@ def parse_native(path, *_):
         stored = parse_fact(path)
     except _Native as error:
         raise _native_bantam_error(error) from None
+    meta = {}
+    try:
+        parts = _pathlib.Path(path).read_text(encoding="utf-8").split("---\n", 2)
+    except (OSError, ValueError):
+        parts = []
+    front = parts[1] if len(parts) == 3 else ""
+    if _NATIVE_EXTRA_LINE.search(front):
+        meta = _native_meta(front)
     return {
         "name": stored.name,
         "description": stored.description,
         "type": stored.type,
         "body": stored.body,
+        "meta": meta,
+        "front": front,
     }
-
-
-class ColdIndexError(_JsError):
-    """`ColdIndexError` (runtime-ts/src/storage/coldindex.ts): the Python
-    `bantamkit.storage.coldindex.ColdIndexError`'s message as a JS Error."""
-
-    _js_name = "ColdIndexError"
-    name = "ColdIndexError"
-
-
-class ColdIndex(_JsObject):
-    """`ColdIndex` (runtime-ts/src/storage/coldindex.ts): `bantamkit.storage.coldindex.ColdIndex`,
-    which it ports (#204), with the TypeScript spelling of the methods store.ts calls; a Python
-    `ColdIndexError` is the adapter's `ColdIndexError`."""
-
-    _js_name = "ColdIndex"
-    _js_own = frozenset({"add", "allDocs", "doc", "query", "reset"})
-    _js_own_methods = frozenset({"add", "allDocs", "doc", "query", "reset"})
-
-    def __init__(self, name, home, cold_dir=None, *_):
-        from ..storage.coldindex import ColdIndex as _Cold
-
-        if cold_dir is _JS_UNDEFINED:
-            cold_dir = None
-        object.__setattr__(self, "_js_cold", _Cold(name, home, cold_dir))
-
-    def _call(self, method, *args):
-        from ..storage.coldindex import ColdIndexError as _Native
-
-        try:
-            return getattr(self._js_cold, method)(*args)
-        except _Native as error:
-            raise ColdIndexError(str(error)) from None
-
-    def add(self, docs, *_):
-        if not isinstance(docs, _JsMap):
-            raise TypeError("ts2py: ColdIndex.add of anything but a Map is outside the subset")
-        return self._call("add", {key: value for key, value in docs})
-
-    def allDocs(self, *_):
-        return self._call("all_docs")
-
-    def doc(self, name, *_):
-        return self._call("doc", name)
-
-    def query(self, terms, *_):
-        return [list(row) for row in self._call("query", list(terms))]
-
-    def reset(self, *_):
-        self._call("reset")
-        return _JS_UNDEFINED
 
 
 _FACTFILE = []
@@ -1730,11 +1763,34 @@ class PyUnicodeDecodeError(_JsError):
 
 def py_read_text(path, *_):
     """`pyReadText` (pyfs.ts): `Path.read_text(encoding='utf-8')`, which it ports; a decode failure
-    is `PyUnicodeDecodeError` with CPython's message."""
+    is `PyUnicodeDecodeError` with CPython's message. J90-P7B: a POSIX path `PurePath` leaves as it
+    is (`_pure_as_is`) is opened as `read_text` opens it, `io.open(path, encoding='utf-8')`, without
+    building the `Path`."""
     try:
-        return _pathlib.Path(_store_path(path, "pyReadText")).read_text(encoding="utf-8")
+        path = _store_path(path, "pyReadText")
+        if _pure_as_is(path):
+            # `io.open`, as `Path.open` calls it: a spy on `builtins.open` sees no more than before.
+            with _io.open(path, encoding="utf-8") as handle:  # noqa: UP020
+                return handle.read()
+        return _pathlib.Path(path).read_text(encoding="utf-8")
     except UnicodeDecodeError as error:
         raise PyUnicodeDecodeError(str(error)) from None
+
+
+def _pure_as_is(path):
+    """`str(PurePath(path)) == path`, by a sufficient test (J90-P7B): POSIX, not empty, and no part
+    `PurePosixPath` rewrites (a doubled `/`, a `.` part, a trailing `/`). Any other path is False,
+    and goes through `Path`."""
+    return (
+        _os.name != "nt"
+        and path != ""
+        and path != "."
+        and path[-1] != "/"
+        and "//" not in path
+        and "/./" not in path
+        and not path.startswith("./")
+        and not path.endswith("/.")
+    )
 
 
 def py_replace(source, target, *_):
@@ -1757,8 +1813,9 @@ def py_scandir_probe(directory, *_):
 
 
 def py_suffix(path, *_):
-    """`pySuffix` (pyfs.ts): `PurePath.suffix`."""
-    return _pathlib.PurePath(path).suffix
+    """`pySuffix` (pyfs.ts): `PurePath.suffix` — 3.12's, where `'a.'` has none
+    (`stdlib312.path_suffix`)."""
+    return _stdlib312().path_suffix(path)
 
 
 def py_unlink(path, *_):
@@ -1818,14 +1875,6 @@ def sorted_path_names(names, *_):
 # ---------------------------------------------------------------- J89-5a (#316 G3 U3): queries
 
 
-def sha16(path, *_):
-    """`sha16` (runtime-ts/src/storage/hotindex.ts): `bantamkit.storage.hotindex.sha16`, which it
-    ports: the first 16 hex characters of sha256 over the realpath's UTF-8."""
-    from ..storage.hotindex import sha16 as reference
-
-    return reference(path)
-
-
 class PyJSONDecodeError(_JsError):
     """`PyJSONDecodeError` (runtime-ts/src/pyjson.ts): CPython's `json.JSONDecodeError` as a JS
     Error, its message `str()` of the one CPython raised."""
@@ -1843,7 +1892,7 @@ class _TaggedDict:
 def _tagged_close(into, at):
     keys, values = into[at]
     held = _JsMap()
-    held._entries = {k: (k, v) for k, v in zip(keys, values, strict=True)}
+    held._entries = dict(zip(keys, values, strict=True))
     into[at] = {"t": "dict", "v": held}
 
 
@@ -1920,7 +1969,7 @@ def _json_too_deep(text):
     # The opener at `cut` is reached exactly when the text before it is a well-formed prefix that
     # wants a value there: `json.loads` of that prefix stops at its end with `Expecting value`.
     try:
-        _json.loads(text[:cut])
+        _stdlib312().json_loads(text[:cut])
     except _json.JSONDecodeError as error:
         return error.msg == "Expecting value" and error.pos == cut
     except RecursionError:
@@ -1946,7 +1995,7 @@ def parse_json(text, *_):
     if _json_too_deep(text):
         raise _JsRangeError("Maximum call stack size exceeded")
     try:
-        value = _json.loads(text)
+        value = _stdlib312().json_loads(text)
     except RecursionError:
         raise _JsRangeError("Maximum call stack size exceeded") from None
     except ValueError as error:
@@ -2105,8 +2154,9 @@ def _grant_config_load(text):
     except ValueError as e:
         # J89-5d: a scalar PyYAML resolves but cannot construct (an implicit timestamp such as
         # `2001-02-30` or `25:00:00`, an int past CPython's 4,300-digit limit) is refused with
-        # CPython's own reason, as a `yaml.YAMLError` is.
-        error = _GrantConfigUnreadable(str(e))
+        # CPython's own reason, as a `yaml.YAMLError` is -- 3.12's, which the port spells (J90-P8F:
+        # 3.14 rewrote the timestamp sentences, gh-109798; `stdlib312.pin_datetime_error`).
+        error = _GrantConfigUnreadable(str(_stdlib312().pin_datetime_error(e)))
     _GRANT_CONFIG[:] = [(text, value, error)]
     return value, error
 
@@ -2168,13 +2218,14 @@ def parse_config_document(text, *_):
 
 
 def py_is_file(path, *_):
-    """`pyIsFile` (pyfs.ts): `Path.is_file()`, which it ports."""
-    return _pathlib.Path(path).is_file()
+    """`pyIsFile` (pyfs.ts): `Path.is_file()`, which it ports — 3.12's (`stdlib312.path_is_file`)."""
+    return _stdlib312().path_is_file(_pathlib.Path(path))
 
 
 def py_resolve(path, *_):
-    """`pyResolve` (pyfs.ts): `str(Path(path).resolve())`, which it ports (`strict=False`)."""
-    return str(_pathlib.Path(path).resolve())
+    """`pyResolve` (pyfs.ts): `str(Path(path).resolve())`, which it ports (`strict=False`) — 3.12's,
+    whose symlink loop raises `RuntimeError` (`stdlib312.path_resolve`)."""
+    return str(_stdlib312().path_resolve(path))
 
 
 def py_stat_is_dir(path, *_):
@@ -2193,7 +2244,10 @@ def py_expanduser(path, *_):
 
 
 def py_is_absolute(path, *_):
-    """`pyIsAbsolute` (pyfs.ts): `PurePath(path).is_absolute()`."""
+    """`pyIsAbsolute` (pyfs.ts): `PurePath(path).is_absolute()` — 3.12's, where a Windows path is
+    absolute only with a drive AND a root (`stdlib312.win_is_absolute`)."""
+    if _os.name == "nt":
+        return _stdlib312().win_is_absolute(path)
     return _pathlib.PurePath(path).is_absolute()
 
 
@@ -2318,7 +2372,7 @@ def _posix_resolve(paths):
             continue
         resolved = f"{path}/{resolved}"
         absolute = path[0] == "/"
-    resolved = _normalize_string(resolved, not absolute, "/", lambda c: c == "/")
+    resolved = _posix_normalized(resolved, not absolute)
     if absolute:
         return "/" + resolved
     return resolved if resolved else "."
@@ -2544,3 +2598,374 @@ def file_links(file, layers, *_):
     names = rf.linked_names(graph, path, utc_now())
     none = f"{history}\n\n{rf.FILE_NO_FACTS.format(suffix=suffix)}"
     return {"said": None, "history": history, "names": list(names), "none": none}
+
+
+# ---------------------------------------------------------------- J90-2 (#316 G4): lock, hotindex
+
+
+def performance_now(*_):
+    """`performance.now()`: a monotonic clock in milliseconds, `time.monotonic()` (the clock the
+    reference's lock read), only ever compared with another reading of itself."""
+    return _time.monotonic() * 1000
+
+
+def _libc_realpath():
+    """libc's `realpath(3)` through ctypes (POSIX); None where ctypes or the symbol is missing."""
+    global _LIBC_REALPATH
+    if _LIBC_REALPATH is None:
+        found = False
+        try:
+            import ctypes
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            realpath = libc.realpath
+            realpath.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+            realpath.restype = ctypes.c_void_p
+            free = libc.free
+            free.argtypes = [ctypes.c_void_p]
+            free.restype = None
+            found = (ctypes, realpath, free)
+        except (ImportError, OSError, AttributeError):
+            found = False
+        _LIBC_REALPATH = found
+    return _LIBC_REALPATH or None
+
+
+_LIBC_REALPATH = None
+
+
+def _realpath_native(abs_path):
+    """`fs.realpathSync.native(abs_path)`: libuv's `uv_fs_realpath`, which is `realpath(3)` on
+    POSIX (the path encoded as `_node_path` hands it to the OS, the answer decoded as Node decodes
+    a name, one U+FFFD per invalid subpart) and `GetFinalPathNameByHandleW` on Windows (CPython's
+    strict `ntpath.realpath` calls the same); any failure an OSError."""
+    if _os.name == "nt":
+        return _os.path.realpath(abs_path, strict=True)
+    native = _libc_realpath()
+    raw = _os.fsencode(abs_path)
+    if native is None:
+        resolved = _os.path.realpath(raw, strict=True)
+    else:
+        ctypes, realpath, free = native
+        if b"\0" in raw:
+            raise OSError(_errno.EINVAL, "realpath")
+        out = realpath(raw, None)
+        if not out:
+            err = ctypes.get_errno()
+            raise OSError(err, _os.strerror(err))
+        try:
+            resolved = ctypes.string_at(out)
+        finally:
+            free(out)
+    return resolved.decode("utf-8", "replace")
+
+
+def node_realpath(path, *_):
+    """`nodeRealpath` (runtime-ts/src/storage/realpath.ts), statement for statement: `path.resolve`
+    (`path_resolve`), then `fs.realpathSync.native` (`_realpath_native`), and where that throws the
+    parent resolved the same way joined with the name as spelled. J90-3 (#316 G4, the
+    orchestrator's ruling on J90-2's divergence): Node's answer, so a path through a DANGLING
+    symlink keeps the link as spelled (it was `os.path.realpath`, which follows it to its missing
+    target), and a name the filesystem folds is spelled as the filesystem spells it."""
+    if not isinstance(path, str):
+        raise TypeError("ts2py: nodeRealpath of anything but a string path is outside the subset")
+    if _os.name == "nt":
+        absolute = _os.path.abspath(_os_text(path))
+    else:
+        absolute = path_resolve(_os_text(path))
+    return _node_realpath_abs(absolute)
+
+
+def _node_realpath_abs(absolute):
+    try:
+        return _realpath_native(absolute)
+    except (OSError, ValueError):
+        parent = path_dirname(absolute)
+        if parent == absolute:
+            return absolute
+        return path_join(_node_realpath_abs(parent), path_basename(absolute))
+
+
+# J90-P7 (#316 G4): `fromJs` (`_lifted`) moved to the runtime as `_js_lifted`, unchanged, so a
+# mypyc build compiles it (this module is never compiled).
+_lifted = _js_lifted
+
+
+def dump_js_value(value, options=_JS_UNDEFINED, float_key=_JS_UNDEFINED, *_):
+    """`dumpJsValue` (runtime-ts/src/pyjson.ts): `dump_json` of `fromJs(value)` (`_lifted`), with
+    `float_key` of a top-level plain object holding a number written as a float (`4.0`)."""
+    if options is _JS_UNDEFINED:
+        options = {}
+    if not isinstance(options, dict) or not set(options) <= _DUMP_OPTIONS:
+        raise TypeError("ts2py: dumpJsValue with those options is outside the subset")
+
+    def opt(name, default):
+        got = options.get(name, _JS_UNDEFINED)
+        return default if got is _JS_UNDEFINED or got is None else got
+
+    lifted = _lifted(value)
+    if (
+        float_key is not _JS_UNDEFINED
+        and type(value) is dict
+        and float_key in value
+        and type(value[float_key]) in (int, float)
+    ):
+        lifted = dict(lifted)
+        lifted[float_key] = float(value[float_key])
+    separators = opt("separators", None)
+    return _json.dumps(
+        lifted,
+        indent=opt("indent", None),
+        sort_keys=opt("sortKeys", False) is True,
+        ensure_ascii=opt("ensureAscii", True) is not False,
+        separators=None if separators is None else (separators[0], separators[1]),
+    )
+
+
+def extract_refs(text, *_):
+    """`extractRefs` (runtime-ts/src/touch/refs.ts): `bantamkit.touch.refs.extract_refs`, which it
+    ports (#200)."""
+    from ..touch.refs import extract_refs as reference
+
+    return reference(text)
+
+
+def fact_refs(description, keywords, body, *_):
+    """`factRefs` (runtime-ts/src/touch/refs.ts): `bantamkit.touch.refs.fact_refs`, which it ports
+    (#200), the keywords as a list."""
+    from ..touch.refs import fact_refs as reference
+
+    return reference(description, list(keywords), body)
+
+
+# ---------------------------------------------------------------- J90-3 (#316 G4): coldindex,
+# retention, tiers
+
+
+def unlink_sync(path, *_):
+    """`fs.unlinkSync(path)`: unlink(2), which `os.unlink` calls (a directory refused by the OS:
+    EPERM on macOS, EISDIR on Linux, as Node's binding gets it); a failure is CPython's OSError."""
+    _os.unlink(_node_path(path, "fs.unlinkSync"))
+    return _JS_UNDEFINED
+
+
+def rmdir_sync(path, *rest):
+    """`fs.rmdirSync(path)`: rmdir(2), which `os.rmdir` calls (ENOTEMPTY / ENOTDIR / ENOENT as the
+    OS answers); options (`recursive`) are outside the subset."""
+    if rest:
+        raise TypeError("ts2py: fs.rmdirSync options are outside the subset")
+    _os.rmdir(_node_path(path, "fs.rmdirSync"))
+    return _JS_UNDEFINED
+
+
+# `path.sep`: the platform's separator, as `path` is `path.posix` or `path.win32`.
+PATH_SEP = "\\" if _os.name == "nt" else "/"
+
+
+def _posix_relative(source, target):
+    """`path.posix.relative` (lib/path.js), statement for statement."""
+    if source == target:
+        return ""
+    source = _posix_resolve([source])
+    target = _posix_resolve([target])
+    if source == target:
+        return ""
+    from_start = 1
+    from_end = len(source)
+    from_len = from_end - from_start
+    to_start = 1
+    to_len = len(target) - to_start
+    length = from_len if from_len < to_len else to_len
+    last_common_sep = -1
+    i = 0
+    while i < length:
+        from_code = source[from_start + i]
+        if from_code != target[to_start + i]:
+            break
+        if from_code == "/":
+            last_common_sep = i
+        i += 1
+    if i == length:
+        if to_len > length:
+            if target[to_start + i] == "/":
+                return target[to_start + i + 1 :]
+            if i == 0:
+                return target[to_start + i :]
+        elif from_len > length:
+            if source[from_start + i] == "/":
+                last_common_sep = i
+            elif i == 0:
+                last_common_sep = 0
+    out = ""
+    i = from_start + last_common_sep + 1
+    while i <= from_end:
+        if i == from_end or source[i] == "/":
+            out += ".." if len(out) == 0 else "/.."
+        i += 1
+    return f"{out}{target[to_start + last_common_sep :]}"
+
+
+def path_relative(source, target, *_):
+    """`path.relative(from, to)`: `path.posix.relative` ported statement for statement (code points
+    for UTF-16 units: only `/` is compared by position, and a pair differing in either unit differs
+    as a code point, so every cut lands on the same character); on Windows CPython's
+    `ntpath.relpath`, which answers `path.win32.relative`'s path for a `to` under `from` (the one
+    shape compiled code passes, `retention.ts`'s `rel`; unmeasured on Windows)."""
+    if not isinstance(source, str) or not isinstance(target, str):
+        raise TypeError("ts2py: path.relative of anything but strings is outside the subset")
+    if _os.name == "nt":
+        return _os.path.relpath(target, source)
+    return _posix_relative(source, target)
+
+
+class _ColdFs(_JsObject):
+    """`coldFs` (runtime-ts/src/storage/coldfs.ts): the reads `coldindex.ts` makes, one object a
+    test swaps a method on. `readFileSync(p)` is the builtin `open(p, encoding="utf-8")` read
+    whole, the reference's `_read_json` (`bantamkit.storage.coldindex` on 743b54b9), which
+    `pyReadText` ports (strict UTF-8, universal newlines, `_store_path`'s path policy); `open` is
+    looked up when called, so the Python test's `builtins.open` spy still sees every read."""
+
+    _js_name = "Object"
+    _js_own = frozenset({"readFileSync"})
+    _js_own_methods = frozenset({"readFileSync"})
+
+    def readFileSync(self, path, *_):
+        try:
+            with open(_store_path(path, "pyReadText"), encoding="utf-8") as handle:
+                return handle.read()
+        except UnicodeDecodeError as error:
+            raise PyUnicodeDecodeError(str(error)) from None
+
+
+coldFs = _ColdFs()
+
+
+def cold_error_text(error, *_):
+    """`coldErrorText` (runtime-ts/src/storage/coldfs.ts): the text a `ColdIndexError` quotes,
+    `str(e)` as the reference quoted it (`f"... unreadable: {e}"`): an OSError CPython's `str(e)`
+    (which a `PyOSError`'s message is in Node), a `PyUnicodeDecodeError` CPython's decoder message
+    (both runtimes). A text that is not JSON never reaches it since J90-3F: `coldindex.ts` throws
+    its own `COLD_NOT_JSON` sentence, so neither parser's wording is quoted
+    (`--suite storage-cold`)."""
+    return str(error)
+
+
+def _fsync_dir(directory):
+    """`retentionfs.ts`'s `fsyncDir`: the reference's `_fsync_dir`. POSIX only."""
+    if _os.name == "nt":
+        return
+    try:
+        fd = _os.open(directory, _os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        _os.fsync(fd)
+        retentionFs.syncs += 1
+    except OSError:
+        pass
+    finally:
+        _os.close(fd)
+
+
+class _RetentionFs(_JsObject):
+    """`retentionFs` (runtime-ts/src/storage/retentionfs.ts): the archive's one write, temp then
+    rename, fsynced (the file, then its directory on POSIX), the reference's `_write_archive`
+    statement for statement (J69-8); the gzip is `gzip_sync`'s (the `gzipSync` row: the compressed
+    bytes are RULED, the data they hold the same). `syncs` counts the syncs made. `os.fsync`,
+    `os.replace` and `os.unlink` are looked up when called, so a test that patches `os` sees
+    them; a test swaps `writeArchive` to make the write fail, as Node's test does."""
+
+    _js_name = "Object"
+    _js_own = frozenset({"syncs", "writeArchive"})
+    _js_own_methods = frozenset({"writeArchive"})
+
+    def __init__(self):
+        self.syncs = 0
+
+    def writeArchive(self, target, data, *_):
+        target = _node_path(target, "retentionFs.writeArchive")
+        directory = _os.path.dirname(target)
+        _pathlib.Path(directory).mkdir(parents=True, exist_ok=True)
+        tmp = _os.path.join(directory, f"{_os.path.basename(target)}.{_os.getpid()}.tmp")
+        # compressed before the temp is opened (J90-3F), as Node's: a live writer's temp is never
+        # idle, so the stale-temp sweep (`removeStaleTemps`) never meets one
+        gz = gzip_sync(data)
+        try:
+            with open(tmp, "wb") as handle:
+                handle.write(gz)
+                handle.flush()
+                _os.fsync(handle.fileno())
+                self.syncs += 1
+            _os.replace(tmp, target)
+            _fsync_dir(directory)
+        except OSError:
+            try:
+                _os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return _JS_UNDEFINED
+
+
+retentionFs = _RetentionFs()
+
+
+def spawn_retention_child(cwd, home, *_):
+    """`spawnRetentionChild` (runtime-ts/src/storage/retentionspawn.ts): the reference's spawn
+    (`maybe_spawn`): `python -m bantamkit.storage.retention <cwd> <home>`, detached and silent
+    (stdin, stdout, stderr to the null device; a new session on POSIX, a detached process group on
+    Windows), never waited for. True once started; False when the spawn fails in any way (the
+    reference answered `failed` for any exception, as `maybeSpawn` answers for a missing child
+    script or a spawn that throws)."""
+    import subprocess
+    import sys
+
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if _os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "bantamkit.storage.retention", cwd, home], **kwargs
+        )
+    except Exception:  # noqa: BLE001 - a spawn this cannot make is never a failed session
+        return False
+    return True
+
+
+def touch_reducer(rows, *_):
+    """`touchReducer` (runtime-ts/src/touch/log.ts): `bantamkit.touch.log.touch_reducer`, which it
+    ports (#200; `--suite touch-log` compares the two); the reference's retention folded with it."""
+    from ..touch.log import touch_reducer as _reducer
+
+    return _reducer(rows)
+
+
+def native_memory_dir(home, *_):
+    """`nativeMemoryDir` (runtime-ts/src/hookadapter.ts): `bantamkit.hookadapter.native_memory_dir`,
+    which it ports (RULING Q1.2 without the transcript branch, J69-7)."""
+    from ..hookadapter import native_memory_dir as _resolve
+
+    return _resolve(home)
+
+
+def has_bantamkit_hooks(path, *_):
+    """`hasBantamkitHooks` (runtime-ts/src/hostinstall.ts): `bantamkit.hostinstall.
+    has_bantamkit_hooks` of the path, which it ports (#204, S2)."""
+    from ..hostinstall import has_bantamkit_hooks as _probe
+
+    return bool(_probe(_pathlib.Path(path)))
+
+
+def process_cwd(*_):
+    """`process.cwd()`: `os.getcwd()`, the reference's `current_cwd`; a deleted directory raises
+    CPython's FileNotFoundError, which a compiled `catch` sees as Node's ENOENT."""
+    return _os.getcwd()

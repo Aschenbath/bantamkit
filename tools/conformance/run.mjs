@@ -38,7 +38,7 @@
  *
  * ctx = { python, repoRoot, runtimeTs, scratch, runPython(scriptPath, payload) }
  */
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { closeSync, existsSync, mkdtempSync, openSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -47,6 +47,111 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(dirname(here));
 const suitesDir = join(here, 'suites');
+
+// ------------------------------------------------------------------- process group
+
+/**
+ * NO CHILD OUTLIVES THE RUN (#316 G4, J90-RF3, J90-RR2 F4).
+ *
+ * Suites run in this process and spawn their children from it, so when the suite bound below
+ * fires, the stuck suite's children are still running. MEASURED by J90-RR2: a `version` suite
+ * hung on a spawned `sleep 417`, bound 60 s, and the sleep was still alive after the run had
+ * exited 1.
+ *
+ * POSIX. The run re-executes itself as the leader of a NEW process group (`detached: true` is
+ * `setsid()`), so every child any suite starts, and every grandchild whose parent has already
+ * gone, carries this group's id. Then:
+ *   - when the suite bound fires, the runner SIGKILLs every member of its group but itself
+ *     (`ps -A -o pid=,pgid=`, the one listing macOS and Linux spell the same way) and carries on;
+ *   - when the run ends, however it ends, the launcher SIGKILLs whatever is left of the group;
+ *   - SIGINT, SIGTERM and SIGHUP to the launcher are forwarded to the group, and if the launcher
+ *     itself disappears (SIGKILL) the runner notices within a second and kills its own group.
+ * A child that deliberately starts its OWN session (`detached: true`) is outside the group and
+ * is not touched: no suite does that (the Retention child is kept off below).
+ *
+ * WINDOWS has no process groups, and Job Objects are not reachable from Node without a native
+ * addon. There is no re-exec; when the bound fires, and at the end of a run in which it fired,
+ * the runner lists its own children (`Get-CimInstance Win32_Process`, by ParentProcessId) and
+ * ends each one's whole tree with `taskkill /T /F`. What that cannot reach: a grandchild whose
+ * parent already exited, because Windows keeps no live parent link for it. Not exercised on
+ * this machine (macOS); the CI matrix runs this file on windows-latest.
+ */
+const GROUP_ENV = 'BANTAMKIT_CONFORMANCE_GROUP_LAUNCHER';
+
+if (process.platform !== 'win32' && !process.env[GROUP_ENV]) {
+  const runner = spawn(process.execPath, [...process.execArgv, fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
+    stdio: 'inherit',
+    detached: true,
+    env: { ...process.env, [GROUP_ENV]: String(process.pid) },
+  });
+  const killGroup = (signal) => {
+    try {
+      process.kill(-runner.pid, signal);
+    } catch {
+      /* ESRCH: the group is already empty */
+    }
+  };
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => killGroup(signal));
+  runner.on('error', (e) => {
+    console.error(`conformance: could not start the runner: ${e.message}`);
+    process.exit(2);
+  });
+  runner.on('exit', (code, signal) => {
+    killGroup('SIGKILL');
+    if (signal) {
+      // End the same way, so the caller sees the signal it would have seen without the re-exec.
+      process.removeAllListeners(signal);
+      process.kill(process.pid, signal);
+    }
+    process.exit(code ?? 1);
+  });
+  // Nothing below runs in the launcher. The runner keeps the loop alive until it exits.
+  await new Promise(() => {});
+}
+
+const launcherPid = Number(process.env[GROUP_ENV] ?? 0);
+delete process.env[GROUP_ENV];
+
+/** Every process this run started that is still alive, ended; the runner itself excepted. */
+function killRunChildren() {
+  if (process.platform === 'win32') {
+    const listed = spawnSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `Get-CimInstance Win32_Process -Filter "ParentProcessId=${process.pid}" | ForEach-Object { $_.ProcessId }`,
+      ],
+      { encoding: 'utf8', timeout: 60_000, windowsHide: true },
+    );
+    for (const pid of (listed.stdout ?? '').split(/\s+/).filter(Boolean)) {
+      spawnSync('taskkill', ['/T', '/F', '/PID', pid], { stdio: 'ignore', timeout: 60_000, windowsHide: true });
+    }
+    return;
+  }
+  if (!launcherPid) return; // not the group leader: nothing here owns a group to clear
+  const listed = spawnSync('ps', ['-A', '-o', 'pid=,pgid='], { encoding: 'utf8' });
+  for (const line of (listed.stdout ?? '').split('\n')) {
+    const [pid, pgid] = line.trim().split(/\s+/).map(Number);
+    if (pgid !== process.pid || pid === process.pid) continue;
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+if (launcherPid) {
+  setInterval(() => {
+    try {
+      process.kill(launcherPid, 0);
+    } catch (e) {
+      if (e.code === 'ESRCH') process.kill(-process.pid, 'SIGKILL');
+    }
+  }, 1000).unref();
+}
 
 // ------------------------------------------------------------------------------ argv
 
@@ -163,6 +268,92 @@ if (!existsSync(python)) {
  */
 const DEFAULT_REF_TIMEOUT_MS = 600_000;
 const REF_TIMEOUT_MS = Number(process.env.BANTAMKIT_CONFORMANCE_REF_TIMEOUT_MS ?? DEFAULT_REF_TIMEOUT_MS);
+
+/**
+ * A SUITE THAT DOES NOT SETTLE IS ONE RED SUITE, NOT A SILENT EXIT (#316 G4, J90-RF2).
+ *
+ * MEASURED by J90-RR with the mypyc extensions in-tree: `version.mjs` awaited an answer from a
+ * server child that had already died on import, so `mod.run(ctx)` never settled; with nothing
+ * left on the event loop Node ended the process with exit 13 ("Warning: Detected unsettled
+ * top-level await" at the `await mod.run(ctx)` below), printed no PASS/FAIL line, and the
+ * suites after `version` never ran. Two ways a suite can fail to settle, two arms:
+ *
+ *   - NOTHING LEFT TO RUN. Node emits `beforeExit` when the loop drains; the pending suite is
+ *     rejected from there (through `setImmediate`, so the loop has work again and a second
+ *     stalled suite gets its own `beforeExit`), and the run carries on to the next suite.
+ *   - STILL BUSY, FOREVER (a child that never exits, a timer that never stops). The per-suite
+ *     bound below, 15 minutes. It must fire BEFORE the CI job deadline (`.github/workflows/
+ *     ci.yml`, `timeout-minutes: 30` on both jobs, which also covers checkout, installs and
+ *     `npm test`): a bound equal to the deadline never fires there, and the job dies naming
+ *     nothing (J90-RR2 F4). MEASURED (J90-RF3, each suite alone, `--suite <name>`, macOS
+ *     laptop, all 56 PASS): the slowest suite is `wire` at 219.3 s, then `instructions` 100.9 s
+ *     and `hooks` 100.7 s. 15 minutes is about four times the slowest, for slower runners, and
+ *     sits above the 10-minute reference-child bound, so a stuck reference child is still named
+ *     by that sharper diagnostic first. When the bound fires, every child the run started is
+ *     killed (see *process group* above) and the run carries on to the next suite.
+ *
+ * `BANTAMKIT_CONFORMANCE_SUITE_TIMEOUT_MS` overrides the bound, so the arm can be demonstrated
+ * (`runtime-py/tests/test_conformance_harness_resilience.py`). Anything else that ends the
+ * process inside a suite (an uncaught exception in a suite's callback, a `die`) still prints a
+ * FAIL line naming the suite, from the `exit` listener below.
+ */
+const DEFAULT_SUITE_TIMEOUT_MS = 900_000;
+const SUITE_TIMEOUT_MS = Number(process.env.BANTAMKIT_CONFORMANCE_SUITE_TIMEOUT_MS ?? DEFAULT_SUITE_TIMEOUT_MS);
+
+class SuiteDidNotSettle extends Error {}
+
+let boundFired = false;
+
+let onDrain = null;
+process.on('beforeExit', () => {
+  if (onDrain === null) return;
+  const fire = onDrain;
+  onDrain = null;
+  setImmediate(fire);
+});
+
+function settled(promise) {
+  return new Promise((resolve, reject) => {
+    const finish = (how) => (value) => {
+      clearTimeout(timer);
+      onDrain = null;
+      how(value);
+    };
+    const timer = setTimeout(() => {
+      onDrain = null;
+      boundFired = true;
+      killRunChildren();
+      reject(
+        new SuiteDidNotSettle(
+          `the suite did not settle within ${SUITE_TIMEOUT_MS / 1000}s (still busy: a child or a timer ` +
+            'kept the process alive; every child the run had started was killed); ' +
+            'BANTAMKIT_CONFORMANCE_SUITE_TIMEOUT_MS overrides the bound',
+        ),
+      );
+    }, SUITE_TIMEOUT_MS);
+    timer.unref();
+    onDrain = () => {
+      clearTimeout(timer);
+      reject(
+        new SuiteDidNotSettle(
+          'the suite did not settle: its run() was still pending with nothing left to run ' +
+            '(Node would have exited 13, "unsettled top-level await", and skipped every suite after it)',
+        ),
+      );
+    };
+    Promise.resolve(promise).then(finish(resolve), finish(reject));
+  });
+}
+
+let runningSuite = null;
+let summarised = false;
+process.on('exit', (code) => {
+  if (summarised || runningSuite === null) return;
+  console.log(
+    `\nFAIL: the run ended (exit ${code}) inside suite ${runningSuite}, before its summary; ` +
+      'the suites after it did not run',
+  );
+});
 
 /**
  * Run a reference script with a JSON payload on stdin and parse its JSON on stdout.
@@ -345,14 +536,19 @@ try {
     let cases = [];
     let suiteNotes = [];
     let failed = 0;
+    runningSuite = suiteName;
     try {
-      ({ cases, notes: suiteNotes = [] } = await mod.run(ctx));
+      ({ cases, notes: suiteNotes = [] } = await settled(mod.run(ctx)));
     } catch (e) {
       failed += 1;
       cases = [];
       suiteNotes = [];
-      console.log(`\n  ✖ ${suiteName}: the suite could not build its cases`);
-      console.log(`      ${e && e.stack ? e.stack.split('\n').slice(0, 4).join('\n      ') : String(e)}`);
+      if (e instanceof SuiteDidNotSettle) {
+        console.log(`\n  ✖ ${suiteName}: ${e.message}`);
+      } else {
+        console.log(`\n  ✖ ${suiteName}: the suite could not build its cases`);
+        console.log(`      ${e && e.stack ? e.stack.split('\n').slice(0, 4).join('\n      ') : String(e)}`);
+      }
     }
     for (const c of cases) {
       totals.cases += 1;
@@ -403,7 +599,10 @@ try {
       }), ${failed} differed`,
     );
   }
+  runningSuite = null;
 } finally {
+  // POSIX: the launcher clears the group when this process exits. Windows has no launcher.
+  if (boundFired && process.platform === 'win32') killRunChildren();
   rmSync(scratch, { recursive: true, force: true });
 }
 
@@ -421,6 +620,7 @@ if (requireExactStrings && totals.strings === 0) {
   process.exit(1);
 }
 
+summarised = true;
 console.log(
   `\n${totals.failed === 0 ? 'PASS' : 'FAIL'}: ${totals.cases} cases, ${totals.bytes} byte-identical, ` +
     `${totals.strings} exact-string, ${totals.json} structural, ${totals.rulings} ruled-different, ` +

@@ -31,6 +31,12 @@
  * `runtime/toLowerCase …` (J89-7, J89-7b) calls the runtime ts2py emitted this run on Greek, ǅ,
  * the 55 code points CPython's table lacks and the 307 it classifies apart for final sigma,
  * against Node's `toLowerCase()`, and pins the answers J89-7 used to refuse as literals.
+ * `runtime/sort …` (J90-P2) sorts seeded arrays with NaN under four comparators with that runtime's
+ * `_js_m_sort` against Node's `.sort`, the order and the comparator's calls.
+ * `adapter/…` (J90-P5) lists, with the TypeScript checker, every member the compiled sources read
+ * off an object an adapter builds (`lib/adaptermembers.mjs`) and asks the committed adapters what
+ * each provides: a member read and not provided is red (it would read `undefined`, silently, as
+ * `Stats.ino` did until J90-P4), and so is a read of an adapter type no row claims.
  *
  * WHY THE PYTHON ARMS READ THE FIXTURE THEMSELVES. `ref/ts2py_ref.py` opens the file with
  * `json.load`; the cases are not sent as a payload, because the payload goes through
@@ -57,6 +63,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { adapterReads } from '../lib/adaptermembers.mjs';
 
 export const name = 'ts2py';
 export const summary = 'workplan three ways: TypeScript, ts2py-generated Python and bantamkit.workplan against one expected file';
@@ -84,7 +91,8 @@ function ts2py(args, out) {
   const cargo = findCargo();
   const r = spawnSync(
     cargo,
-    ['run', '--release', '--quiet', '--manifest-path', join(repoRoot, 'tools', 'ts2py', 'Cargo.toml'), '--', ...args],
+    // #337: the compiler holds no bantamkit name; bantamkit's adapters and header names are its host file.
+    ['run', '--release', '--quiet', '--manifest-path', join(repoRoot, 'tools', 'ts2py', 'Cargo.toml'), '--', ...args, '--config', join(repoRoot, 'tools', 'ts2py-bantamkit', 'ts2py.toml')],
     { cwd: repoRoot, encoding: 'utf8', timeout: 900_000, maxBuffer: 64 * 1024 * 1024 },
   );
   if (r.error) throw new Error(`ts2py: could not run ${cargo}: ${r.error.message} (set TS2PY_CARGO)`);
@@ -110,7 +118,10 @@ const CODEC_SOURCES = ['runtime-ts/src/memory/pyyaml.ts', 'runtime-ts/src/memory
 /**
  * #316 G1 (J87-3): pricing and jobbudget; G2 (J88-2): the log segment, the event log and the token
  * ledger; G3 U1 (J89-2): the usage ledger; G3 (J89-3): retrieval; G3 U2 (J89-4b): the store; G3 U3
- * (J89-5): the native layer; (J89-5a) the queries sidecar; (J89-5b) the layers; (J89-5c) the dream; G3 U4 (J89-6) the component. One ts2py call into the same package,
+ * (J89-5): the native layer; (J89-5a) the queries sidecar; (J89-5b) the layers; (J89-5c) the dream; G3 U4 (J89-6) the component;
+ * G4 (J90-2) the lock and the hot index (which the store imports and which imports the store back:
+ * an import cycle, written at the end of each module); G4 (J90-3) the cold index, retention, the
+ * tiers and the storage package file (`storage/index.ts`, its re-exports). One ts2py call into the same package,
  * because the token ledger imports pricing and the event log and the usage ledger import the log
  * segment, and an import between compiled modules resolves only inside one call.
  */
@@ -128,8 +139,14 @@ const G1_SOURCES = [
   'runtime-ts/src/memory/layers.ts',
   'runtime-ts/src/memory/dream.ts',
   'runtime-ts/src/memory/component.ts',
+  'runtime-ts/src/storage/lock.ts',
+  'runtime-ts/src/storage/hotindex.ts',
+  'runtime-ts/src/storage/coldindex.ts',
+  'runtime-ts/src/storage/retention.ts',
+  'runtime-ts/src/storage/tiers.ts',
+  'runtime-ts/src/storage/index.ts',
 ];
-const CARGO_RUN = 'cargo run --release --manifest-path tools/ts2py/Cargo.toml --';
+const CARGO_RUN = 'cargo run --release --manifest-path tools/ts2py/Cargo.toml -- --config tools/ts2py-bantamkit/ts2py.toml';
 const REGENERATE =
   'regenerate from the repository root:\n' +
   `  ${CARGO_RUN} ${SOURCE} -o ${COMMITTED}/workplan.py --runtime-module ._ts2py_runtime\n` +
@@ -283,6 +300,77 @@ export async function run(ctx) {
       cases.push({ name: `runtime/toLowerCase LITERAL answers: ${JSON.stringify(text)}`, kind: 'string', expected: lowered, actual: got[agree.length + i] });
     });
     notes.push(`runtime toLowerCase: ${inputs.length} inputs against node, ${answered.length} pinned as literals`);
+  }
+
+  // J90-P2: the runtime's `.sort(compare)`, from the runtime ts2py emitted this run, against Node's
+  // on seeded arrays with NaN (an inconsistent comparator) and lengths past V8's insertion bound and
+  // its min run: each order, and the calls the first comparator was made, pair for pair. Until
+  // J90-P2 `_js_m_sort` was CPython's `list.sort`: other calls on every CPython, and on 3.13+
+  // another order for an inconsistent comparator.
+  {
+    const SORTS = [
+      (a, b) => a - b,
+      (a, b) => b - a,
+      (a, b) => (a > b ? 1 : 0),
+      (a, b) => ((a * 7 + b * 3) % 5) - 2,
+    ];
+    let seed = 90902;
+    const next = () => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return Math.floor(seed / 65536);
+    };
+    const arrays = [];
+    for (let k = 0; k < 120; k += 1) {
+      const n = k < 10 ? k : next() % 90;
+      arrays.push(Array.from({ length: n }, () => (next() % 7 === 0 ? 'NaN' : next() % 40)));
+    }
+    const runtime = join(bed, 'committed', '_ts2py_runtime.py');
+    const got = ctx.runPython(REF, { sort: { runtime, arrays } }).sort;
+    arrays.forEach((items, i) => {
+      const values = items.map((x) => (x === 'NaN' ? NaN : x));
+      const calls = [];
+      const logged = (a, b) => {
+        calls.push(`${String(a)}<${String(b)}`);
+        return a - b;
+      };
+      const expected = [logged, ...SORTS.slice(1)].map((cmp) => [...values].sort(cmp).map(String).join(','));
+      expected.push(calls.join(' '));
+      cases.push({ name: `runtime/sort agrees with node: ${items.length} items #${i}`, kind: 'json', expected, actual: got[i] });
+    });
+    notes.push(`runtime sort: ${arrays.length} arrays x ${SORTS.length} comparators against node, with the calls`);
+  }
+
+  // J90-P5: every member the compiled modules read off an adapter's object is one it provides.
+  {
+    const audit = adapterReads(repoRoot, [SOURCE, ...CODEC_SOURCES, ...G1_SOURCES]);
+    const classes = Object.keys(audit.classes).sort();
+    const got = ctx.runPython(REF, { adapters: { classes, scratch: join(bed, 'adapters') } }).adapters;
+    cases.push({ name: 'adapter/every read of an adapter type has a row', kind: 'json', expected: [], actual: audit.unclassified });
+    for (const cls of classes) {
+      const read = audit.classes[cls];
+      cases.push({
+        name: `adapter/${cls} provides every member compiled code reads (${read.join(', ')})`,
+        kind: 'json',
+        expected: [],
+        actual: read.filter((m) => !got.classes[cls].includes(m)),
+      });
+    }
+    for (const [provider, rows] of Object.entries(audit.dicts).sort()) {
+      const samples = got.dicts[provider] ?? [];
+      for (const row of rows) {
+        const shaped = samples.filter((d) => Object.entries(row.literals).every(([k, v]) => d[k] === v));
+        const best = shaped.length === 0 ? row.members : shaped
+          .map((d) => row.members.filter((m) => !Object.hasOwn(d, m)))
+          .reduce((a, b) => (b.length < a.length ? b : a));
+        cases.push({
+          name: `adapter/${provider} ${JSON.stringify(row.literals)} provides ${row.members.join(', ')}`,
+          kind: 'json',
+          expected: [],
+          actual: best,
+        });
+      }
+    }
+    notes.push(`adapter members: ${audit.count} reads of members declared outside the compiled sources, ${classes.length} adapter classes and ${Object.keys(audit.dicts).length} dict producers checked`);
   }
   return { cases, notes };
 }

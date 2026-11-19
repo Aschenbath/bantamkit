@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use oxc_ast::ast::*;
 use oxc_span::{GetSpan, Span};
 
-use crate::adapters::{self, AdapterKind};
+use crate::adapters::{AdapterKind, AdapterTable, Contract};
 use crate::pyfmt::{is_py_keyword, py_name, py_number, py_str, py_str_utf16};
 use crate::types::{self, Assume, Fact, Key, MODULE, Observed, TypeDecls};
 
@@ -260,6 +260,10 @@ const METHODS: &[(&str, usize, usize, Option<usize>, Ret)] = &[
     ("forEach", 1, 1, Some(0), Ret::Any),
     ("keys", 0, 0, None, Ret::List),
     ("copyWithin", 2, 3, None, Ret::List),
+    // J90-2 (#316 G4: storage/hotindex).
+    ("delete", 1, 1, None, Ret::Bool),
+    // J90-3 (#316 G4: storage/retention): `Buffer.prototype.equals`.
+    ("equals", 1, 1, None, Ret::Bool),
 ];
 
 /// J86-R finding 3: every method a builtin prototype the subset can reach carries (String, Array,
@@ -293,6 +297,8 @@ const JS_METHOD_NAMES: &[&str] = &[
     "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__", "constructor",
     "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toLocaleString", "toString",
     "valueOf",
+    // J90-3: Buffer.prototype's `equals` (a Uint8Array method the subset now calls).
+    "equals",
 ];
 
 /// Static calls on a builtin namespace: object, method, helper, min args, max args, returns.
@@ -403,7 +409,7 @@ pub struct ModuleExports {
 /// Everything about the other modules of a multi-module compile a module needs (J86).
 #[derive(Clone, Default)]
 pub struct ModuleCtx {
-    /// This module's path, as printed (`runtime-ts/src/memory/factfile.ts`).
+    /// This module's path, as printed (`src/memory/factfile.ts`).
     pub path: String,
     /// Every compiled module, by its normalised `.ts` path.
     pub modules: HashMap<String, ModuleExports>,
@@ -411,6 +417,12 @@ pub struct ModuleCtx {
     pub class_methods: HashSet<String>,
     /// Where the hand-written adapters are imported from (`._ts2py_adapters`).
     pub adapter_module: String,
+    /// #337: the host's adapter rows (`host.rs`).
+    pub adapters: std::sync::Arc<AdapterTable>,
+    /// J90-2: the compiled modules this one imports that import it back, directly or not (an
+    /// import cycle, as `hotindex.ts` and `memory/store.ts` are). Their names are imported at
+    /// the END of the Python module (`late_imports`), when every name of this one is bound.
+    pub cyclic_imports: HashSet<String>,
 }
 
 /// A class being lowered: its members as JS spells them.
@@ -442,6 +454,11 @@ pub struct Lowerer<'s> {
     error_classes: HashSet<String>,
     /// J87-3: source names of adapter functions, which may be passed as a `.sort` comparator.
     adapter_fns: HashSet<String>,
+    /// J90-P2 (#337): source names of adapter functions whose row promises
+    /// `Contract::CompareCodepoints`.
+    codepoint_fns: HashSet<String>,
+    /// J90-P6 (#337): source names bound to Node's `createHash` (`node:crypto`).
+    hash_fns: HashSet<String>,
     /// J87-3: the enclosing `catch (e)` bindings, innermost last: (source name, the temporary
     /// holding what was caught). The only use accepted is rethrowing it (`throw e`).
     catch_params: Vec<(String, String)>,
@@ -458,6 +475,12 @@ pub struct Lowerer<'s> {
     classes: HashMap<String, String>,
     /// J86: `from <module> import <names>` lines this module needs, by module.
     pub imports: BTreeMap<String, BTreeSet<String>>,
+    /// J90-2: the same, from a module of an import cycle (`ModuleCtx::cyclic_imports`): written
+    /// after the body, so the cycle imports whichever module comes first without a name unbound.
+    pub late_imports: BTreeMap<String, BTreeSet<String>>,
+    /// J90-2: the Python names `late_imports` binds; none may be read while the module itself is
+    /// being executed (a module-level initializer, an `extends`), when it may not be bound yet.
+    cyclic_py: HashSet<String>,
     /// J86: the class whose body is being lowered.
     class_ctx: Option<ClassCtx>,
     /// J86: index into `scopes` where each enclosing `def` starts, innermost last, with the names
@@ -479,6 +502,9 @@ pub struct Lowerer<'s> {
     sigs: HashMap<String, Sig>,
     /// J87: module-level `const` bindings of a value (not an arrow).
     module_consts: HashSet<String>,
+    /// J90-P: module-level `const` arrows `(v) => Object.entries(v)`, which `new Map(f(x))`
+    /// reads as `new Map(Object.entries(x))`.
+    entries_aliases: HashSet<String>,
     /// J89-2: module-level `let` bindings (Python module globals a function may assign).
     module_lets: HashSet<String>,
     /// J89-2: per function being lowered, the module `let`s it assigns (`global` declarations).
@@ -523,6 +549,9 @@ pub struct Lowerer<'s> {
     cur_indent: usize,
     /// J88-2: how many callback lambdas enclose the expression being lowered.
     in_callback: usize,
+    /// J90-P2: the operand of `&&` being lowered cannot change an array's length (`pure_test`),
+    /// so `x.length === N` on the left may narrow `x` to an array of exactly N elements there.
+    length_ok: bool,
     /// J89-3: `const` bindings of a `new Float64Array(n)` (SUBSET.md, *Typed arrays*).
     typed_arrays: HashSet<Key>,
     /// J89-3: `const` bindings of an array literal: a fresh array no parameter can alias.
@@ -533,6 +562,23 @@ pub struct Lowerer<'s> {
     fast_init_done: bool,
     /// J89-3: an assignment in the proven copy gave a carried `let` a value not proven a number.
     fast_carry_failed: bool,
+    /// J90-P3: the proven copies enclosing `fast` (a counted loop nested in another's copy),
+    /// innermost last: a binding the outer copy declares keeps its key inside the inner one.
+    fast_outer: Vec<FastLoop>,
+    /// J90-P3: module `const`s bound to a positive integer literal (a counted loop's stride).
+    int_consts: HashMap<String, u64>,
+
+    /// J90-P3: lowering the general loop of a proven copy (the path a failed guard takes): a
+    /// counted loop nested in it is lowered once, without a copy of its own.
+    in_fallback: usize,
+
+    /// J90-P6: lowering a comprehension's iterable, where an assignment expression is a
+    /// SyntaxError: a guarded inline expansion there binds no temporary (`hot`).
+    no_walrus: usize,
+    /// J90-P6: lowering an inline callback's body (a comprehension element): no expansion.
+    hot_comp: usize,
+    /// J90-P6: the temporaries `hot` has bound, for unique names.
+    hot_tmp: usize,
 }
 
 /// J89-3: what `fast_loop_plan` found in a counted loop's body.
@@ -546,6 +592,23 @@ struct LoopScan {
     numeric: BTreeSet<String>,
     pushed: HashSet<String>,
     filled: HashSet<String>,
+    /// J90-P: plain arrays whose `.length` the body reads (source names).
+    measured: HashSet<String>,
+    /// J90-P3: the variables of counted loops nested in the body.
+    loop_vars: HashSet<String>,
+    /// J90-P3: per plain array read at `i + c`, the largest `c` (0 for `x[i]`).
+    offsets: HashMap<String, u64>,
+    /// J90-P3: plain arrays some read of which is an operand of arithmetic or a comparison
+    /// (directly, or through a `const` the body declares from it): their elements are checked
+    /// numbers. The others are only bounds-checked and read as they are.
+    numeric_arrays: HashSet<String>,
+    /// J90-P3: a `const` the body declares from `x[i + c]`, by name: the array `x`.
+    from_read: HashMap<String, String>,
+    /// J90-P3: the expression `scan_expr` is about to walk is a SINK, where a value is only
+    /// stored or tested and no code can run on it: an array literal's element, `push`'s argument,
+    /// an `if` test, a `const` initializer. Anywhere else, reading an element (or a `const` read
+    /// from one) makes its array `numeric_arrays`.
+    sink: bool,
 }
 
 /// J89-3: a counted loop `fast_loop` versions: the bound's Python code, and the guard's parts.
@@ -556,6 +619,15 @@ struct LoopPlan {
     typed: BTreeSet<String>,
     plain: BTreeSet<String>,
     filled: BTreeSet<String>,
+    /// J90-P: plain arrays whose `.length` the body reads, checked lists before the loop.
+    measured: BTreeSet<String>,
+    /// J90-P3: the stride (`i += S`), 1 for `i += 1` / `i++`.
+    step: u64,
+    /// J90-P3: per plain array, the largest offset `c` of a read `x[i + c]`.
+    offsets: BTreeMap<String, u64>,
+    /// J90-P3: plain arrays read only as values (never an operand): bounds-checked, not
+    /// `_js_doubles`-checked, and each read proves nothing about its element.
+    pass: BTreeSet<String>,
     speculated: Vec<String>,
     carried: Vec<String>,
     declared: HashSet<String>,
@@ -577,6 +649,8 @@ struct FastLoop {
     typed: HashSet<String>,
     /// Plain arrays the body reads by `i`, checked by `_js_doubles` (source names).
     plain: HashSet<String>,
+    /// J90-P3: plain arrays the body reads by `i` (or `i + c`) as values only, bounds-checked.
+    pass: HashSet<String>,
     /// Fresh local arrays (`fresh_arrays`) the body writes at `i`, checked a list long enough.
     filled: HashSet<String>,
     /// Outer `let`s the body assigns and uses as operands, checked a number before the loop and
@@ -627,6 +701,8 @@ impl<'s> Lowerer<'s> {
             globals: HashMap::new(),
             error_classes: HashSet::new(),
             adapter_fns: HashSet::new(),
+            codepoint_fns: HashSet::new(),
+            hash_fns: HashSet::new(),
             catch_params: Vec::new(),
             exports: Vec::new(),
             scopes: Vec::new(),
@@ -635,6 +711,8 @@ impl<'s> Lowerer<'s> {
             ctx,
             classes: HashMap::new(),
             imports: BTreeMap::new(),
+            late_imports: BTreeMap::new(),
+            cyclic_py: HashSet::new(),
             class_ctx: None,
             defs: Vec::new(),
             breaks: Vec::new(),
@@ -645,6 +723,7 @@ impl<'s> Lowerer<'s> {
             rets: Vec::new(),
             sigs: HashMap::new(),
             module_consts: HashSet::new(),
+            entries_aliases: HashSet::new(),
             module_lets: HashSet::new(),
             global_writes: Vec::new(),
             frozen: HashSet::new(),
@@ -666,11 +745,18 @@ impl<'s> Lowerer<'s> {
             pre: Vec::new(),
             cur_indent: 0,
             in_callback: 0,
+            length_ok: false,
             typed_arrays: HashSet::new(),
             fresh_arrays: HashSet::new(),
             fast: None,
             fast_init_done: false,
             fast_carry_failed: false,
+            fast_outer: Vec::new(),
+            int_consts: HashMap::new(),
+            in_fallback: 0,
+            no_walrus: 0,
+            hot_comp: 0,
+            hot_tmp: 0,
         }
     }
 
@@ -698,11 +784,15 @@ impl<'s> Lowerer<'s> {
     fn var_key(&self, name: &str) -> Option<Key> {
         if let Some(i) = self.scopes.iter().rposition(|s| s.contains(name)) {
             // J89-3: a binding the proven copy of a counted loop declares is its own key there.
-            let ver = match &self.fast {
-                Some(fast) if i + 1 == self.scopes.len() && fast.declared.contains(name) => {
-                    fast.span
-                }
-                _ => 0,
+            // J90-P3: or the enclosing copy that declares it, when copies nest.
+            let ver = if i + 1 == self.scopes.len() {
+                self.fast
+                    .iter()
+                    .chain(self.fast_outer.iter().rev())
+                    .find(|fast| fast.declared.contains(name))
+                    .map_or(0, |fast| fast.span)
+            } else {
+                0
             };
             return Some(Key::Var {
                 typed: self.typed,
@@ -800,7 +890,7 @@ impl<'s> Lowerer<'s> {
         };
         let key = self.var_key(id.name.as_str())?;
         let module = matches!(key, Key::Var { owner: MODULE, .. });
-        (module || self.consts.contains(&key)).then_some(key)
+        (module || self.consts.contains(&key) || self.assume.stable.contains(&key)).then_some(key)
     }
 
     /// J87: the current fact of a binding (a narrowing in force, else this round's assumption).
@@ -817,10 +907,19 @@ impl<'s> Lowerer<'s> {
         use BinaryOperator as Op;
         match strip_parens(test) {
             Expression::LogicalExpression(l) => match (l.operator, when) {
-                // Both hold.
+                // Both hold (the right one tested where the left one holds).
                 (LogicalOperator::And, true) | (LogicalOperator::Or, false) => {
+                    // A length the left proves holds past the right only if the right cannot
+                    // change it either (J90-P2, `length_ok`).
+                    let length_ok = self.length_ok;
+                    self.length_ok = length_ok && self.pure_test(&l.right);
                     let mut out = self.narrowings(&l.left, when);
-                    out.extend(self.narrowings(&l.right, when));
+                    self.length_ok = length_ok;
+                    let depth = self.narrow.len();
+                    self.narrow.extend(out.iter().cloned());
+                    let right = self.narrowings(&l.right, when);
+                    self.narrow.truncate(depth);
+                    out.extend(right);
                     out
                 }
                 // One of the two holds: what both sides prove of the same binding.
@@ -848,6 +947,24 @@ impl<'s> Lowerer<'s> {
                 }
                 self.narrowings(&u.argument, !when)
             }
+            // J90-P: `Array.isArray(x)` true: x is a list.
+            Expression::CallExpression(c)
+                if when
+                    && !c.optional
+                    && c.arguments.len() == 1
+                    && matches!(strip(&c.callee), Expression::StaticMemberExpression(m)
+                        if !m.optional && m.property.name == "isArray"
+                            && matches!(strip(&m.object), Expression::Identifier(o) if o.name == "Array"))
+                    && !self.is_local("Array") =>
+            {
+                match c.arguments[0]
+                    .as_expression()
+                    .and_then(|x| self.narrowable(x))
+                {
+                    Some(key) => vec![(key, Fact::list())],
+                    None => Vec::new(),
+                }
+            }
             Expression::Identifier(_) if when => match self.narrowable(test) {
                 Some(key) => self
                     .defined_narrowing(key, true, true)
@@ -865,6 +982,32 @@ impl<'s> Lowerer<'s> {
                 };
                 // The test is true exactly when the two sides are equal (`eq`) or unequal.
                 let equal = eq == when;
+                // J90-P2: `x.length === N` true, `x` an array: exactly N elements, while nothing
+                // can change its length (`length_ok`: the rest of an `&&` that `pure_test` holds).
+                if strict && equal && self.length_ok {
+                    for (side, other) in [(&b.left, &b.right), (&b.right, &b.left)] {
+                        let (Expression::StaticMemberExpression(m), Expression::NumericLiteral(n)) =
+                            (strip_parens(side), strip_parens(other))
+                        else {
+                            continue;
+                        };
+                        if m.optional
+                            || m.property.name != "length"
+                            || n.value.fract() != 0.0
+                            || !(0.0..=16.0).contains(&n.value)
+                        {
+                            continue;
+                        }
+                        let Some(key) = self.narrowable(&m.object) else {
+                            continue;
+                        };
+                        let Some(mut fact) = self.current(&key).filter(|f| f.list && !f.top) else {
+                            continue;
+                        };
+                        fact.tuple = Some(vec![Fact::default(); n.value as usize]);
+                        return vec![(key, fact)];
+                    }
+                }
                 // `x === null` / `x == undefined` ...: rules out what it names when unequal.
                 for (side, other) in [(&b.left, &b.right), (&b.right, &b.left)] {
                     if !is_nullish_literal(other) {
@@ -1075,6 +1218,11 @@ impl<'s> Lowerer<'s> {
                             match &d.init {
                                 Some(Expression::ArrowFunctionExpression(a)) => {
                                     self.add_sig(id.name.as_str(), public, &a.params, id.span);
+                                    if v.kind == VariableDeclarationKind::Const
+                                        && is_entries_alias(a)
+                                    {
+                                        self.entries_aliases.insert(id.name.to_string());
+                                    }
                                 }
                                 init => {
                                     if v.kind == VariableDeclarationKind::Let {
@@ -1082,6 +1230,14 @@ impl<'s> Lowerer<'s> {
                                     }
                                     if v.kind == VariableDeclarationKind::Const {
                                         self.module_consts.insert(id.name.to_string());
+                                        if let Some(Expression::NumericLiteral(n)) = init
+                                            && n.value >= 1.0
+                                            && n.value.fract() == 0.0
+                                            && n.value <= 1024.0
+                                        {
+                                            self.int_consts
+                                                .insert(id.name.to_string(), n.value as u64);
+                                        }
                                         if !public
                                             && matches!(init, Some(Expression::ArrayExpression(_)))
                                         {
@@ -1133,6 +1289,21 @@ impl<'s> Lowerer<'s> {
         body
     }
 
+    /// J90-2: refuse a module-level initializer whose Python reads a name imported in a cycle:
+    /// it runs while the module is executed, and the cycle may not have bound that name yet.
+    fn module_eval_use(&mut self, code: &str, span: Span) {
+        let mut hit: Vec<&String> = self
+            .cyclic_py
+            .iter()
+            .filter(|py| uses_ident(code, py))
+            .collect();
+        hit.sort();
+        if let Some(py) = hit.first() {
+            let construct = format!("module-level use of {py}, imported in an import cycle");
+            self.refuse(span, construct);
+        }
+    }
+
     fn declare_global(&mut self, name: &str, exported: bool, span: Span) {
         let py = py_name(name, true, !exported);
         self.claim(name, &py, span);
@@ -1152,7 +1323,7 @@ impl<'s> Lowerer<'s> {
             }
             Statement::ExportFromDeclaration(e) => {
                 if !e.export_kind.is_type() {
-                    self.refuse(e.span, "re-export");
+                    self.re_export(e);
                 }
             }
             // Resolved in pass 1 (`import`), through a compiled module or the adapter seam.
@@ -1202,6 +1373,7 @@ impl<'s> Lowerer<'s> {
                             continue;
                         }
                         let value = self.expr(init);
+                        self.module_eval_use(&value.code, d.span);
                         out.push(format!("{name} = {}", value.code));
                     }
                     return;
@@ -1222,6 +1394,7 @@ impl<'s> Lowerer<'s> {
                         }
                         Some(init) => {
                             let value = self.expr(init);
+                            self.module_eval_use(&value.code, d.span);
                             out.push(format!("{name} = {}", value.code));
                             // J87: a frozen array keeps what its elements are; any other const
                             // keeps the flags of its value (the binding never changes).
@@ -1330,13 +1503,51 @@ impl<'s> Lowerer<'s> {
             sig.py.clone()
         };
         self.typed = true;
+        let typed_at = out.len();
         self.function_body(&typed_name, source, &sig.params, None, ret(true), out);
         if wrapped {
-            out.push(String::new());
-            out.push(String::new());
             self.typed = false;
             let guard = (sig.typed_py.as_str(), sig.params.as_slice());
-            self.function_body(&sig.py, source, &[], Some(guard), ret(false), out);
+            let mut untyped = Vec::new();
+            self.function_body(&sig.py, source, &[], Some(guard), ret(false), &mut untyped);
+            // J90-P2: when the guarded entry's own body is the typed body line for line (the
+            // annotations proved nothing the lowering used), one body serves both names: the
+            // entry without its guard, and the typed name bound to it.
+            let guard_at = untyped
+                .iter()
+                .position(|l| l.starts_with("    if ") && l.ends_with(':'))
+                .filter(|&k| {
+                    untyped.get(k + 1).is_some_and(|l| {
+                        l.starts_with(&format!("        return {}(", sig.typed_py))
+                    })
+                });
+            // J90-P3: line for line up to the compiler's own temporaries (`_js_caught3` in one
+            // body, `_js_caught9` in the other): each is local to its body, so renaming them
+            // consistently changes nothing the body does.
+            let same = guard_at.is_some_and(|k| {
+                let typed = &out[typed_at..];
+                let head = |l: &str, name: &str| {
+                    l.strip_prefix(&format!("def {name}(")).map(str::to_string)
+                };
+                let a: Vec<&String> = typed[1..k].iter().chain(&typed[k..]).collect();
+                let b: Vec<&String> = untyped[1..k].iter().chain(&untyped[k + 2..]).collect();
+                typed.len() + 2 == untyped.len()
+                    && head(&typed[0], &sig.typed_py).is_some()
+                    && head(&typed[0], &sig.typed_py) == head(&untyped[0], &sig.py)
+                    && canonical_temps(&a) == canonical_temps(&b)
+            });
+            if let Some(k) = guard_at.filter(|_| same) {
+                out.truncate(typed_at);
+                untyped.drain(k..k + 2);
+                out.extend(untyped);
+                out.push(String::new());
+                out.push(String::new());
+                out.push(format!("{} = {}", sig.typed_py, sig.py));
+            } else {
+                out.push(String::new());
+                out.push(String::new());
+                out.extend(untyped);
+            }
         }
         self.typed = false;
     }
@@ -1791,6 +2002,56 @@ impl<'s> Lowerer<'s> {
         matches!((strip(e), &self.fast), (Expression::Identifier(id), Some(fast)) if id.name == fast.var.as_str())
     }
 
+    /// J90-P3: `e` may be evaluated twice: a local name, or a literal index into one (a read
+    /// of a list or a dict element runs no code).
+    fn twice_safe(&self, e: &Expression<'_>) -> bool {
+        match strip(e) {
+            Expression::Identifier(id) => self.is_scoped(id.name.as_str()),
+            Expression::ComputedMemberExpression(m) => {
+                matches!(strip(&m.object), Expression::Identifier(id) if self.is_scoped(id.name.as_str()))
+                    && matches!(strip(&m.expression), Expression::NumericLiteral(_))
+            }
+            _ => false,
+        }
+    }
+
+    /// J90-P3: `c` when `e` is `var + c` (or `var` itself, 0), `c` a whole-number literal or a
+    /// module `const` bound to one.
+    fn index_offset(&self, e: &Expression<'_>, var: &str) -> Option<u64> {
+        match strip(e) {
+            Expression::Identifier(id) if id.name == var => Some(0),
+            Expression::BinaryExpression(b) if b.operator == BinaryOperator::Addition => {
+                if !matches!(strip(&b.left), Expression::Identifier(x) if x.name == var) {
+                    return None;
+                }
+                self.int_literal(&b.right)
+            }
+            _ => None,
+        }
+    }
+
+    /// J90-P3: a whole-number literal from 0 to 1024, or a module `const` bound to one.
+    fn int_literal(&self, e: &Expression<'_>) -> Option<u64> {
+        match strip(e) {
+            Expression::NumericLiteral(n)
+                if n.value >= 0.0 && n.value.fract() == 0.0 && n.value <= 1024.0 =>
+            {
+                Some(n.value as u64)
+            }
+            Expression::Identifier(id) if !self.is_scoped(id.name.as_str()) => {
+                self.int_consts.get(id.name.as_str()).copied()
+            }
+            _ => None,
+        }
+    }
+
+    /// J90-P3: in the proven copy of a counted loop, the offset `c` of an index `i + c` (0 for
+    /// `i` itself) into an array the copy reads directly.
+    fn fast_offset(&self, e: &Expression<'_>) -> Option<u64> {
+        let fast = self.fast.as_ref()?;
+        self.index_offset(e, &fast.var)
+    }
+
     fn is_scoped(&self, name: &str) -> bool {
         self.scopes.iter().any(|scope| scope.contains(name))
     }
@@ -1869,9 +2130,16 @@ impl<'s> Lowerer<'s> {
                 }
                 other => {
                     self.statement_call = matches!(other, Expression::CallExpression(_));
-                    let value = self.expr(other);
+                    // J90-PF: the call's statement form first; else `expr`'s own (`hot`).
+                    let value = self.expr_inner(other);
                     self.statement_call = false;
-                    out.push(format!("{p}{}", value.code));
+                    match self.hot_stmt(&value.code, &p) {
+                        Some(lines) => out.extend(lines),
+                        None => {
+                            let value = self.hot(value);
+                            out.push(format!("{p}{}", value.code));
+                        }
+                    }
                 }
             },
             Statement::VariableDeclaration(v) => self.var_decl(v, indent, out),
@@ -2157,6 +2425,9 @@ impl<'s> Lowerer<'s> {
     /// compiled or caller code runs while it loops); no closure, no other member read, no nested
     /// loop. `None`: the loop is lowered once, as before.
     fn fast_loop_plan(&mut self, f: &ForStatement<'_>) -> Option<LoopPlan> {
+        if self.in_fallback > 0 {
+            return None;
+        }
         let Some(ForStatementInit::VariableDeclaration(v)) = &f.init else {
             return None;
         };
@@ -2178,30 +2449,34 @@ impl<'s> Lowerer<'s> {
         {
             return None;
         }
-        // The update: `i += 1`, `i = i + 1`, `i++`, `++i`.
-        let one = |e: &Expression<'_>| matches!(strip(e), Expression::NumericLiteral(n) if n.value == 1.0);
+        // The update: `i += 1`, `i = i + 1`, `i++`, `++i`; J90-P3: or a stride `i += S` /
+        // `i = i + S`, `S` a positive whole-number literal or a module `const` bound to one.
+        let stride = |e: &Expression<'_>| self.int_literal(e).filter(|s| *s >= 1);
         let is_var = |e: &Expression<'_>| matches!(strip(e), Expression::Identifier(x) if x.name == var.as_str());
-        let update_ok = match f.update.as_ref() {
-            Some(Expression::UpdateExpression(u)) => {
-                u.operator == UpdateOperator::Increment
-                    && matches!(&u.argument, SimpleAssignmentTarget::AssignmentTargetIdentifier(x) if x.name == var.as_str())
+        let step = match f.update.as_ref() {
+            Some(Expression::UpdateExpression(u))
+                if u.operator == UpdateOperator::Increment
+                    && matches!(&u.argument, SimpleAssignmentTarget::AssignmentTargetIdentifier(x) if x.name == var.as_str()) =>
+            {
+                Some(1)
             }
-            Some(Expression::AssignmentExpression(a)) => {
-                let target = matches!(&a.left, AssignmentTarget::AssignmentTargetIdentifier(x) if x.name == var.as_str());
-                target
-                    && match a.operator {
-                        AssignmentOperator::Addition => one(&a.right),
-                        AssignmentOperator::Assign => {
-                            matches!(strip(&a.right), Expression::BinaryExpression(b) if b.operator == BinaryOperator::Addition && is_var(&b.left) && one(&b.right))
+            Some(Expression::AssignmentExpression(a)) if matches!(&a.left, AssignmentTarget::AssignmentTargetIdentifier(x) if x.name == var.as_str()) => {
+                match a.operator {
+                    AssignmentOperator::Addition => stride(&a.right),
+                    AssignmentOperator::Assign => match strip(&a.right) {
+                        Expression::BinaryExpression(b)
+                            if b.operator == BinaryOperator::Addition && is_var(&b.left) =>
+                        {
+                            stride(&b.right)
                         }
-                        _ => false,
-                    }
+                        _ => None,
+                    },
+                    _ => None,
+                }
             }
-            _ => false,
+            _ => None,
         };
-        if !update_ok {
-            return None;
-        }
+        let step = step?;
         let mut scan = LoopScan {
             var: var.clone(),
             ..LoopScan::default()
@@ -2252,6 +2527,20 @@ impl<'s> Lowerer<'s> {
                 return None;
             }
         }
+        // J90-P: an array whose `.length` the body reads keeps that length through the loop: the
+        // body neither assigns it nor pushes onto it nor stores past its end, and calls no code
+        // that could (adapters and `Math` only).
+        for x in &scan.measured {
+            if *x == var
+                || scan.assigned.contains(x)
+                || scan.declared.contains(x)
+                || scan.pushed.contains(x)
+                || scan.filled.contains(x)
+                || !self.is_scoped(x)
+            {
+                return None;
+            }
+        }
         // Each operand name the body neither declares nor assigns is checked a number before the
         // loop, unless it is one already.
         let mut speculated = Vec::new();
@@ -2277,13 +2566,23 @@ impl<'s> Lowerer<'s> {
         {
             return None;
         }
+        // J90-P3: an array read only as a value is bounds-checked alone (its elements may be
+        // anything: each read proves nothing about its element).
+        let (plain, pass): (BTreeSet<String>, BTreeSet<String>) = scan
+            .plain
+            .into_iter()
+            .partition(|x| scan.numeric_arrays.contains(x));
         Some(LoopPlan {
             var,
             bound,
             bound_name,
             typed: scan.typed.into_iter().collect(),
-            plain: scan.plain.into_iter().collect(),
+            plain,
             filled: scan.filled.into_iter().collect(),
+            measured: scan.measured.into_iter().collect(),
+            step,
+            offsets: scan.offsets.into_iter().collect(),
+            pass,
             speculated,
             carried,
             declared: scan.declared,
@@ -2311,7 +2610,9 @@ impl<'s> Lowerer<'s> {
         self.refusals.truncate(refusals);
         out.push(format!("{}else:", pad(indent)));
         self.fast_init_done = true;
+        self.in_fallback += 1;
         self.c_for_loop(f, indent + 1, out);
+        self.in_fallback -= 1;
         self.fast_init_done = false;
     }
 
@@ -2337,16 +2638,55 @@ impl<'s> Lowerer<'s> {
         for t in &plan.typed {
             guard.push(format!("{b} <= len({})", py_name(t, false, false)));
         }
+        // J90-P3: the last index a read `x[i + c]` reaches is `last + c`, `last` the largest
+        // value `range(i, b, step)` takes (none when `b <= i`).
+        let step = plan.step;
+        let in_range = |x: &str, c: u64| -> String {
+            if step == 1 {
+                if c == 0 {
+                    format!("{b} <= len({x})")
+                } else {
+                    format!("{b} + {c} <= len({x})")
+                }
+            } else {
+                let plus = if c == 0 {
+                    String::new()
+                } else {
+                    format!(" + {c}")
+                };
+                format!("({b} <= {i} or {i} + ({b} - 1 - {i}) // {step} * {step}{plus} < len({x}))")
+            }
+        };
         for x in &plan.plain {
+            let c = plan.offsets.get(x).copied().unwrap_or(0);
             let x = py_name(x, false, false);
             guard.push(format!("type({x}) is list"));
-            guard.push(format!("{b} <= len({x})"));
-            guard.push(format!("_js_doubles({x}, {i}, {b})"));
+            guard.push(in_range(&x, c));
+            if step == 1 && c == 0 {
+                guard.push(format!("_js_doubles({x}, {i}, {b})"));
+            } else if step == 1 {
+                guard.push(format!("_js_doubles({x}, {i}, {b} + {c})"));
+            } else {
+                guard.push(format!("_js_doubles({x}, {i}, len({x}))"));
+            }
+        }
+        for x in &plan.pass {
+            let c = plan.offsets.get(x).copied().unwrap_or(0);
+            let x = py_name(x, false, false);
+            guard.push(format!("type({x}) is list"));
+            guard.push(in_range(&x, c));
         }
         for x in &plan.filled {
             let x = py_name(x, false, false);
             guard.push(format!("type({x}) is list"));
             guard.push(format!("{b} <= len({x})"));
+        }
+        for x in plan
+            .measured
+            .iter()
+            .filter(|x| !plan.plain.contains(*x) && !plan.filled.contains(*x))
+        {
+            guard.push(format!("type({}) is list", py_name(x, false, false)));
         }
         let carried: Vec<String> = if carry {
             plan.carried.clone()
@@ -2358,8 +2698,13 @@ impl<'s> Lowerer<'s> {
         }
         out.push(format!("{p}if {}:", guard.join(" and ")));
         // The loop starts at the value the init gave `i` (a Python `range` reads it once).
+        let stride = if step == 1 {
+            String::new()
+        } else {
+            format!(", {step}")
+        };
         out.push(format!(
-            "{}for {i} in range({i}, {b}):  # noqa: B020",
+            "{}for {i} in range({i}, {b}{stride}):  # noqa: B020",
             pad(indent + 1)
         ));
         let saved = self.fast.replace(FastLoop {
@@ -2368,9 +2713,13 @@ impl<'s> Lowerer<'s> {
             var: plan.var.clone(),
             typed: plan.typed.iter().cloned().collect(),
             plain: plan.plain.iter().cloned().collect(),
+            pass: plan.pass.iter().cloned().collect(),
             filled: plan.filled.iter().cloned().collect(),
             carried: carried.iter().cloned().collect(),
         });
+        if let Some(outer) = saved.clone() {
+            self.fast_outer.push(outer);
+        }
         let depth = self.narrow.len();
         let mut narrowed = vec![plan.var.clone()];
         narrowed.extend(plan.speculated.iter().cloned());
@@ -2380,12 +2729,24 @@ impl<'s> Lowerer<'s> {
                 self.narrow.push((key, Fact::num()));
             }
         }
+        // J90-P: each array whose `.length` the body reads is a list there (the guard checked it,
+        // and the body cannot rebind it), so `.length` is `len(...)`.
+        for name in &plan.measured {
+            if let Some(key) = self.var_key(name) {
+                self.narrow.push((key, Fact::list()));
+            }
+        }
         let failed = std::mem::replace(&mut self.fast_carry_failed, false);
         self.breaks.push(BreakTarget::Loop);
         self.body(&f.body, indent + 2, out);
         self.breaks.pop();
+        // J90-P3: a nested copy that assigns a carried `let` a value not proven a number does not
+        // flag it here, but the nested loop's general loop (lowered in this copy too) does.
         let ok = !std::mem::replace(&mut self.fast_carry_failed, failed);
         self.narrow.truncate(depth);
+        if saved.is_some() {
+            self.fast_outer.pop();
+        }
         self.fast = saved;
         ok
     }
@@ -2411,7 +2772,60 @@ impl<'s> Lowerer<'s> {
                 .argument
                 .as_ref()
                 .is_none_or(|e| self.scan_expr(e, sc, false)),
+            // J90-P3: `throw new Error('...')`: it leaves the loop and runs no compiled code.
+            Statement::ThrowStatement(t) => match strip(&t.argument) {
+                Expression::NewExpression(n) => {
+                    matches!(strip(&n.callee), Expression::Identifier(id) if id.name == "Error" && !self.is_local("Error"))
+                        && n.arguments.iter().all(|a| {
+                            matches!(
+                                a.as_expression().map(strip),
+                                Some(Expression::StringLiteral(_))
+                            )
+                        })
+                }
+                _ => false,
+            },
+            // J90-P3: a counted loop nested in the body (`for (let k = a; k < b; k += S)`): its
+            // variable and every binding it declares are the body's, and its own reads by `k` are
+            // reads by a local (`scan_expr`); it gets its own proven copy when it is lowered.
+            Statement::ForStatement(f) => {
+                let Some(ForStatementInit::VariableDeclaration(v)) = &f.init else {
+                    return false;
+                };
+                if v.kind != VariableDeclarationKind::Let || v.declarations.len() != 1 {
+                    return false;
+                }
+                let d = &v.declarations[0];
+                let BindingPattern::BindingIdentifier(id) = &d.id else {
+                    return false;
+                };
+                if id.name.as_str() == sc.var || f.test.is_none() {
+                    return false;
+                }
+                sc.declared.insert(id.name.to_string());
+                sc.assigned.insert(id.name.to_string());
+                sc.loop_vars.insert(id.name.to_string());
+                let init_ok = d.init.as_ref().is_some_and(|e| self.scan_expr(e, sc, true));
+                let update_ok = match f.update.as_ref() {
+                    Some(Expression::AssignmentExpression(a)) => {
+                        matches!(&a.left, AssignmentTarget::AssignmentTargetIdentifier(x) if x.name == id.name)
+                            && self.scan_assign(a, sc)
+                    }
+                    Some(Expression::UpdateExpression(u)) => {
+                        matches!(&u.argument, SimpleAssignmentTarget::AssignmentTargetIdentifier(x) if x.name == id.name)
+                    }
+                    _ => false,
+                };
+                init_ok
+                    && update_ok
+                    && f.test
+                        .as_ref()
+                        .is_some_and(|t| self.scan_expr(t, sc, false))
+                    && self.scan_stmt(&f.body, sc)
+            }
             Statement::IfStatement(i) => {
+                // J90-P3: a bare name tested is a sink (`_js_truthy` runs no code).
+                sc.sink = matches!(strip(&i.test), Expression::Identifier(_));
                 self.scan_expr(&i.test, sc, false)
                     && self.scan_stmt(&i.consequent, sc)
                     && i.alternate.as_ref().is_none_or(|a| self.scan_stmt(a, sc))
@@ -2428,6 +2842,18 @@ impl<'s> Lowerer<'s> {
                         return false;
                     }
                     sc.declared.insert(id.name.to_string());
+                    // J90-P3: a `const` read from `x[i + c]`: a later operand use of it is an
+                    // operand use of `x`'s element.
+                    if v.kind == VariableDeclarationKind::Const
+                        && let Some(Expression::ComputedMemberExpression(m)) =
+                            d.init.as_ref().map(strip)
+                        && let Expression::Identifier(object) = strip(&m.object)
+                        && self.index_offset(&m.expression, &sc.var).is_some()
+                    {
+                        sc.from_read
+                            .insert(id.name.to_string(), object.name.to_string());
+                        sc.sink = true;
+                    }
                     d.init.as_ref().is_none_or(|e| self.scan_expr(e, sc, false))
                 })
             }
@@ -2527,7 +2953,11 @@ impl<'s> Lowerer<'s> {
                         .is_some_and(|k| self.fresh_arrays.contains(&k))
                 {
                     sc.pushed.insert(name.to_string());
-                    return args_ok(self, sc, false);
+                    // J90-P3: the pushed value is a sink.
+                    return c.arguments[0].as_expression().is_some_and(|e| {
+                        sc.sink = true;
+                        self.scan_expr(e, sc, false)
+                    });
                 }
                 false
             }
@@ -2539,6 +2969,7 @@ impl<'s> Lowerer<'s> {
     /// Float64Array), so a name there is checked a number before the loop.
     fn scan_expr(&self, e: &Expression<'_>, sc: &mut LoopScan, numeric: bool) -> bool {
         use BinaryOperator as Op;
+        let sink = std::mem::replace(&mut sc.sink, false);
         match e {
             Expression::NumericLiteral(_)
             | Expression::BooleanLiteral(_)
@@ -2552,12 +2983,37 @@ impl<'s> Lowerer<'s> {
                 if numeric {
                     sc.numeric.insert(name.to_string());
                 }
+                if !sink && let Some(array) = sc.from_read.get(name) {
+                    sc.numeric_arrays.insert(array.clone());
+                }
                 true
             }
-            Expression::ParenthesizedExpression(x) => self.scan_expr(&x.expression, sc, numeric),
-            Expression::TSNonNullExpression(x) => self.scan_expr(&x.expression, sc, numeric),
-            Expression::TSAsExpression(x) => self.scan_expr(&x.expression, sc, numeric),
-            Expression::TSSatisfiesExpression(x) => self.scan_expr(&x.expression, sc, numeric),
+            // J90-P3: an array literal's elements, each a sink (stored as it is).
+            Expression::ArrayExpression(a) => a.elements.iter().all(|el| match el {
+                ArrayExpressionElement::SpreadElement(_) | ArrayExpressionElement::Elision(_) => {
+                    false
+                }
+                other => other.as_expression().is_some_and(|x| {
+                    sc.sink = true;
+                    self.scan_expr(x, sc, false)
+                }),
+            }),
+            Expression::ParenthesizedExpression(x) => {
+                sc.sink = sink;
+                self.scan_expr(&x.expression, sc, numeric)
+            }
+            Expression::TSNonNullExpression(x) => {
+                sc.sink = sink;
+                self.scan_expr(&x.expression, sc, numeric)
+            }
+            Expression::TSAsExpression(x) => {
+                sc.sink = sink;
+                self.scan_expr(&x.expression, sc, numeric)
+            }
+            Expression::TSSatisfiesExpression(x) => {
+                sc.sink = sink;
+                self.scan_expr(&x.expression, sc, numeric)
+            }
             Expression::BinaryExpression(b) => {
                 let numeric_op = matches!(
                     b.operator,
@@ -2604,14 +3060,42 @@ impl<'s> Lowerer<'s> {
                 let Expression::Identifier(object) = strip(&m.object) else {
                     return false;
                 };
-                if !at_var {
-                    return false;
+                let name = object.name.to_string();
+                // J90-P3: `x[i + c]`, a constant offset past the loop variable.
+                if let Some(c) = self.index_offset(&m.expression, &sc.var) {
+                    let at = sc.offsets.entry(name.clone()).or_insert(0);
+                    *at = (*at).max(c);
+                    if !sink {
+                        sc.numeric_arrays.insert(name.clone());
+                    }
+                    sc.plain.insert(name);
+                    return true;
                 }
-                sc.plain.insert(object.name.to_string());
-                true
+                // J90-P3: `x[k]`, `k` a binding the body declares (a nested loop's variable): a
+                // read the general lowering makes, of an array checked a list before the loop.
+                let _ = at_var;
+                match strip(&m.expression) {
+                    Expression::Identifier(k) if sc.loop_vars.contains(k.name.as_str()) => {
+                        sc.measured.insert(name);
+                        self.scan_expr(&m.expression, sc, true)
+                    }
+                    _ => false,
+                }
             }
             Expression::StaticMemberExpression(m) => {
-                !m.optional && m.property.name == "length" && self.typed_array(&m.object).is_some()
+                if m.optional || m.property.name != "length" {
+                    return false;
+                }
+                if self.typed_array(&m.object).is_some() {
+                    return true;
+                }
+                // J90-P: `.length` of a plain array named by a binding, checked a list before the
+                // loop (`fast_copy`).
+                let Expression::Identifier(object) = strip(&m.object) else {
+                    return false;
+                };
+                sc.measured.insert(object.name.to_string());
+                true
             }
             Expression::CallExpression(c) => self.scan_call(c, sc),
             _ => false,
@@ -2991,10 +3475,11 @@ impl<'s> Lowerer<'s> {
                 let object = self.expr(&m.object);
                 let key = self.expr(&m.expression);
                 let value = self.expr(&a.right);
-                out.push(format!(
-                    "{p}_js_put({}, {}, {})",
-                    object.code, key.code, value.code
-                ));
+                let code = format!("_js_put({}, {}, {})", object.code, key.code, value.code);
+                match self.hot_stmt(&code, &p) {
+                    Some(lines) => out.extend(lines),
+                    None => out.push(format!("{p}{code}")),
+                }
             }
             AssignmentTarget::ArrayAssignmentTarget(t) if op.is_none() => {
                 self.array_assignment(t, &a.right, indent, out);
@@ -3098,14 +3583,24 @@ impl<'s> Lowerer<'s> {
                     // J87: every element is a fresh array of exactly this many items.
                     out.push(format!("{p}for {} in {}:", names.join(", "), right.code));
                 } else {
-                    let item = format!("_js_item{}", self.tmp);
-                    self.tmp += 1;
-                    out.push(format!("{p}for {item} in {}:", right.code));
-                    for (i, name) in names.iter().enumerate() {
-                        if name != "_js_hole" {
-                            out.push(format!("{}{name} = _js_get({item}, {i})", pad(indent + 1)));
-                        }
-                    }
+                    // J90-P: each item through `_js_rows`, which slices a list long enough at
+                    // once and reads anything else as the general lowering did (`_js_get` of
+                    // each named index, in order).
+                    let wanted: Vec<String> = names
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, name)| *name != "_js_hole")
+                        .map(|(i, _)| i.to_string())
+                        .collect();
+                    out.push(format!(
+                        "{p}for {}{} in _js_rows({}, {}, ({}{})):",
+                        names.join(", "),
+                        if names.len() == 1 { "," } else { "" },
+                        right.code,
+                        names.len(),
+                        wanted.join(", "),
+                        if wanted.len() == 1 { "," } else { "" }
+                    ));
                 }
             }
             other => {
@@ -3127,6 +3622,229 @@ impl<'s> Lowerer<'s> {
     // ---------------------------------------------------------------- expressions
 
     fn expr(&mut self, e: &Expression<'_>) -> Py {
+        let value = self.expr_inner(e);
+        self.hot(value)
+    }
+
+    /// J90-P6: guarded inline expansion of a hot helper call (RULES.md, *J90-P6 rules*). Inside a
+    /// loop body, `_js_m_get(m, k)`, `_js_strict_eq(a, b)` and `_js_add(a, b)` are rewritten to a
+    /// conditional expression whose fast arm is the helper's own first branch under an exact-type
+    /// guard at least as strict, and whose slow arm is the unchanged helper call. Operands are
+    /// evaluated once each, in their original order: every operand but the first must be a name
+    /// or a literal (read again in the slow arm, with no code run in between); the first, if it is
+    /// anything else, is bound by `:=` in the guard's first test, which always runs. Where `:=`
+    /// cannot stand (a comprehension's iterable, a lambda), the first operand must be simple too.
+    fn hot(&mut self, value: Py) -> Py {
+        // Measured (docs/porting.md, *Guarded inline expansion*): a comprehension element and the
+        // other helpers (`_js_get`, `_js_num`, `_js_coalesce_value`, `_js_list_at`) moved no
+        // path by more than the run's spread and cost the wheel 1.5x its size budget.
+        if self.scopes.is_empty() || self.hot_comp > 0 || !self.breaks.contains(&BreakTarget::Loop)
+        {
+            return value;
+        }
+        let walrus = self.no_walrus == 0 && self.in_callback == 0;
+        let (negate, call) = match value.code.strip_prefix("not ") {
+            Some(rest) => (true, rest),
+            None => (false, value.code.as_str()),
+        };
+        let Some((helper, args)) = split_call(call) else {
+            return value;
+        };
+        let arity = match helper {
+            "_js_m_get" | "_js_strict_eq" | "_js_add" => 2,
+            // J90-PF: `m.has(k)`, a proven list read by an index, `xs.push(x)` of one item.
+            "_js_m_has" | "_js_list_at" | "_js_m_push" => 2,
+            _ => return value,
+        };
+        if args.len() != arity || (negate && helper != "_js_strict_eq") {
+            return value;
+        }
+        if args[1..].iter().any(|a| !simple_operand(a)) {
+            return value;
+        }
+        // A literal operand must be of the fast arm's own type (a literal of another type could
+        // never take it), and the first is never a literal: the guard tests no literal's type.
+        let literal = |a: &str| simple_operand(a) && !is_name(a);
+        let second = &args[1];
+        // J90-PF: an index literal is a non-negative int under 16 digits (its own type and range).
+        let index_literal = |a: &str| is_int_literal(a) && !a.starts_with('-') && a.len() < 16;
+        let literal_ok = match helper {
+            "_js_m_get" | "_js_m_has" => {
+                !literal(second) || is_str_literal(second) || index_literal(second)
+            }
+            "_js_strict_eq" => !literal(second),
+            "_js_list_at" => !literal(second) || index_literal(second),
+            "_js_m_push" => true,
+            _ => {
+                !literal(second)
+                    || (is_int_literal(second) && second.trim_start_matches('-').len() < 16)
+            }
+        };
+        let first = args[0].clone();
+        if literal(&first) || !literal_ok {
+            return value;
+        }
+        // J90-PF: `_js_list_at`'s guard tests no receiver, and `xs.append(x) or len(xs)` reads
+        // the receiver again after the item: each must be a name.
+        if matches!(helper, "_js_list_at" | "_js_m_push") && !is_name(&first) {
+            return value;
+        }
+        // `type(t := x)`: an assignment expression may stand alone as a call's argument.
+        let (bind, name) = if simple_operand(&first) {
+            (first.clone(), first.clone())
+        } else if walrus {
+            self.hot_tmp += 1;
+            let t = format!("_js_h{}", self.hot_tmp);
+            (format!("{t} := {first}"), t)
+        } else {
+            return value;
+        };
+        // An addend the fast arm accepts lies within half the safe range (`_JS_SAFE_MAX / 2`), so
+        // the exact sum of two is itself a double's exact int and `_js_num` would return it as is.
+        const HALF: &str = "4503599627370496";
+        // J90-PF: the ints a double holds exactly (`_JS_SAFE_MIN` / `_JS_SAFE_MAX`): each is its own
+        // `_js_key` and compares by value under `===`.
+        const SAFE: &str = "9007199254740992";
+        let a = &name;
+        let code = match helper {
+            "_js_m_get" | "_js_m_has" => {
+                let k = &args[1];
+                // J90-PF: a key that is its own `_js_key`: a string, or a safe int (was: strings).
+                let key_test = if is_str_literal(k) || index_literal(k) {
+                    String::new()
+                } else {
+                    format!(
+                        " and (type({k}) is str or type({k}) is int and -{SAFE} <= {k} <= {SAFE})"
+                    )
+                };
+                if helper == "_js_m_get" {
+                    format!(
+                        "({a}._entries.get({k}, _JS_UNDEFINED) if type({bind}) is _JsMap{key_test} else _js_m_get({a}, {k}))"
+                    )
+                } else {
+                    // `has` of a Set too: its items are keyed by the same `_js_key` tags.
+                    format!(
+                        "({k} in {a}._entries if type({bind}) is _JsMap{key_test} else {k} in {a}._items if type({a}) is _JsSet{key_test} else _js_m_has({a}, {k}))"
+                    )
+                }
+            }
+            "_js_strict_eq" => {
+                let b = &args[1];
+                let (op, not) = if negate { ("!=", "not ") } else { ("==", "") };
+                // J90-PF: and two safe ints (the helper's second branch), compared by value.
+                format!(
+                    "({a} {op} {b} if type({bind}) is type({b}) is str or type({a}) is type({b}) is int and -{SAFE} <= {a} <= {SAFE} and -{SAFE} <= {b} <= {SAFE} else {not}_js_strict_eq({a}, {b}))"
+                )
+            }
+            "_js_list_at" => {
+                // J90-PF: a proven list read at an int index inside it: the element (the helper's
+                // own first branch).
+                let i = &args[1];
+                let i_test = if index_literal(i) {
+                    format!("{i} < len({a})")
+                } else {
+                    format!("type({i}) is int and 0 <= {i} < len({a})")
+                };
+                format!("({a}[{i}] if {i_test} else _js_list_at({a}, {i}))")
+            }
+            "_js_m_push" => {
+                // J90-PF: a list's push of one item is its append, and answers the new length
+                // (the helper's own first branch). The item is a name or a literal, so reading the
+                // receiver again for its length reads the same list.
+                let x = &args[1];
+                format!(
+                    "({a}.append({x}) or len({a}) if type({a}) is list else _js_m_push({a}, {x}))"
+                )
+            }
+            _ => {
+                let b = &args[1];
+                let b_test = if is_int_literal(b) && b.trim_start_matches('-').len() < 16 {
+                    String::new()
+                } else {
+                    format!(" and type({b}) is int and -{HALF} <= {b} <= {HALF}")
+                };
+                format!(
+                    "({a} + {b} if type({bind}) is int{b_test} and -{HALF} <= {a} <= {HALF} else _js_add({a}, {b}))"
+                )
+            }
+        };
+        Py {
+            code,
+            prec: ATOM,
+            ..value
+        }
+    }
+
+    /// J90-P6 / J90-PF: where a guarded inline expansion may be written: a loop body of a
+    /// function, outside a comprehension element.
+    fn hot_here(&self) -> bool {
+        !self.scopes.is_empty() && self.hot_comp == 0 && self.breaks.contains(&BreakTarget::Loop)
+    }
+
+    /// J90-PF: guarded inline expansion of a helper call that stands as a statement in a loop
+    /// body of a function (RULES.md, *J90-PF rules*; where `hot` applies): `m.set(k, v)`,
+    /// `xs.push(x)` and `xs[i] = v` are each written as an `if` whose first arm is the helper's
+    /// own first branch under a guard at least as strict and whose `else` is the unchanged call.
+    /// The receiver, key and value of `set` and of a store must each be a name or a literal (read
+    /// again in the arm with no code run in between); a push's one item may be anything:
+    /// `xs.append(x)` reads `xs` before it evaluates `x`, as JS reads the receiver first, and only
+    /// one arm runs. The result is discarded, as the statement discards the call's.
+    fn hot_stmt(&self, code: &str, p: &str) -> Option<Vec<String>> {
+        if !self.hot_here() {
+            return None;
+        }
+        let (helper, args) = split_call(code)?;
+        let name = |a: &str| is_name(a) && !matches!(a, "True" | "False" | "None");
+        let index_literal = |a: &str| is_int_literal(a) && !a.starts_with('-') && a.len() < 16;
+        const SAFE: &str = "9007199254740992";
+        let q = format!("{p}    ");
+        match (helper, args.as_slice()) {
+            ("_js_m_set", [m, k, v]) if name(m) && simple_value(v) => {
+                let key_test = if is_str_literal(k) || index_literal(k) {
+                    String::new()
+                } else if name(k) {
+                    format!(
+                        " and (type({k}) is str or type({k}) is int and -{SAFE} <= {k} <= {SAFE})"
+                    )
+                } else {
+                    return None;
+                };
+                Some(vec![
+                    format!("{p}if type({m}) is _JsMap{key_test} and {m}._keys is None:"),
+                    format!("{q}{m}._entries[{k}] = {v}"),
+                    format!("{p}else:"),
+                    format!("{q}{code}"),
+                ])
+            }
+            ("_js_m_push", [xs, _]) if name(xs) => {
+                let item = &args[1];
+                Some(vec![
+                    format!("{p}if type({xs}) is list:"),
+                    format!("{q}{xs}.append({item})"),
+                    format!("{p}else:"),
+                    format!("{q}{code}"),
+                ])
+            }
+            ("_js_put", [xs, i, v]) if name(xs) && simple_operand(v) => {
+                let i_test = if index_literal(i) {
+                    format!("{i} < len({xs})")
+                } else if name(i) {
+                    format!("type({i}) is int and 0 <= {i} < len({xs})")
+                } else {
+                    return None;
+                };
+                Some(vec![
+                    format!("{p}if type({xs}) is list and {i_test}:"),
+                    format!("{q}{xs}[{i}] = {v}"),
+                    format!("{p}else:"),
+                    format!("{q}{code}"),
+                ])
+            }
+            _ => None,
+        }
+    }
+
+    fn expr_inner(&mut self, e: &Expression<'_>) -> Py {
         match e {
             Expression::BooleanLiteral(b) => Py {
                 pure: true,
@@ -3172,8 +3890,14 @@ impl<'s> Lowerer<'s> {
             Expression::ConditionalExpression(c) => {
                 let test = self.expr(&c.test);
                 let test = truthy(test);
+                // J90-P: each branch under what the test being true (false) proves.
+                let depth = self.narrow.len();
+                self.narrow_on(&c.test, true);
                 let yes = self.expr(&c.consequent);
+                self.narrow.truncate(depth);
+                self.narrow_on(&c.test, false);
                 let no = self.expr(&c.alternate);
+                self.narrow.truncate(depth);
                 let code = Py::new(
                     format!("{} if {} else {}", yes.at(OR), test.at(OR), no.at(TERNARY)),
                     TERNARY,
@@ -3201,7 +3925,25 @@ impl<'s> Lowerer<'s> {
                 }
                 if self.is_process_env(&m.object) {
                     let key = py_str(m.property.name.as_str());
-                    return self.process_env_read(key);
+                    return self.process_env_read(key, m.span);
+                }
+                // J90-3: a constant of a namespace-imported Node module (`path.sep`): its adapter
+                // row, read by name. Anything else of the namespace stays refused below.
+                if let Expression::Identifier(id) = strip(&m.object)
+                    && !self.is_scoped(id.name.as_str())
+                    && let Some(module) = self.namespaces.get(id.name.as_str()).cloned()
+                    && let Some(adapter) =
+                        self.ctx.adapters.import(&module, m.property.name.as_str())
+                    && adapter.kind == AdapterKind::Constant
+                {
+                    self.imports
+                        .entry(self.ctx.adapter_module.clone())
+                        .or_default()
+                        .insert(adapter.py_name.to_string());
+                    return Py {
+                        pure: true,
+                        ..Py::atom(adapter.py_name.to_string())
+                    };
                 }
                 // J89-3: a Float64Array's `.length` (fixed when it is made); nothing else of it.
                 if let Some(name) = self.typed_array(&m.object) {
@@ -3222,8 +3964,9 @@ impl<'s> Lowerer<'s> {
                     && matches!(strip(&m.object), Expression::Identifier(p) if p.name == "process")
                     && !self.is_local("process")
                 {
-                    let adapter =
-                        adapters::global("process.env.all").expect("declared in adapters.rs");
+                    let Some(adapter) = self.ctx.adapters.global("process.env.all") else {
+                        return self.refuse(m.span, "process.env as a value: no declared adapter");
+                    };
                     self.imports
                         .entry(self.ctx.adapter_module.clone())
                         .or_default()
@@ -3236,7 +3979,9 @@ impl<'s> Lowerer<'s> {
                     && m.property.name == "pid"
                     && !self.is_local("process")
                 {
-                    let adapter = adapters::global("process.pid").expect("declared in adapters.rs");
+                    let Some(adapter) = self.ctx.adapters.global("process.pid") else {
+                        return self.refuse(m.span, "process.pid: no declared adapter");
+                    };
                     self.imports
                         .entry(self.ctx.adapter_module.clone())
                         .or_default()
@@ -3313,7 +4058,7 @@ impl<'s> Lowerer<'s> {
                 // J87-3: `process.env[name]`, through the adapter.
                 if self.is_process_env(&m.object) {
                     let key = self.expr(&m.expression);
-                    return self.process_env_read(key.code);
+                    return self.process_env_read(key.code, m.span);
                 }
                 // J89-3: an element of a Float64Array: a float, or `undefined` for a key that is
                 // not a valid index (`_js_ta_get`); in the proven copy of a counted loop, at the
@@ -3334,19 +4079,25 @@ impl<'s> Lowerer<'s> {
                         .with_fact(Some(&Fact::or_undefined(Fact::f64())));
                 }
                 // J89-3: in the proven copy of a counted loop, an element of a plain array its guard
-                // checked (`_js_doubles`): a proven number.
-                if self.is_fast_index(&m.expression)
+                // checked (`_js_doubles`): a proven number. J90-P3: at `i + c` too, and an element
+                // of an array the guard only bounds-checked, read as it is (proving nothing).
+                if let Some(c) = self.fast_offset(&m.expression)
                     && let Expression::Identifier(id) = strip(&m.object)
-                    && self
-                        .fast
-                        .as_ref()
-                        .is_some_and(|f| f.plain.contains(id.name.as_str()))
+                    && let Some(fast) = self.fast.as_ref()
+                    && (fast.plain.contains(id.name.as_str())
+                        || fast.pass.contains(id.name.as_str()))
                 {
+                    let fact = if fast.plain.contains(id.name.as_str()) {
+                        Fact::num()
+                    } else {
+                        Fact::default()
+                    };
                     let py = py_name(id.name.as_str(), false, false);
-                    let var = py_name(&self.fast.as_ref().unwrap().var, false, false);
+                    let var = py_name(&fast.var, false, false);
+                    let at = if c == 0 { var } else { format!("{var} + {c}") };
                     return Py {
                         pure: true,
-                        ..Py::atom(format!("{py}[{var}]")).with_fact(Some(&Fact::num()))
+                        ..Py::atom(format!("{py}[{at}]")).with_fact(Some(&fact))
                     };
                 }
                 // A literal key is a name (`xs['map']`); a computed one is checked at run time
@@ -3428,7 +4179,28 @@ impl<'s> Lowerer<'s> {
                 if object.is_list {
                     return Py::atom(format!("_js_list_at({}, {})", object.code, key.code));
                 }
-                let read = Py::atom(format!("_js_get({}, {})", object.code, key.code));
+                // J90-PF: inside a loop body, a read by a key proven a number, of a receiver and a
+                // key that are names: the list's element when the receiver is a list and the key
+                // an int index inside it (`_js_get`'s own branch for that pair), else `_js_get`.
+                let index_literal =
+                    literal_index.is_some() && is_int_literal(&key.code) && key.code.len() < 16;
+                let read = if key.is_num
+                    && self.hot_here()
+                    && is_name(&object.code)
+                    && (is_name(&key.code) || index_literal)
+                {
+                    let (o, k) = (&object.code, &key.code);
+                    let k_test = if index_literal {
+                        format!("{k} < len({o})")
+                    } else {
+                        format!("type({k}) is int and 0 <= {k} < len({o})")
+                    };
+                    Py::atom(format!(
+                        "({o}[{k}] if type({o}) is list and {k_test} else _js_get({o}, {k}))"
+                    ))
+                } else {
+                    Py::atom(format!("_js_get({}, {})", object.code, key.code))
+                };
                 // J87: element 0 of what `exec` returned is the matched `str` (reading it from
                 // `null` is the TypeError JS raises too).
                 if object.is_match
@@ -3540,8 +4312,10 @@ impl<'s> Lowerer<'s> {
 
     /// J87-3: a read of the process environment (`adapters.rs`, `process.env`): a string, or
     /// `undefined` when the variable is unset.
-    fn process_env_read(&mut self, key: String) -> Py {
-        let adapter = adapters::global("process.env").expect("declared in adapters.rs");
+    fn process_env_read(&mut self, key: String, span: Span) -> Py {
+        let Some(adapter) = self.ctx.adapters.global("process.env") else {
+            return self.refuse(span, "process.env read: no declared adapter");
+        };
         self.imports
             .entry(self.ctx.adapter_module.clone())
             .or_default()
@@ -3843,7 +4617,8 @@ impl<'s> Lowerer<'s> {
                 let value = self.expr(&b.left);
                 match self.class_ref(&b.right) {
                     Some(class) => {
-                        Py::boolean(format!("isinstance({}, {class})", value.code), ATOM)
+                        // J90-P7: through `_js_instanceof`, which mypyc compiles as the builtin.
+                        Py::boolean(format!("_js_instanceof({}, {class})", value.code), ATOM)
                     }
                     None => {
                         self.refuse(b.span, "instanceof anything but a compiled or Error class")
@@ -3858,6 +4633,41 @@ impl<'s> Lowerer<'s> {
     }
 
     fn strict_eq(&mut self, left: &Expression<'_>, right: &Expression<'_>, negate: bool) -> Py {
+        // J90-P: `typeof x === 'string'` (or 'number', 'boolean', 'undefined', either side, or
+        // `!==`): the one type test `_js_typeof` answers that name for, without the name.
+        for (side, other) in [(left, right), (right, left)] {
+            if let (Expression::UnaryExpression(u), Expression::StringLiteral(name)) =
+                (strip_parens(side), strip_parens(other))
+                && u.operator == UnaryOperator::Typeof
+            {
+                let test = match name.value.as_str() {
+                    Some("string") => Some("isinstance({}, str)"),
+                    Some("boolean") => Some("isinstance({}, bool)"),
+                    Some("number") => Some("_js_is_number({})"),
+                    Some("undefined") => Some("{} is _JS_UNDEFINED"),
+                    _ => None,
+                };
+                if let Some(test) = test {
+                    let value = self.expr(&u.argument);
+                    let operand = if test.starts_with('{') {
+                        value.at(CMP + 1)
+                    } else {
+                        value.code.clone()
+                    };
+                    if negate && test == "{} is _JS_UNDEFINED" {
+                        return Py::boolean(format!("{operand} is not _JS_UNDEFINED"), CMP);
+                    }
+                    let code = test.replace("{}", &operand);
+                    return if negate {
+                        Py::boolean(format!("not {code}"), NOT)
+                    } else if test.starts_with('{') {
+                        Py::boolean(code, CMP)
+                    } else {
+                        Py::boolean(code, ATOM)
+                    };
+                }
+            }
+        }
         // J87: comparing a local with null or undefined does not let its value escape.
         let l = if is_nullish_literal(right) {
             self.peek(left)
@@ -3925,7 +4735,24 @@ impl<'s> Lowerer<'s> {
 
     fn logical(&mut self, l: &LogicalExpression<'_>) -> Py {
         let left = self.expr(&l.left);
+        // J90-P: the right side runs only where the left is truthy (`&&`) or falsy (`||`), so it
+        // is lowered under what that proves of `const` bindings, as an `if` narrows its branches.
+        let depth = self.narrow.len();
+        let length_ok = self.length_ok;
+        match l.operator {
+            LogicalOperator::And => {
+                self.length_ok = self.pure_test(&l.right);
+                self.narrow_on(&l.left, true);
+            }
+            LogicalOperator::Or => {
+                self.length_ok = false;
+                self.narrow_on(&l.left, false);
+            }
+            LogicalOperator::Coalesce => self.length_ok = false,
+        }
         let right = self.expr(&l.right);
+        self.length_ok = length_ok;
+        self.narrow.truncate(depth);
         match l.operator {
             LogicalOperator::And | LogicalOperator::Or if left.is_bool && right.is_bool => {
                 let (op, prec) = if l.operator == LogicalOperator::And {
@@ -4150,6 +4977,11 @@ impl<'s> Lowerer<'s> {
         self.push_scope(scope, a.span.start);
         for name in callback_params {
             self.bind(&name, Fact::default());
+            // J90-P: an expression body cannot assign a parameter (an assignment inside an
+            // expression is refused), so each is a `const` there, which a guard may narrow.
+            if let Some(key) = self.var_key(&name) {
+                self.consts.insert(key);
+            }
         }
         // J89-5: an annotated parameter declares its data fields (`(o: Omission) => o.count`), as
         // a function's parameter does (`bind_params`).
@@ -4174,6 +5006,112 @@ impl<'s> Lowerer<'s> {
         }
         params.push("*_".to_string());
         Py::new(format!("lambda {}: {code}", params.join(", ")), LAMBDA)
+    }
+
+    /// J90-P2: an expression that cannot change any array's length or run code that could: names,
+    /// literals, member reads (a getter is assumed to have no effect, as the key sorts assume),
+    /// `typeof`, `!`, `-`, comparisons, arithmetic, `&&` / `||` / `??`, `?:`, and calls of
+    /// `Number.isInteger`, `Number.isNaN` and `Array.isArray` on such expressions.
+    fn pure_test(&self, e: &Expression<'_>) -> bool {
+        match strip(e) {
+            Expression::Identifier(_)
+            | Expression::NumericLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_) => true,
+            Expression::StaticMemberExpression(m) => self.pure_test(&m.object),
+            Expression::ComputedMemberExpression(m) => {
+                self.pure_test(&m.object) && self.pure_test(&m.expression)
+            }
+            Expression::UnaryExpression(u) => {
+                matches!(
+                    u.operator,
+                    UnaryOperator::Typeof
+                        | UnaryOperator::LogicalNot
+                        | UnaryOperator::UnaryNegation
+                ) && self.pure_test(&u.argument)
+            }
+            Expression::BinaryExpression(b) => {
+                !matches!(b.operator, BinaryOperator::In | BinaryOperator::Instanceof)
+                    && self.pure_test(&b.left)
+                    && self.pure_test(&b.right)
+            }
+            Expression::LogicalExpression(l) => self.pure_test(&l.left) && self.pure_test(&l.right),
+            Expression::ConditionalExpression(c) => {
+                self.pure_test(&c.test)
+                    && self.pure_test(&c.consequent)
+                    && self.pure_test(&c.alternate)
+            }
+            Expression::CallExpression(c) => {
+                let known = matches!(strip(&c.callee), Expression::StaticMemberExpression(m)
+                    if !m.optional
+                        && matches!(strip(&m.object), Expression::Identifier(o)
+                            if (o.name == "Number" && matches!(m.property.name.as_str(), "isInteger" | "isNaN"))
+                                || (o.name == "Array" && m.property.name == "isArray")));
+                known
+                    && !self.is_local("Number")
+                    && !self.is_local("Array")
+                    && !c.optional
+                    && c.arguments
+                        .iter()
+                        .all(|a| a.as_expression().is_some_and(|e| self.pure_test(e)))
+            }
+            _ => false,
+        }
+    }
+
+    /// J90-P2: an arrow `(x) => e` whose body a comprehension may hold in place of the lambda
+    /// `callback` makes: one plain parameter (no default, no pattern, no rest), an expression body,
+    /// and no function in `e` (one could outlive its element, and a comprehension's variable is
+    /// one binding for every element, a lambda's parameter one per call).
+    fn inlinable_callback(&self, a: &ArrowFunctionExpression<'_>) -> bool {
+        let Some(body) = a.body.as_expression() else {
+            return false;
+        };
+        let text = self.text(body.span());
+        !a.r#async
+            && a.params.rest.is_none()
+            && a.params.items.len() == 1
+            && a.params.items[0].initializer.is_none()
+            && matches!(
+                a.params.items[0].pattern,
+                BindingPattern::BindingIdentifier(_)
+            )
+            && !text.contains("=>")
+            && !text.contains("function")
+            && !text.contains("class")
+    }
+
+    /// J90-P2: the parameter's Python name and the body of an `inlinable_callback`, lowered as
+    /// `callback` lowers it (the parameter a `const` a guard may narrow).
+    fn inline_callback(&mut self, a: &ArrowFunctionExpression<'_>) -> (String, Py) {
+        let BindingPattern::BindingIdentifier(id) = &a.params.items[0].pattern else {
+            unreachable!("inlinable_callback checked a plain parameter")
+        };
+        let body = a
+            .body
+            .as_expression()
+            .expect("inlinable_callback checked an expression body");
+        let py = py_name(id.name.as_str(), false, false);
+        self.claim(id.name.as_str(), &py, id.span);
+        let mut scope = HashSet::new();
+        scope.insert(id.name.to_string());
+        self.push_scope(scope, a.span.start);
+        self.bind(id.name.as_str(), Fact::default());
+        if let Some(key) = self.var_key(id.name.as_str()) {
+            self.consts.insert(key);
+        }
+        self.declare_annotation(
+            id.name.as_str(),
+            a.params.items[0].type_annotation.as_deref(),
+        );
+        self.rets.push(None);
+        self.in_callback += 1;
+        let value = self.expr(body);
+        self.in_callback -= 1;
+        self.rets.pop();
+        self.pop_scope();
+        (py, value)
     }
 
     /// J87: a direct call of a module function: its typed body when every guarded parameter's
@@ -4249,6 +5187,16 @@ impl<'s> Lowerer<'s> {
                         args[0].code
                     )));
                 }
+                if as_statement {
+                    // J90-PF: several items: `_js_m_push`'s own `extend` of them, in order (the
+                    // receiver is read first, then each item, as JS reads them).
+                    let items: Vec<String> = args.iter().map(|a| a.code.clone()).collect();
+                    return Some(Py::atom(format!(
+                        "{}.extend(({},))",
+                        receiver.at(ATOM),
+                        items.join(", ")
+                    )));
+                }
                 Some(returned(Ret::Num, format!("_js_m_push({})", all(args))))
             }
             "includes" if receiver.is_list && one_str && (receiver.pure || args[0].pure) => {
@@ -4312,6 +5260,38 @@ impl<'s> Lowerer<'s> {
                             if l.value.as_str().is_some_and(|v| !v.contains(['$', '\\']))) =>
             {
                 Some(returned(Ret::Str, format!("_js_re_replace({})", all(args))))
+            }
+            // J90-PF: `s.endsWith(lit)` / `s.startsWith(lit)`, `lit` an ASCII string literal and
+            // the one argument: Python's own `endswith` / `startswith` on a `str` (an ASCII unit
+            // is its own code point, and no surrogate unit equals one, so comparing the last or
+            // first code units is comparing those code points), else the helper. A receiver that
+            // is not a proven `str` must be a name, read twice.
+            "endsWith" | "startsWith"
+                if args.len() == 1
+                    && matches!(call.arguments.first().and_then(|a| a.as_expression()).map(strip),
+                        Some(Expression::StringLiteral(l)) if l.value.as_str().is_some_and(str::is_ascii))
+                    && (receiver.is_str || is_name(&receiver.code)) =>
+            {
+                let py = if method == "endsWith" {
+                    "endswith"
+                } else {
+                    "startswith"
+                };
+                let lit = &args[0].code;
+                if receiver.is_str {
+                    Some(Py::boolean(
+                        format!("{}.{py}({lit})", receiver.at(ATOM)),
+                        ATOM,
+                    ))
+                } else {
+                    let r = &receiver.code;
+                    Some(Py::boolean(
+                        format!(
+                            "({r}.{py}({lit}) if type({r}) is str else _js_m_{method}({r}, {lit}))"
+                        ),
+                        ATOM,
+                    ))
+                }
             }
             "startsWith" if receiver.is_str && one_str => Some(returned(
                 Ret::Bool,
@@ -4472,6 +5452,23 @@ impl<'s> Lowerer<'s> {
                     };
                     return returned(Ret::Str, format!("_js_date_to_iso({})", args[0]));
                 }
+                // J90-P2: `createHash('sha256' | 'sha1').update(x, 'utf8').digest('hex')` (the
+                // node:crypto adapter): `hash_hex(alg, x)`, the three calls' checks and bytes at
+                // once. The algorithm is a literal the adapter takes, so no call can throw before
+                // `x` is evaluated, as in JS.
+                if method == "digest"
+                    && let Some((alg, data)) = self.hash_chain(c, m)
+                {
+                    self.imports
+                        .entry(self.ctx.adapter_module.clone())
+                        .or_default()
+                        .insert("hash_hex".to_string());
+                    let value = self.expr(data);
+                    return returned(
+                        Ret::Str,
+                        format!("hash_hex({}, {})", py_str(alg), value.code),
+                    );
+                }
                 if let Expression::Identifier(object) = strip(&m.object)
                     && !self.is_local(object.name.as_str())
                     && !self.classes.contains_key(object.name.as_str())
@@ -4533,6 +5530,111 @@ impl<'s> Lowerer<'s> {
                 } else {
                     None
                 };
+                // J90-P: `xs.sort((a, b) => k(a) - k(b))` (or `k(b) - k(a)`) for a pure key `k`:
+                // a stable sort by the keys when every key is a number and none is NaN
+                // (`_js_sort_keyed`), else the general sort with the same comparator.
+                let keyed = if method == "sort"
+                    && !class_method
+                    && by_key.is_none()
+                    && c.arguments.len() == 1
+                {
+                    c.arguments[0]
+                        .as_expression()
+                        .and_then(|e| self.keyed_comparator(e))
+                } else {
+                    None
+                };
+                // J90-P2: `xs.sort((a, b) => k1(a) - k1(b) || cmpCodepoint(k2(a), k2(b)) || ...)`:
+                // stable sorts by each key, last first, when every key is a number JS holds
+                // exactly and none is NaN (a code-point key: a `str`), else the general sort.
+                let lex = if method == "sort"
+                    && !class_method
+                    && by_key.is_none()
+                    && keyed.is_none()
+                    && c.arguments.len() == 1
+                {
+                    c.arguments[0]
+                        .as_expression()
+                        .and_then(|e| self.lex_comparator(e))
+                } else {
+                    None
+                };
+                // J90-2: `xs.every((x) => Number.isInteger(x))` / `xs.every((x) => typeof x ===
+                // 'string')`, the hot index's shape checks over 5,000-element columns: one helper
+                // per test, which answers at C speed for a list of exactly that Python type and
+                // runs the same per-element test as the general lowering otherwise.
+                if method == "every"
+                    && !class_method
+                    && c.arguments.len() == 1
+                    && let Some(test) = c.arguments[0]
+                        .as_expression()
+                        .and_then(|e| self.every_test(e))
+                {
+                    let receiver = self.expr(&m.object);
+                    let result =
+                        returned(Ret::Bool, format!("_js_every_{test}({})", receiver.code));
+                    return if receiver.top {
+                        result.with_fact(None)
+                    } else {
+                        result
+                    };
+                }
+                // J90-P2: `xs.every/some/map/filter((x) => e)` with one plain parameter and no
+                // function inside `e`: the comprehension `_js_m_every` (...) runs, with `e` inline
+                // instead of a lambda called per element.
+                if matches!(method, "every" | "some" | "map" | "filter")
+                    && !class_method
+                    && c.arguments.len() == 1
+                    && let Some(Expression::ArrowFunctionExpression(arrow)) =
+                        c.arguments[0].as_expression().map(strip)
+                    && self.inlinable_callback(arrow)
+                {
+                    // J90-P6: the comprehension's iterable, where `:=` is a SyntaxError.
+                    self.no_walrus += 1;
+                    let receiver = self.expr(&m.object);
+                    self.no_walrus -= 1;
+                    let items = if receiver.is_list {
+                        receiver.at(OR + 1)
+                    } else {
+                        format!("_js_array({}, {})", py_str(method), receiver.code)
+                    };
+                    self.hot_comp += 1;
+                    let (param, value) = self.inline_callback(arrow);
+                    self.hot_comp -= 1;
+                    // A comprehension's element may be a conditional expression; its `if` clause
+                    // may not.
+                    let test = |v: &Py, prec: u8| {
+                        if v.is_bool {
+                            v.at(prec)
+                        } else {
+                            format!("_js_truthy({})", v.code)
+                        }
+                    };
+                    let (code, ret) = match method {
+                        "every" => (
+                            format!("all({} for {param} in {items})", test(&value, TERNARY)),
+                            Ret::Bool,
+                        ),
+                        "some" => (
+                            format!("any({} for {param} in {items})", test(&value, TERNARY)),
+                            Ret::Bool,
+                        ),
+                        "map" => (
+                            format!("[{} for {param} in {items}]", value.at(TERNARY)),
+                            Ret::List,
+                        ),
+                        _ => (
+                            format!("[{param} for {param} in {items} if {}]", test(&value, OR)),
+                            Ret::List,
+                        ),
+                    };
+                    let result = returned(ret, code);
+                    return if receiver.top || value.top {
+                        result.with_fact(None)
+                    } else {
+                        result
+                    };
+                }
                 let receiver = self.expr(&m.object);
                 // J89-4a: `a.splice(start, count, ...xs)`, `xs` proven a list.
                 let splice_spread = method == "splice";
@@ -4554,6 +5656,79 @@ impl<'s> Lowerer<'s> {
                         if descending { "True" } else { "False" },
                         args[0].code
                     );
+                    let result = returned(Ret::List, code);
+                    return if receiver.top {
+                        result.with_fact(None)
+                    } else {
+                        result
+                    };
+                }
+                if let Some((arrow, key, descending)) = keyed {
+                    // J90-PF: `(a, b) => a - b` (or `b - a`): the item is its own key, so a list
+                    // of safe ints sorts by value (`_js_sort_num`), else `_js_sort_keyed` as before.
+                    let identity = matches!(
+                        (strip(key), &arrow.params.items[0].pattern),
+                        (Expression::Identifier(k), BindingPattern::BindingIdentifier(p))
+                            if k.name == p.name
+                    );
+                    let flag = if descending { "True" } else { "False" };
+                    let code = if identity {
+                        format!(
+                            "_js_sort_num({}, {}, {})",
+                            receiver.code, flag, args[0].code
+                        )
+                    } else {
+                        let key = self.key_lambda(arrow, key);
+                        format!(
+                            "_js_sort_keyed({}, {}, {}, {})",
+                            receiver.code, key, flag, args[0].code
+                        )
+                    };
+                    let result = returned(Ret::List, code);
+                    return if receiver.top {
+                        result.with_fact(None)
+                    } else {
+                        result
+                    };
+                }
+                if let Some((arrow, parts)) = lex {
+                    let parts: Vec<String> = parts
+                        .into_iter()
+                        .map(|(key, descending, cp)| {
+                            let key = self.key_lambda(arrow, key);
+                            let flag = |b: bool| if b { "True" } else { "False" };
+                            format!("({key}, {}, {})", flag(descending), flag(cp))
+                        })
+                        .collect();
+                    let code = format!(
+                        "_js_sort_lex({}, ({},), {})",
+                        receiver.code,
+                        parts.join(", "),
+                        args[0].code
+                    );
+                    let result = returned(Ret::List, code);
+                    return if receiver.top {
+                        result.with_fact(None)
+                    } else {
+                        result
+                    };
+                }
+                // J90-PF: `[...new Set(xs)].sort(cmp)`, `cmp` an adapter whose row promises
+                // code-point order (not a local) and `Set` the builtin: `_js_sort_unique(xs, cmp)`,
+                // which answers `sorted(set(xs))` for a list of `str`s and the general lowering's
+                // own `_js_m_sort([*_JsSet(xs)], cmp)` for anything else.
+                if method == "sort"
+                    && !class_method
+                    && !spread
+                    && args.len() == 1
+                    && simple_operand(&args[0].code)
+                    && matches!(c.arguments[0].as_expression().map(strip),
+                        Some(Expression::Identifier(id))
+                            if self.codepoint_fns.contains(id.name.as_str())
+                                && !self.is_scoped(id.name.as_str()))
+                    && let Some(inner) = self.set_spread(&m.object, &receiver.code)
+                {
+                    let code = format!("_js_sort_unique({inner}, {})", args[0].code);
                     let result = returned(Ret::List, code);
                     return if receiver.top {
                         result.with_fact(None)
@@ -4588,6 +5763,54 @@ impl<'s> Lowerer<'s> {
                 result
             }
             other => self.refuse(other.span(), "call of a computed callee"),
+        }
+    }
+
+    /// J90-2: `(x) => Number.isInteger(x)` is `"integer"`, `(x) => typeof x === 'string'` (or `==`)
+    /// is `"string"`: a one-parameter arrow whose body is exactly that test of its parameter, with
+    /// `Number` the global. Any other callback is the general `every`.
+    fn every_test(&self, e: &Expression<'_>) -> Option<&'static str> {
+        let Expression::ArrowFunctionExpression(arrow) = strip(e) else {
+            return None;
+        };
+        if arrow.r#async || arrow.params.items.len() != 1 || arrow.params.rest.is_some() {
+            return None;
+        }
+        let BindingPattern::BindingIdentifier(param) = &arrow.params.items[0].pattern else {
+            return None;
+        };
+        let is_param = |e: &Expression<'_>| matches!(strip(e), Expression::Identifier(id) if id.name == param.name);
+        let body = arrow.body.as_expression()?;
+        match strip(body) {
+            Expression::CallExpression(call)
+                if call.arguments.len() == 1
+                    && !call.optional
+                    && call.arguments[0].as_expression().is_some_and(is_param) =>
+            {
+                let Expression::StaticMemberExpression(m) = strip(&call.callee) else {
+                    return None;
+                };
+                let number =
+                    matches!(strip(&m.object), Expression::Identifier(id) if id.name == "Number");
+                (number && m.property.name == "isInteger" && !self.is_local("Number"))
+                    .then_some("integer")
+            }
+            Expression::BinaryExpression(b)
+                if matches!(
+                    b.operator,
+                    BinaryOperator::StrictEquality | BinaryOperator::Equality
+                ) =>
+            {
+                let typeof_param = |e: &Expression<'_>| {
+                    matches!(strip(e), Expression::UnaryExpression(u)
+                        if u.operator == UnaryOperator::Typeof && is_param(&u.argument))
+                };
+                let string = |e: &Expression<'_>| matches!(strip(e), Expression::StringLiteral(s) if s.value == "string");
+                ((typeof_param(&b.left) && string(&b.right))
+                    || (string(&b.left) && typeof_param(&b.right)))
+                .then_some("string")
+            }
+            _ => None,
         }
     }
 
@@ -4656,13 +5879,302 @@ impl<'s> Lowerer<'s> {
         }
     }
 
+    /// J90-P: `(a, b) => k(a) - k(b)` (ascending) or `(a, b) => k(b) - k(a)` (descending), where
+    /// `k(x)` reads only `x`, other bindings, member reads and `.get(...)` (no compiled class
+    /// declares `get`, so it is a Map's): an expression with no effect, whose value for an item is
+    /// the same however often it is computed. The arrow, `k(a)` and whether it is descending.
+    fn keyed_comparator<'b, 'a>(
+        &self,
+        e: &'b Expression<'a>,
+    ) -> Option<(&'b ArrowFunctionExpression<'a>, &'b Expression<'a>, bool)> {
+        let Expression::ArrowFunctionExpression(arrow) = strip(e) else {
+            return None;
+        };
+        if arrow.r#async || arrow.params.items.len() != 2 || arrow.params.rest.is_some() {
+            return None;
+        }
+        if arrow.params.items.iter().any(|p| p.initializer.is_some()) {
+            return None;
+        }
+        let param = |k: usize| match &arrow.params.items[k].pattern {
+            BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+            _ => None,
+        };
+        let (a, b) = (param(0)?, param(1)?);
+        if a == b || matches!(&arrow.body, ArrowFunctionBody::FunctionBody(_)) {
+            return None;
+        }
+        let Expression::BinaryExpression(d) = strip(arrow.body.as_expression()?) else {
+            return None;
+        };
+        if d.operator != BinaryOperator::Subtraction {
+            return None;
+        }
+        // `l` is `k(b)` and `r` is `k(a)`: descending; the other way round: ascending.
+        if self.swapped(&d.left, &d.right, &a, &b) {
+            return Some((arrow, &d.right, true));
+        }
+        if self.swapped(&d.right, &d.left, &a, &b) {
+            return Some((arrow, &d.left, false));
+        }
+        None
+    }
+
+    /// J90-P2: the `x` of `createHash(alg).update(x, 'utf8').digest('hex')`, `createHash` the
+    /// node:crypto adapter (not a local) and `alg` the literal `'sha256'` or `'sha1'`: None for
+    /// anything else (the calls are then lowered one by one).
+    fn hash_chain<'b, 'a>(
+        &self,
+        c: &'b CallExpression<'a>,
+        m: &'b StaticMemberExpression<'a>,
+    ) -> Option<(&'static str, &'b Expression<'a>)> {
+        let literal = |a: &Argument<'_>, want: &[&'static str]| -> Option<&'static str> {
+            match a.as_expression().map(strip) {
+                Some(Expression::StringLiteral(s)) => want.iter().copied().find(|w| s.value == *w),
+                _ => None,
+            }
+        };
+        if c.optional
+            || m.optional
+            || c.arguments.len() != 1
+            || literal(&c.arguments[0], &["hex"]).is_none()
+        {
+            return None;
+        }
+        let Expression::CallExpression(update) = strip(&m.object) else {
+            return None;
+        };
+        let Expression::StaticMemberExpression(um) = strip(&update.callee) else {
+            return None;
+        };
+        if update.optional
+            || um.optional
+            || um.property.name != "update"
+            || update.arguments.len() != 2
+            || literal(&update.arguments[1], &["utf8"]).is_none()
+        {
+            return None;
+        }
+        let Expression::CallExpression(create) = strip(&um.object) else {
+            return None;
+        };
+        let Expression::Identifier(f) = strip(&create.callee) else {
+            return None;
+        };
+        let adapter = self.hash_fns.contains(f.name.as_str()) && !self.is_scoped(f.name.as_str());
+        if !adapter || create.optional || create.arguments.len() != 1 {
+            return None;
+        }
+        let alg = literal(&create.arguments[0], &["sha256", "sha1"])?;
+        Some((alg, update.arguments[0].as_expression()?))
+    }
+
+    /// J90-P2: `(a, b) => c1 || c2 || ... || cn`, each `ci` a key difference `k(a) - k(b)` /
+    /// `k(b) - k(a)` or a code-point comparison `cmp(k(a), k(b))` / `cmp(k(b), k(a))` (`cmp` an
+    /// adapter whose row promises `compare-codepoints`, not a local), every `k` pure as for
+    /// `keyed_comparator`: the arrow and per part its `k(a)`, whether it is descending and whether
+    /// it is a code-point part. Only a chain of two or more parts, or one code-point part (one
+    /// difference alone is `keyed_comparator`'s).
+    #[allow(clippy::type_complexity)]
+    fn lex_comparator<'b, 'a>(
+        &self,
+        e: &'b Expression<'a>,
+    ) -> Option<(
+        &'b ArrowFunctionExpression<'a>,
+        Vec<(&'b Expression<'a>, bool, bool)>,
+    )> {
+        let Expression::ArrowFunctionExpression(arrow) = strip(e) else {
+            return None;
+        };
+        if arrow.r#async || arrow.params.items.len() != 2 || arrow.params.rest.is_some() {
+            return None;
+        }
+        if arrow.params.items.iter().any(|p| p.initializer.is_some()) {
+            return None;
+        }
+        let param = |k: usize| match &arrow.params.items[k].pattern {
+            BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+            _ => None,
+        };
+        let (a, b) = (param(0)?, param(1)?);
+        if a == b || matches!(&arrow.body, ArrowFunctionBody::FunctionBody(_)) {
+            return None;
+        }
+        fn chain<'b, 'a>(e: &'b Expression<'a>, out: &mut Vec<&'b Expression<'a>>) {
+            match strip(e) {
+                Expression::LogicalExpression(or) if or.operator == LogicalOperator::Or => {
+                    chain(&or.left, out);
+                    chain(&or.right, out);
+                }
+                other => out.push(other),
+            }
+        }
+        let mut parts = Vec::new();
+        chain(arrow.body.as_expression()?, &mut parts);
+        let codepoint = |name: &str| self.codepoint_fns.contains(name) && !self.is_scoped(name);
+        let mut keys = Vec::new();
+        for part in parts {
+            let (l, r, cp) = match part {
+                Expression::BinaryExpression(d) if d.operator == BinaryOperator::Subtraction => {
+                    (&d.left, &d.right, false)
+                }
+                Expression::CallExpression(c)
+                    if !c.optional
+                        && c.arguments.len() == 2
+                        && matches!(strip(&c.callee), Expression::Identifier(id) if codepoint(id.name.as_str())) =>
+                {
+                    (
+                        c.arguments[0].as_expression()?,
+                        c.arguments[1].as_expression()?,
+                        true,
+                    )
+                }
+                _ => return None,
+            };
+            if self.swapped(l, r, &a, &b) {
+                keys.push((r, true, cp));
+            } else if self.swapped(r, l, &a, &b) {
+                keys.push((l, false, cp));
+            } else {
+                return None;
+            }
+        }
+        (keys.len() >= 2 || keys.first().is_some_and(|k| k.2)).then_some((arrow, keys))
+    }
+
+    /// J90-P: `l` is `r` with `a` read as `b`: the same pure expression of the other parameter.
+    fn swapped(&self, l: &Expression<'_>, r: &Expression<'_>, a: &str, b: &str) -> bool {
+        match (strip(l), strip(r)) {
+            (Expression::Identifier(x), Expression::Identifier(y)) => {
+                (x.name == b && y.name == a)
+                    || (x.name == y.name && x.name != a && x.name != b && x.name != "undefined")
+            }
+            (Expression::NumericLiteral(x), Expression::NumericLiteral(y)) => {
+                x.value.to_bits() == y.value.to_bits()
+            }
+            (Expression::StringLiteral(x), Expression::StringLiteral(y)) => x.value == y.value,
+            (Expression::StaticMemberExpression(x), Expression::StaticMemberExpression(y)) => {
+                !x.optional
+                    && !y.optional
+                    && x.property.name == y.property.name
+                    && self.swapped(&x.object, &y.object, a, b)
+            }
+            // (A Float64Array's element is J89-3's key sort, `_js_sort_by_f64`, or the general one.)
+            (Expression::ComputedMemberExpression(x), Expression::ComputedMemberExpression(y)) => {
+                !x.optional
+                    && !y.optional
+                    && self.typed_array(&x.object).is_none()
+                    && self.swapped(&x.object, &y.object, a, b)
+                    && self.swapped(&x.expression, &y.expression, a, b)
+            }
+            (Expression::CallExpression(x), Expression::CallExpression(y)) => {
+                fn get<'b, 'a>(
+                    c: &'b CallExpression<'a>,
+                ) -> Option<(&'b Expression<'a>, &'b Expression<'a>)> {
+                    match strip(&c.callee) {
+                        Expression::StaticMemberExpression(m)
+                            if !c.optional && !m.optional && m.property.name == "get" =>
+                        {
+                            match c.arguments.as_slice() {
+                                [arg] => arg.as_expression().map(|e| (&m.object, e)),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+                let (Some((xo, xa)), Some((yo, ya))) = (get(x), get(y)) else {
+                    return false;
+                };
+                !self.ctx.class_methods.contains("get")
+                    && !self.imported_methods.contains("get")
+                    && self.swapped(xo, yo, a, b)
+                    && self.swapped(xa, ya, a, b)
+            }
+            _ => false,
+        }
+    }
+
+    /// J90-P: `lambda <a>, *_: <k(a)>`, `k(a)` lowered in a scope of the comparator's first
+    /// parameter alone (as the comparator's own lowering binds it).
+    /// J90-PF: the lowered `xs` of an array literal `[...new Set(xs)]` (one spread element, `Set`
+    /// the builtin, one plain argument) whose lowering `code` is exactly `[*_JsSet(<xs>)]`; None
+    /// for any other array or text.
+    fn set_spread(&self, object: &Expression<'_>, code: &str) -> Option<String> {
+        let Expression::ArrayExpression(array) = strip(object) else {
+            return None;
+        };
+        let [ArrayExpressionElement::SpreadElement(spread)] = array.elements.as_slice() else {
+            return None;
+        };
+        let Expression::NewExpression(n) = strip(&spread.argument) else {
+            return None;
+        };
+        let builtin = matches!(strip(&n.callee), Expression::Identifier(id)
+            if id.name == "Set" && !self.is_local("Set") && !self.classes.contains_key("Set"));
+        if !builtin
+            || n.arguments.len() != 1
+            || matches!(n.arguments[0], Argument::SpreadElement(_))
+        {
+            return None;
+        }
+        let inner = code.strip_prefix("[*_JsSet(")?.strip_suffix(")]")?;
+        // The text between is one balanced expression (no `), (` splitting it into two).
+        let mut depth = 0i32;
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
+        for ch in inner.chars() {
+            if let Some(q) = quote {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == q {
+                    quote = None;
+                }
+                continue;
+            }
+            match ch {
+                '"' | '\'' => quote = Some(ch),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (depth == 0 && quote.is_none() && !inner.is_empty()).then(|| inner.to_string())
+    }
+
+    fn key_lambda(&mut self, arrow: &ArrowFunctionExpression<'_>, key: &Expression<'_>) -> String {
+        let BindingPattern::BindingIdentifier(id) = &arrow.params.items[0].pattern else {
+            unreachable!("keyed_comparator matched a plain parameter")
+        };
+        let py = py_name(id.name.as_str(), false, false);
+        self.claim(id.name.as_str(), &py, id.span);
+        let mut scope = HashSet::new();
+        scope.insert(id.name.to_string());
+        self.push_scope(scope, arrow.span.start);
+        self.bind(id.name.as_str(), Fact::default());
+        self.rets.push(None);
+        self.in_callback += 1;
+        let value = self.expr(key);
+        self.in_callback -= 1;
+        self.rets.pop();
+        self.pop_scope();
+        format!("lambda {py}, *_: {}", value.at(TERNARY))
+    }
+
     fn static_call(&mut self, object: &str, method: &str, c: &CallExpression<'_>) -> Py {
         // J88-2: a function of a namespace-imported Node module, or a Node global's static
         // (`Buffer.from`): its adapter row, called with the arguments as given.
         let adapter = match self.namespaces.get(object) {
             Some(module) => {
                 let module = module.clone();
-                match adapters::import(&module, method) {
+                match self.ctx.adapters.import(&module, method) {
                     Some(a) if a.kind == AdapterKind::Function => Some(a),
                     _ => {
                         let construct = format!("{module} function {method}: no declared adapter");
@@ -4670,7 +6182,10 @@ impl<'s> Lowerer<'s> {
                     }
                 }
             }
-            None => adapters::global(&format!("{object}.{method}"))
+            None => self
+                .ctx
+                .adapters
+                .global(&format!("{object}.{method}"))
                 .filter(|a| a.kind == AdapterKind::Function),
         };
         if let Some(adapter) = adapter {
@@ -4743,7 +6258,56 @@ impl<'s> Lowerer<'s> {
         let Some(args) = self.args(&c.arguments, None, false) else {
             return Py::atom("None");
         };
+        // J90-P3: `Array.isArray(x)` is `_js_is_array`'s own test, inline (no call).
+        if helper == "_js_is_array" && args.len() == 1 {
+            return Py::boolean(format!("isinstance({}, list)", args[0]), ATOM);
+        }
+        // J90-P3: `Number.isInteger(x)`, `x` a name or an element read (evaluated twice, no
+        // effect): a plain int a double holds exactly is `_js_number_is_integer`'s first answer
+        // (True), inline; anything else asks it.
+        if helper == "_js_number_is_integer"
+            && args.len() == 1
+            && c.arguments[0]
+                .as_expression()
+                .is_some_and(|e| self.twice_safe(e))
+        {
+            let x = &args[0];
+            return Py::boolean(
+                format!(
+                    "(type({x}) is int and -2**53 <= {x} <= 2**53 or _js_number_is_integer({x}))"
+                ),
+                ATOM,
+            );
+        }
         returned(ret, format!("{helper}({})", args.join(", ")))
+    }
+
+    /// J90-P: the `x` of `Object.entries(x)` (`Object` the global), or of `f(x)` where `f` is a
+    /// module `const` arrow `(v) => Object.entries(v)` no scope shadows.
+    fn entries_source<'b, 'a>(&self, e: &'b Expression<'a>) -> Option<&'b Expression<'a>> {
+        let Expression::CallExpression(c) = strip(e) else {
+            return None;
+        };
+        let [arg] = c.arguments.as_slice() else {
+            return None;
+        };
+        let arg = arg.as_expression()?;
+        if c.optional {
+            return None;
+        }
+        let ok = match strip(&c.callee) {
+            Expression::StaticMemberExpression(m) => {
+                !m.optional
+                    && m.property.name == "entries"
+                    && matches!(strip(&m.object), Expression::Identifier(o)
+                        if o.name == "Object" && !self.is_local("Object"))
+            }
+            Expression::Identifier(f) => {
+                self.entries_aliases.contains(f.name.as_str()) && !self.is_scoped(f.name.as_str())
+            }
+            _ => false,
+        };
+        ok.then_some(arg)
     }
 
     fn new_expr(&mut self, n: &NewExpression<'_>) -> Py {
@@ -4769,6 +6333,16 @@ impl<'s> Lowerer<'s> {
                     if n.arguments.len() > 1 {
                         return self.refuse(n.span, "argument count for new Map/Set");
                     }
+                    // J90-P: `new Map(Object.entries(x))` (or through a module `const` arrow
+                    // `(v) => Object.entries(v)`): the Map built from the object's own keys at
+                    // once (`_js_map_entries`), not through the entries array it would discard.
+                    if name == "Map"
+                        && let Some(object) = n.arguments.first().and_then(|a| a.as_expression())
+                        && let Some(source) = self.entries_source(object)
+                    {
+                        let source = self.expr(source);
+                        return Py::atom(format!("_js_map_entries({})", source.code));
+                    }
                     Some(if name == "Map" { "_JsMap" } else { "_JsSet" }.to_string())
                 }
                 // J86: the built-in Errors the codec throws.
@@ -4786,7 +6360,7 @@ impl<'s> Lowerer<'s> {
                     )
                 }
                 "RegExp" => return self.dynamic_regex(n),
-                _ => match adapters::global(name) {
+                _ => match self.ctx.adapters.global(name) {
                     Some(adapter) if matches!(adapter.kind, AdapterKind::Class(_)) => {
                         self.imports
                             .entry(self.ctx.adapter_module.clone())
@@ -4928,8 +6502,16 @@ impl<'s> Lowerer<'s> {
                     continue;
                 };
                 self.claim(local, &py, s.span);
-                self.imports
-                    .entry(format!(".{}", module.py_module))
+                let cyclic = resolved
+                    .as_ref()
+                    .is_some_and(|path| self.ctx.cyclic_imports.contains(path));
+                let into = if cyclic {
+                    self.cyclic_py.insert(py.clone());
+                    &mut self.late_imports
+                } else {
+                    &mut self.imports
+                };
+                into.entry(format!(".{}", module.py_module))
                     .or_default()
                     .insert(py.clone());
                 self.globals.insert(local.to_string(), py.clone());
@@ -4943,7 +6525,7 @@ impl<'s> Lowerer<'s> {
             }
             match resolved
                 .as_deref()
-                .and_then(|path| adapters::import(path, local))
+                .and_then(|path| self.ctx.adapters.import(path, local))
             {
                 Some(adapter) => {
                     let py = adapter.py_name.to_string();
@@ -4964,6 +6546,12 @@ impl<'s> Lowerer<'s> {
                         }
                         AdapterKind::Function => {
                             self.adapter_fns.insert(local.to_string());
+                            if adapter.contract == Some(Contract::CompareCodepoints) {
+                                self.codepoint_fns.insert(local.to_string());
+                            }
+                            if adapter.is(Some("node:crypto"), "createHash") {
+                                self.hash_fns.insert(local.to_string());
+                            }
                         }
                         AdapterKind::Constant => {}
                         // J89-4a: its methods dispatch in this module only.
@@ -5023,6 +6611,81 @@ impl<'s> Lowerer<'s> {
     }
 
     /// `export { a, b }`: each a module-level name (declared or imported), exported as itself.
+    /// J90-3: `export { a, type T } from './m.js'` (storage/index.ts): each value name imported
+    /// as `import { a } from './m.js'` would import it (a compiled module of the call, or an
+    /// adapter row), then exported. A renamed re-export, `export *`, and a name already bound here
+    /// are refused. Another compiled module cannot import a name through the re-export (the
+    /// re-exporting module's export table lists only what it declares): such an import is refused
+    /// as one the module does not export.
+    fn re_export(&mut self, e: &ExportFromDeclaration<'_>) {
+        if e.with_clause.is_some() {
+            self.refuse(e.span, "re-export with an import attribute");
+            return;
+        }
+        let Some(spec) = e.source.value.as_str() else {
+            self.refuse(e.span, "re-export specifier with a lone surrogate");
+            return;
+        };
+        let resolved = resolve_specifier(&self.ctx.path, spec);
+        for specifier in &e.specifiers {
+            if specifier.export_kind.is_type() {
+                continue;
+            }
+            let local = specifier.local.name();
+            if specifier.exported.name() != local {
+                self.refuse(specifier.span, "renamed re-export");
+                continue;
+            }
+            let local = local.as_str();
+            let compiled = resolved
+                .as_ref()
+                .and_then(|path| self.ctx.modules.get(path))
+                .cloned();
+            let py = if let Some(module) = compiled {
+                let Some((py, _)) = module.names.get(local).cloned() else {
+                    let construct = format!(
+                        "re-export of {local} from {spec}, which that module does not export"
+                    );
+                    self.refuse(specifier.span, construct);
+                    continue;
+                };
+                let cyclic = resolved
+                    .as_ref()
+                    .is_some_and(|path| self.ctx.cyclic_imports.contains(path));
+                let into = if cyclic {
+                    self.cyclic_py.insert(py.clone());
+                    &mut self.late_imports
+                } else {
+                    &mut self.imports
+                };
+                into.entry(format!(".{}", module.py_module))
+                    .or_default()
+                    .insert(py.clone());
+                py
+            } else if let Some(adapter) = resolved
+                .as_deref()
+                .and_then(|path| self.ctx.adapters.import(path, local))
+            {
+                let py = adapter.py_name.to_string();
+                self.imports
+                    .entry(self.ctx.adapter_module.clone())
+                    .or_default()
+                    .insert(py.clone());
+                py
+            } else {
+                let construct = format!(
+                    "re-export of {local} from {spec}: no compiled module and no declared adapter"
+                );
+                self.refuse(specifier.span, construct);
+                continue;
+            };
+            self.claim(local, &py, specifier.span);
+            if !self.exports.contains(&py) {
+                self.exports.push(py);
+            }
+        }
+    }
+
     fn export_list(&mut self, e: &ExportNamedDeclaration<'_>) {
         for specifier in &e.specifiers {
             if specifier.export_kind.is_type() {
@@ -5050,6 +6713,13 @@ impl<'s> Lowerer<'s> {
     /// initialised in declaration order at the start of `__init__` (after the base's, as JS does
     /// for a derived class), then the constructor body runs.
     fn class_decl(&mut self, c: &Class<'_>, out: &mut Vec<String>) {
+        let start = out.len();
+        self.class_decl_body(c, out);
+        let lines = out.split_off(start);
+        out.extend(hoist_closure_methods(lines));
+    }
+
+    fn class_decl_body(&mut self, c: &Class<'_>, out: &mut Vec<String>) {
         let Some(id) = &c.id else {
             self.refuse(c.span, "anonymous class");
             return;
@@ -5061,8 +6731,8 @@ impl<'s> Lowerer<'s> {
         if c.r#abstract {
             self.refuse(c.span, "abstract class");
         }
-        // J87-3: `extends` an Error class visible here (an adapter `ErrorClass` such as
-        // `BantamError`, or one declared above) as well as `Error` itself.
+        // J87-3: `extends` an Error class visible here (an adapter `ErrorClass` such as a host's
+        // `AppError`, or one declared above) as well as `Error` itself.
         let error_base: Option<String> = match &c.heritage {
             None => None,
             Some(h) => match strip(&h.expression) {
@@ -5184,10 +6854,23 @@ impl<'s> Lowerer<'s> {
                 format!("frozenset({{{}}})", items.join(", "))
             }
         };
+        // J90-P7: every class ts2py writes is an ordinary Python class under mypyc too (its base,
+        // `_JsObject` or an Error, is one, and `_js_object_get` reads its `__dict__`); the three
+        // reflective lists are class attributes, so they say so.
+        out.push("@_mypyc_attr(native_class=False)".to_string());
         out.push(format!("class {name}({base}):"));
-        out.push(format!("    _js_name = {}", py_str(id.name.as_str())));
-        out.push(format!("    _js_own = {}", set(&own)));
-        out.push(format!("    _js_own_methods = {}", set(&own_methods)));
+        out.push(format!(
+            "    _js_name: _ClassVar[str] = {}",
+            py_str(id.name.as_str())
+        ));
+        out.push(format!(
+            "    _js_own: _ClassVar[frozenset[str]] = {}",
+            set(&own)
+        ));
+        out.push(format!(
+            "    _js_own_methods: _ClassVar[frozenset[str]] = {}",
+            set(&own_methods)
+        ));
 
         // __init__: base, then fields, then the constructor body.
         if !fields.is_empty() || constructor.is_some() || !is_error {
@@ -5265,7 +6948,13 @@ impl<'s> Lowerer<'s> {
             }
             let mut signature = vec!["self".to_string()];
             signature.extend(names.iter().map(|(_, py)| py.clone()));
-            out.push(format!("    def {key}({}):", signature.join(", ")));
+            // J90-P7: mypyc compiles a property only with a return annotation.
+            let returns = if m.kind == MethodDefinitionKind::Get {
+                " -> object"
+            } else {
+                ""
+            };
+            out.push(format!("    def {key}({}){returns}:", signature.join(", ")));
             self.param_defaults(&f.params, 2, out);
             self.hoist_params(&f.params, 2, out);
             self.block(statements, 2, out);
@@ -5824,7 +7513,54 @@ fn property_key_name(key: &PropertyKey<'_>) -> Option<String> {
 }
 
 /// A relative import specifier resolved against the importing module's path, `.js` read as the
-/// `.ts` it is compiled from (`runtime-ts/src/memory/pyyaml.ts`). None for a bare specifier.
+/// `.ts` it is compiled from (`src/memory/pyyaml.ts`). None for a bare specifier.
+/// J90-2: the compiled modules of the call `program` imports a value from (a type-only import
+/// binds nothing at run time and is no edge of an import cycle).
+pub fn compiled_imports(
+    program: &Program<'_>,
+    path: &str,
+    modules: &HashMap<String, ModuleExports>,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for stmt in &program.body {
+        // J90-3: a value re-export binds what an import of the same names would.
+        if let Statement::ExportFromDeclaration(e) = stmt
+            && !e.export_kind.is_type()
+            && e.specifiers.iter().any(|s| !s.export_kind.is_type())
+        {
+            if let Some(spec) = e.source.value.as_str()
+                && let Some(target) = resolve_specifier(path, spec)
+                && modules.contains_key(&target)
+            {
+                out.insert(target);
+            }
+            continue;
+        }
+        let Statement::ImportDeclaration(i) = stmt else {
+            continue;
+        };
+        if i.import_kind.is_type() {
+            continue;
+        }
+        let values = i.specifiers.as_ref().is_some_and(|specifiers| {
+            specifiers.iter().any(|s| match s {
+                ImportDeclarationSpecifier::ImportSpecifier(s) => !s.import_kind.is_type(),
+                _ => true,
+            })
+        });
+        if !values {
+            continue;
+        }
+        if let Some(spec) = i.source.value.as_str()
+            && let Some(target) = resolve_specifier(path, spec)
+            && modules.contains_key(&target)
+        {
+            out.insert(target);
+        }
+    }
+    out
+}
+
 pub fn resolve_specifier(importer: &str, spec: &str) -> Option<String> {
     // J87-3: a Node builtin (`node:fs`) is its own key in the adapter table.
     if spec.starts_with("node:") {
@@ -5982,8 +7718,69 @@ fn units_name(name: &str) -> String {
     format!("_jsu_{}", py_name(name, false, false))
 }
 
+/// J90-2: `name` appears in `code` as a whole Python identifier (as `lib.rs`'s `uses`).
+fn uses_ident(code: &str, name: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    code.match_indices(name).any(|(at, _)| {
+        let before = code[..at].chars().next_back();
+        let after = code[at + name.len()..].chars().next();
+        !before.is_some_and(ident) && !after.is_some_and(ident)
+    })
+}
+
 fn method_as_value(name: &str) -> String {
     format!("method .{name} read as a value (a method may only be called directly)")
+}
+
+/// J90-P3: the lines with every compiler temporary (`_js_caught`, `_js_error`, `_js_fn`,
+/// `_js_arg`, `_js_t`, `_js_first`, `_js_obj`, `_js_switch`, `_js_item` followed by digits, as a
+/// whole name) renumbered in the order it first appears: two bodies that differ only in which
+/// numbers their temporaries got are equal here.
+fn canonical_temps(lines: &[&String]) -> Vec<String> {
+    const TEMPS: [&str; 9] = [
+        "caught", "error", "fn", "arg", "t", "first", "obj", "switch", "item",
+    ];
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let bytes = line.as_bytes();
+        let mut text = String::with_capacity(line.len());
+        let mut at = 0;
+        while at < bytes.len() {
+            let start_ok = at == 0 || !word(bytes[at - 1]);
+            let mut taken = None;
+            if start_ok && line[at..].starts_with("_js_") {
+                for temp in TEMPS {
+                    let rest = &line[at + 4..];
+                    if let Some(digits) = rest.strip_prefix(temp) {
+                        let n = digits.bytes().take_while(u8::is_ascii_digit).count();
+                        let end = at + 4 + temp.len() + n;
+                        if n > 0 && (end == bytes.len() || !word(bytes[end])) {
+                            taken = Some(end);
+                            break;
+                        }
+                    }
+                }
+            }
+            match taken {
+                Some(end) => {
+                    let name = &line[at..end];
+                    let next = seen.len();
+                    let k = *seen.entry(name.to_string()).or_insert(next);
+                    text.push_str(&format!("\u{0}{k}"));
+                    at = end;
+                }
+                None => {
+                    let ch = line[at..].chars().next().unwrap();
+                    text.push(ch);
+                    at += ch.len_utf8();
+                }
+            }
+        }
+        out.push(text);
+    }
+    out
 }
 
 fn pad(indent: usize) -> String {
@@ -6216,6 +8013,10 @@ fn truthy(value: Py) -> Py {
     } else if value.is_str {
         // J87: a proven `str` is falsy exactly when empty, in both languages.
         Py::boolean(format!("{} != \"\"", value.at(CMP + 1)), CMP)
+    } else if value.is_num && value.pure && !value.top && value.prec == ATOM {
+        // J90-P3: a proven number named once (a name, an element read): falsy exactly when it is
+        // `0`, `-0` or NaN (`x == x` is false only for NaN).
+        Py::boolean(format!("{c} != 0 and {c} == {c}", c = value.code), AND)
     } else {
         Py::boolean(format!("_js_truthy({})", value.code), ATOM)
     }
@@ -6252,6 +8053,32 @@ fn is_nullish_literal(e: &Expression<'_>) -> bool {
         Expression::Identifier(id) => id.name == "undefined",
         _ => false,
     }
+}
+
+/// J90-P: `(v) => Object.entries(v)` (casts allowed): one plain parameter, an expression body
+/// that is exactly that call of it.
+fn is_entries_alias(a: &ArrowFunctionExpression<'_>) -> bool {
+    if a.params.items.len() != 1 || a.params.rest.is_some() {
+        return false;
+    }
+    let BindingPattern::BindingIdentifier(param) = &a.params.items[0].pattern else {
+        return false;
+    };
+    if matches!(&a.body, ArrowFunctionBody::FunctionBody(_)) {
+        return false;
+    }
+    let Some(body) = a.body.as_expression() else {
+        return false;
+    };
+    let Expression::CallExpression(c) = strip(body) else {
+        return false;
+    };
+    !c.optional
+        && matches!(strip(&c.callee), Expression::StaticMemberExpression(m)
+            if !m.optional && m.property.name == "entries"
+                && matches!(strip(&m.object), Expression::Identifier(o) if o.name == "Object"))
+        && matches!(c.arguments.as_slice(), [arg]
+            if matches!(arg.as_expression().map(strip), Some(Expression::Identifier(x)) if x.name == param.name))
 }
 
 fn is_entries_call(e: &Expression<'_>) -> bool {
@@ -6652,6 +8479,286 @@ fn regex_class(chars: &[char], open: usize, out: &mut String) -> Result<usize, S
     }
     out.push(']');
     Ok(i)
+}
+
+/// J90-P6: `name(arg, ...)` spanning all of `code`: the name and the top-level arguments, split at
+/// commas outside brackets and string literals. `None` for anything else (a call followed by more
+/// code, a keyword argument, a starred argument, an unbalanced text).
+fn split_call(code: &str) -> Option<(&str, Vec<String>)> {
+    let open = code.find('(')?;
+    let name = &code[..open];
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let inner = code[open + 1..].strip_suffix(')')?;
+    let mut args = Vec::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut start = 0;
+    for (i, c) in inner.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            ',' if depth == 0 => {
+                args.push(inner[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 || quote.is_some() {
+        return None;
+    }
+    let last = inner[start..].trim();
+    if !last.is_empty() {
+        args.push(last.to_string());
+    }
+    if args
+        .iter()
+        .any(|a| a.is_empty() || a.starts_with('*') || is_keyword_arg(a))
+    {
+        return None;
+    }
+    Some((name, args))
+}
+
+/// `name=value` at the top level of an argument (not `==`, `<=`, `>=`, `!=`, `:=`).
+fn is_keyword_arg(arg: &str) -> bool {
+    let head: String = arg
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    !head.is_empty() && arg[head.len()..].starts_with('=') && !arg[head.len()..].starts_with("==")
+}
+
+/// J90-P6: an operand `hot` may read twice: a Python name (never a keyword other than the three
+/// constants), an int or float literal, or a plain double-quoted string literal. Reading one runs
+/// no code, so a second read gives the same value.
+fn simple_operand(code: &str) -> bool {
+    matches!(code, "True" | "False" | "None")
+        || is_name(code)
+        || is_int_literal(code)
+        || is_float_literal(code)
+        || is_str_literal(code)
+}
+
+/// J90-PF: a value a statement expansion may store after its guard: a `simple_operand`, or a list
+/// display of them (`[row]`), whose evaluation reads names and runs no code.
+fn simple_value(code: &str) -> bool {
+    if simple_operand(code) {
+        return true;
+    }
+    let Some(inner) = code.strip_prefix('[').and_then(|c| c.strip_suffix(']')) else {
+        return false;
+    };
+    !inner.trim().is_empty()
+        && !inner.contains(['[', ']', '(', ')', '"', '\''])
+        && inner.split(',').all(|item| simple_operand(item.trim()))
+}
+
+/// A Python name, never a keyword.
+fn is_name(code: &str) -> bool {
+    let mut chars = code.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !is_py_keyword(code)
+}
+
+fn is_int_literal(code: &str) -> bool {
+    let digits = code.strip_prefix('-').unwrap_or(code);
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
+fn is_float_literal(code: &str) -> bool {
+    let body = code.strip_prefix('-').unwrap_or(code);
+    !body.is_empty()
+        && body.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && body
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-'))
+}
+
+/// A `py_str` literal: `"`, then no unescaped `"` until the closing one.
+fn is_str_literal(code: &str) -> bool {
+    let Some(body) = code.strip_prefix('"').and_then(|b| b.strip_suffix('"')) else {
+        return false;
+    };
+    let mut escaped = false;
+    for c in body.chars() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            return false;
+        }
+    }
+    !escaped
+}
+
+/// J90-P7 (#316 G4): mypyc 2.4.1 cannot compile a method of a non-native class whose body holds a
+/// nested function or lambda that captures a variable (an internal error, mypyc/mypyc#1205; fixed
+/// by python/mypy#22237, not in a release). Every class ts2py writes is non-native under mypyc, so a
+/// method holding a `def` or a `lambda` is written as a module-level function
+/// `_js_method_<Class>_<name>` right after the class, and the method forwards to it with the same
+/// parameters: the same body, the same `self`, run in the same order. ts2py emits no `super()`
+/// (whose `__class__` cell would not survive the move), and refuses a TypeScript name with a
+/// `_js_` prefix, so the new name cannot meet one from the source. A class written inside a
+/// function (indented) is left as it is.
+fn hoist_closure_methods(lines: Vec<String>) -> Vec<String> {
+    let Some(at) = lines.iter().position(|l| l.starts_with("class ")) else {
+        return lines;
+    };
+    let class = lines[at]["class ".len()..]
+        .split(['(', ':'])
+        .next()
+        .unwrap_or("")
+        .to_string();
+    // Split the class body into member chunks: each starts at a `    def` (with the decorator line
+    // before it, when there is one).
+    let mut head: Vec<String> = lines[..=at].to_vec();
+    let mut chunks: Vec<Vec<String>> = Vec::new();
+    let mut i = at + 1;
+    while i < lines.len() {
+        let line = &lines[i];
+        let starts = line.starts_with("    def ")
+            || (line.starts_with("    @")
+                && lines.get(i + 1).is_some_and(|n| n.starts_with("    def ")));
+        if starts {
+            let mut chunk = vec![line.clone()];
+            if line.starts_with("    @") {
+                i += 1;
+                chunk.push(lines[i].clone());
+            }
+            i += 1;
+            while i < lines.len() && (lines[i].is_empty() || lines[i].starts_with("        ")) {
+                chunk.push(lines[i].clone());
+                i += 1;
+            }
+            chunks.push(chunk);
+        } else if chunks.is_empty() {
+            head.push(line.clone());
+            i += 1;
+        } else {
+            // Anything else after the first member: keep the class as written.
+            return lines;
+        }
+    }
+    let nested = |chunk: &[String]| {
+        chunk
+            .iter()
+            .skip_while(|l| !l.starts_with("    def "))
+            .skip(1)
+            .any(|l| {
+                let t = l.trim_start();
+                t.starts_with("def ") || has_word(l, "lambda")
+            })
+    };
+    let mut body: Vec<String> = head;
+    let mut after: Vec<String> = Vec::new();
+    for chunk in chunks {
+        if !nested(&chunk) {
+            body.extend(chunk);
+            continue;
+        }
+        let d = chunk
+            .iter()
+            .position(|l| l.starts_with("    def "))
+            .expect("a def");
+        let header = &chunk[d];
+        let key = header["    def ".len()..]
+            .split('(')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let open = header.find('(').expect("(");
+        let close = header.rfind(')').expect(")");
+        let params = &header[open + 1..close];
+        let tail = &header[close..];
+        let fname = format!("_js_method_{class}_{key}");
+        let forward: Vec<String> = split_params(params)
+            .into_iter()
+            .filter(|p| *p != "*_")
+            .map(|p| p.split('=').next().unwrap_or("").trim().to_string())
+            .collect();
+        // The method: its decorator and header as written, one forwarding line.
+        body.extend(chunk[..=d].iter().cloned());
+        body.push(format!("        return {fname}({})", forward.join(", ")));
+        // The function: the same header under the new name, the body one level out.
+        let trailing: Vec<&String> = chunk[d + 1..].iter().collect();
+        let blank = trailing.iter().rev().take_while(|l| l.is_empty()).count();
+        after.push(String::new());
+        after.push(String::new());
+        let returns = tail.trim_start_matches(')').trim_end_matches(':');
+        after.push(format!("def {fname}({params}){returns}:"));
+        for l in &trailing[..trailing.len() - blank] {
+            after.push(if l.is_empty() {
+                String::new()
+            } else {
+                l[4..].to_string()
+            });
+        }
+        for _ in 0..blank {
+            body.push(String::new());
+        }
+    }
+    // Keep the blank lines that separated members in the class as the source had them.
+    let mut out = body;
+    while out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+    out.extend(after);
+    out
+}
+
+/// A parameter list split at its top-level commas.
+fn split_params(params: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut from = 0;
+    for (i, c) in params.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(params[from..i].trim());
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if !params[from..].trim().is_empty() {
+        out.push(params[from..].trim());
+    }
+    out
+}
+
+/// `word` appears in `line` as a whole identifier.
+fn has_word(line: &str, word: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    line.match_indices(word).any(|(at, _)| {
+        !line[..at].chars().next_back().is_some_and(ident)
+            && !line[at + word.len()..].chars().next().is_some_and(ident)
+    })
 }
 
 #[cfg(test)]

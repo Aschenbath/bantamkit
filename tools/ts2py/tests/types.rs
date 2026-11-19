@@ -37,8 +37,12 @@ fn lacks(body: &str, needle: &str) {
 /// Run `probe(<arg>)` of the module under Python and print it as Node's `JSON.stringify` would,
 /// every code unit at or above U+007F escaped.
 fn run(module: &str, arg: &str) -> String {
+    // J90-P7: one directory per call. Keyed by the module's length alone, two tests running at
+    // once could write one `probe.py` and read each other's answer.
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!(
-        "ts2py-types-{}-{:x}",
+        "ts2py-types-{}-{call}-{:x}",
         std::process::id(),
         module.len() ^ arg.len() << 20
     ));
@@ -131,7 +135,8 @@ fn string_fast_paths_taken_only_on_a_proven_str() {
         "_js_units_slice(_jsu_s, -2, 9)",
         "_js_units_index_of(_jsu_s, \"b\", 2)",
         "_js_str_includes(s, ",
-        "_js_str_starts_with(s, \"a\")",
+        // J90-PF: an ASCII literal needle is Python's own `startswith` on the proven `str`.
+        "s.startswith(\"a\")",
         "\"yes\" if s != \"\" else \"no\"",
         "not s != \"\"",
     ] {
@@ -217,7 +222,12 @@ fn number_ops_plain_only_on_proven_numbers() {
     has(count, "i = _js_num(i + 1)");
     has(count, "i == n");
     // `j` also takes `step` (`unknown`, cast with `as`): JS's `+` and `<`, through the runtime.
-    has(count, "j = _js_add(j, step)");
+    // J90-P6: in a loop the `+` is the guarded expansion, whose plain `+` runs only for two ints
+    // within 2^52 and whose other arm is the same runtime call.
+    has(
+        count,
+        "j = (j + step if type(j) is int and type(step) is int and -4503599627370496 <= step <= 4503599627370496 and -4503599627370496 <= j <= 4503599627370496 else _js_add(j, step))",
+    );
     has(count, "_js_lt(j, n)");
     // `count(2, '1')` concatenates, as JS does: the cast proved nothing.
     assert_eq!(
@@ -292,9 +302,11 @@ fn frozen_module_array_unpacks_and_an_escaped_one_does_not() {
         classify,
         "pattern.search(_js_code_units(value)) is not None",
     );
-    // SHARED is also pushed to, so its rows prove nothing.
+    // SHARED is also pushed to, so its rows prove nothing: each is read the general way
+    // (`_js_rows`, J90-P: `_js_get` of each name's index unless the row is a list that long).
     let loose = def_of(&module, "_loose");
-    has(loose, "for _js_item");
+    has(loose, "in _js_rows(_SHARED, 3, (0, 1, 2)):");
+    lacks(loose, "in _SHARED:");
     has(loose, "_js_m_includes(firsts, ");
     has(loose, "_js_m_test(pattern, value)");
     assert_eq!(

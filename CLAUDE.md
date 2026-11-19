@@ -61,12 +61,17 @@ modules*, also in `docs/install.md`; cargo is needed only for this). A stale or 
 file is refused by the F4 byte-compare in `node tools/conformance/run.mjs --suite ts2py` and
 by `runtime-py/tests/test_ts2py_fresh.py`. The public Python name stays a hand-written shim
 beside it (`bantamkit/memory/store.py` over `_generated/store.py`); an import ts2py does not
-compile reaches Python only through a measured row in `tools/ts2py/src/adapters.rs`.
+compile reaches Python only through a measured row in `tools/ts2py-bantamkit/ts2py.toml`.
 
 For a generated module, the "lands in both runtimes" rule above is met by regenerating — one
 TypeScript change is both halves — plus a conformance case that compares the two answers, as
 for any other feature. A shim or adapter change is still Python-side work and must keep the
 two answers identical.
+
+The compiled build is a gate too (#316 G4, J90-P7/P8): a change that reaches `_generated/` must keep
+pytest and `--all` green with the mypyc extensions beside the `.py` files as well as on the pure
+build (`docs/porting.md`, *The generated Python compiled with mypyc*; the wheels:
+`docs/install.md`, *Compiled wheels and the pure fallback*).
 
 ## Shift-work orchestration policy
 

@@ -35,6 +35,20 @@ tests skip):
 The conformance suite (`node tools/conformance/run.mjs --all`) compares the Python answers with
 the Node build's, so build that first: `cd runtime-ts && npm ci && npm run build`.
 
+**Every supported CPython is a gate, not only the repo venv's 3.12** (#316 G4, J90-P8F). Python
+must give Node's answer on 3.11, 3.12, 3.13 and 3.14, and 3.13/3.14 changed some of the answers
+3.12 gave (`docs/porting.md`, *CPython 3.13 and 3.14 answer 3.12's answers*). Make a venv per
+interpreter the same way (`<python3.X> -m venv <dir> && <dir>/bin/pip install -e
+"runtime-py[dev,mcp]"`) and run the suites and pytest against each:
+
+```bash
+node tools/conformance/run.mjs --all --python <venv-3.11>/bin/python
+node tools/conformance/run.mjs --all                                  # the repo venv, 3.12
+node tools/conformance/run.mjs --all --python <venv-3.13>/bin/python
+node tools/conformance/run.mjs --all --python <venv-3.14>/bin/python
+<venv-3.14>/bin/python -m pytest runtime-py/tests -q
+```
+
 Check the install:
 
 ```bash
@@ -46,38 +60,133 @@ Check the install:
 Part of the Python package is compiled from the TypeScript in `runtime-ts/src` by `tools/ts2py`,
 a Rust compiler: everything in `runtime-py/src/bantamkit/_generated/` (the memory store, recall,
 layers, dream and component, the fact-file codec, the event log, the token ledger, pricing, the
-job budget, the log segment and the work planner). The generated files are committed, so
+job budget, the log segment, the storage lock, the hot and cold indexes, retention, the capability
+tiers and the work planner). The generated files are committed, so
 installing, testing and building the wheel need no Rust. You need `cargo` only to regenerate.
 
 To change one of these modules, edit the TypeScript, never `_generated/`, and regenerate from the
 repository root (`~/.cargo/bin/cargo` when cargo is not on PATH):
 
 ```bash
-cargo run --release --manifest-path tools/ts2py/Cargo.toml -- runtime-ts/src/workplan.ts \
+cargo run --release --manifest-path tools/ts2py/Cargo.toml -- --config tools/ts2py-bantamkit/ts2py.toml runtime-ts/src/workplan.ts \
   -o runtime-py/src/bantamkit/_generated/workplan.py --runtime-module ._ts2py_runtime
-cargo run --release --manifest-path tools/ts2py/Cargo.toml -- \
+cargo run --release --manifest-path tools/ts2py/Cargo.toml -- --config tools/ts2py-bantamkit/ts2py.toml \
   runtime-ts/src/memory/pyyaml.ts runtime-ts/src/memory/factfile.ts \
   --out-dir runtime-py/src/bantamkit/_generated --runtime-module ._ts2py_runtime
-cargo run --release --manifest-path tools/ts2py/Cargo.toml -- \
+cargo run --release --manifest-path tools/ts2py/Cargo.toml -- --config tools/ts2py-bantamkit/ts2py.toml \
   runtime-ts/src/pricing.ts runtime-ts/src/jobbudget.ts runtime-ts/src/storage/logsegment.ts \
   runtime-ts/src/eventlog.ts runtime-ts/src/tokenledger.ts runtime-ts/src/memory/usage.ts \
   runtime-ts/src/memory/retrieval.ts runtime-ts/src/memory/store.ts runtime-ts/src/memory/native.ts \
   runtime-ts/src/memory/queries.ts runtime-ts/src/memory/layers.ts runtime-ts/src/memory/dream.ts \
-  runtime-ts/src/memory/component.ts \
+  runtime-ts/src/memory/component.ts runtime-ts/src/storage/lock.ts runtime-ts/src/storage/hotindex.ts \
+  runtime-ts/src/storage/coldindex.ts runtime-ts/src/storage/retention.ts \
+  runtime-ts/src/storage/tiers.ts runtime-ts/src/storage/index.ts \
   --out-dir runtime-py/src/bantamkit/_generated --runtime-module ._ts2py_runtime
-cargo run --release --manifest-path tools/ts2py/Cargo.toml -- \
+cargo run --release --manifest-path tools/ts2py/Cargo.toml -- --config tools/ts2py-bantamkit/ts2py.toml \
   --emit-runtime runtime-py/src/bantamkit/_generated/_ts2py_runtime.py
-cargo run --release --manifest-path tools/ts2py/Cargo.toml -- \
+cargo run --release --manifest-path tools/ts2py/Cargo.toml -- --config tools/ts2py-bantamkit/ts2py.toml \
   --emit-adapters runtime-py/src/bantamkit/_generated/_ts2py_adapters.py
 ```
 
+`--config tools/ts2py-bantamkit/ts2py.toml` is bantamkit's host file (#337): the compiler in
+`tools/ts2py` is its own package and holds no bantamkit name, so the adapter rows, the adapter
+module (`tools/ts2py-bantamkit/adapters.py`) and the names the headers print come from that file.
+Without it every import of a module outside the call is refused.
+
+Where each piece lives since J90-PKG: the compiler, its runtime support
+(`tools/ts2py/python/ts2py/runtime.py`, the source of `_ts2py_runtime.py`) and its own tests
+(`cargo test --manifest-path tools/ts2py/Cargo.toml`) in `tools/ts2py/`; bantamkit's half in
+`tools/ts2py-bantamkit/`: the host file (`ts2py.toml`, every adapter row and its reason), the
+adapter module (`adapters.py`, the source of `_ts2py_adapters.py`), the census
+(`census.mjs`) and the tests that compile bantamkit's own modules
+(`cargo test --manifest-path tools/ts2py-bantamkit/Cargo.toml`). The rules each row was measured
+under stay in `tools/ts2py/RULES.md`.
+
 The output is deterministic: on an unchanged tree these five commands rewrite the same bytes. Two
-gates refuse a stale or hand-edited file: `runtime-py/tests/test_ts2py_fresh.py` (each module's
-`source-sha256` header against its TypeScript, no Rust needed) and
-`node tools/conformance/run.mjs --suite ts2py`, which recompiles everything and byte-compares it
-with the committed files. Each Python module keeps its public API through a hand-written shim
+gates refuse a stale or hand-edited file: `runtime-py/tests/test_ts2py_fresh.py` and
+`node tools/conformance/run.mjs --suite ts2py`. Both recompile everything and byte-compare it with
+the committed files, so a hand-edited body is refused even when its header still matches. The
+pytest file also checks each module's `source-sha256` header against its TypeScript, which needs no
+Rust; on a machine without cargo it runs only that check and skips the byte compare, saying so. Each Python module keeps its public API through a hand-written shim
 beside it; see [Architecture → Generated modules](architecture.md#generated-modules-where-they-sit)
 and [Porting → Generated modules](porting.md).
+
+## Compiled wheels and the pure fallback
+
+Since #316 G4 (J90-P8), `pip install bantamkit` picks one of two builds of the
+same code, by the platform tag pip matches (PEP 425: the most specific compatible tag wins).
+Neither needs Rust or a C compiler on the installing machine: the compiled wheel ships its
+extensions built.
+
+| platform | CPython | wheel |
+|---|---|---|
+| macOS 11+ on Apple silicon | 3.11, 3.12, 3.13, 3.14 | `cp3XX-cp3XX-macosx_11_0_arm64`, mypyc-compiled |
+| Linux, glibc 2.17+, x86_64 and aarch64 | 3.11, 3.12, 3.13, 3.14 | `cp3XX-cp3XX-manylinux2014_<arch>.manylinux_2_17_<arch>.manylinux_2_28_<arch>`, mypyc-compiled (built in the `manylinux_2_28` image; auditwheel measured it needs nothing past glibc 2.17) |
+| everything else: **Windows** (#336), musl Linux, macOS on Intel, any other interpreter | any >= 3.11 | `py3-none-any`, pure Python |
+
+The compiled wheel carries the same `.py` files as the pure one and, beside 23 of them
+(`bantamkit/_generated/_ts2py_runtime` and the 22 modules compiled from the TypeScript), an
+extension module built by mypyc 2.4.1 (`-O3`, debug level 0, `strip -x`); `_ts2py_adapters` stays
+interpreted. Python imports the extension when one matches the interpreter and the `.py` file
+otherwise, so there is no switch to set. Both builds answer every call identically — that is
+gated by the conformance suites run against each — and only speed differs: measured on macOS
+arm64 in J90-P7/P7B (`docs/porting.md`), the compiled build is at or below the hand-written
+Python of 9c6bc181 on every measured path, 3.11–3.14.
+
+**Where the compiled wheel puts its extensions.** Beside each of those `.py` files, and one more
+at the top of site-packages: mypyc's shared library for the whole group,
+`<hash>__mypyc.cpython-3XX-<platform>.so`, which every compiled module imports by that top-level
+name. It is in the wheel's `RECORD`, so pip installs, upgrades and removes it with the package.
+Measured (J90-RF2, a cp312 wheel built from this tree into a fresh venv): the package imports and
+serves from an empty directory with all 23 modules compiled; `pip install --upgrade` to a build
+whose module set differs (so its library has another hash) removed the old library and installed
+the new one; a downgrade swapped them back; `pip uninstall` removed it. A copy of the
+`bantamkit/` directory alone, without that library, cannot import its compiled modules: nothing
+in bantamkit copies or moves the installed package (`--update` runs `pip install --upgrade`, and
+the kept install under `~/.bantamkit/mcp` is the npm package), but a hand-made copy must take the
+library too.
+
+**Which one am I running?** `build_identity` (an MCP tool) answers `compiled`:
+`mypyc (23 compiled, 1 interpreted)` for a platform wheel, `none (0 compiled, 24 interpreted)`
+for the pure wheel or a checkout. The Node server answers the same field
+`not applicable (the Node runtime runs JavaScript; it has no compiled build)`. `build_id` is the
+same for both Python builds of one release, because they are the same source; this field is
+what tells them apart. From a shell:
+
+```bash
+<env>/bin/python -c "import bantamkit.mcpserver as m; print(m.build_identity()['compiled'])"
+```
+
+Windows gets the pure wheel. It is expected to install and import as before, but no Windows
+machine ran it for this change; compiled Windows wheels are #336.
+
+### Building the wheels locally
+
+`tools/release/publish.sh` builds the whole set (phase 2); to build it by hand, from a clean
+checkout on an Apple-silicon Mac with **Docker running** and `uv` available:
+
+```bash
+.venv/bin/python -m build --sdist --no-isolation --outdir out runtime-py
+tools/release/build-wheels.sh --sdist out/bantamkit-<version>.tar.gz --out out             # both
+tools/release/build-wheels.sh --sdist out/bantamkit-<version>.tar.gz --out out --only macos
+tools/release/smoke-wheel.sh out/bantamkit-<version>-cp312-cp312-macosx_11_0_arm64.whl     # install + run one
+```
+
+- **macOS** wheels build on this Mac with python-build-standalone interpreters that `uv`
+  downloads into `.release/cache/pythons` (set `UV=/path/to/uv` if `uv` on PATH is a shim
+  with no version). cibuildwheel is not used here: outside CI it refuses to install the
+  python.org builds it needs.
+- **Linux** wheels build in cibuildwheel 4.3.5's `manylinux_2_28` images under local Docker:
+  aarch64 natively on Apple silicon, x86_64 under emulation, which is most of the time.
+  GitHub Actions is not used.
+- Every wheel is built **from the sdist** with `BANTAMKIT_MYPYC=1`, which turns on the compile
+  in `runtime-py/hatch_build.py` (isolated builds fetch `mypy==2.4.1` and `setuptools`). Without
+  that variable the build is the pure wheel, byte for byte what it was before the hook existed;
+  `pip install -e` never compiles.
+
+Prior art: black ships the same shape (mypyc platform wheels plus a pure wheel), built with
+hatch-mypyc and cibuildwheel; this repository uses its own hook instead because hatch-mypyc
+compiles in the source tree and moves `pyproject.toml` aside while it runs.
 
 ## Pinned install from a tag
 

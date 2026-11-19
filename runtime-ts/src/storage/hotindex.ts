@@ -38,13 +38,16 @@ import * as path from 'node:path';
 
 import { BantamError } from '../errors.js';
 import { parseFrontmatter, pySplit, pyStrip } from '../memory/factfile.js';
-import { PyOSError, PyUnicodeDecodeError, pyJoin, pyReadText } from '../memory/pyfs.js';
+import { PyOSError, pyDecodeUtf8, pyJoin, pyOSErrorText, pyReadText } from '../memory/pyfs.js';
 import { FIELD_BOOST, pyRound9, stale, tokenizeV2 } from '../memory/retrieval.js';
 import { MemoryStore, pyText, tokens } from '../memory/store.js';
 import { cmpCodepoint } from '../pysem.js';
-import { dumpJson, fromJs, type PyValue } from '../pyjson.js';
+import { dumpJsValue } from '../pyjson.js';
 import { extractRefs, factRefs } from '../touch/refs.js';
-import { exclusive } from './lock.js';
+import { exclusive, removeStaleTemps } from './lock.js';
+import { parseNative } from './nativefact.js';
+import { statFile, statMtimeNs, statStamp } from './statstamp.js';
+import { nodeRealpath } from './realpath.js';
 
 // 2: the head + 16-shard layout. A version-1 single file is rebuilt, never read as a head.
 /**
@@ -120,19 +123,58 @@ interface IndexData {
   skipped: Map<string, string>;
   loose: string[];
   df: Map<string, number>;
-  avgdl: number;
   /**
-   * Per doc, the token count of each FIELD_BOOST field; validated one by one when read. A plain
-   * object as parsed, never copied into a Map: that copy cost 1.9 ms of a 5,000-fact recall.
+   * `df` as read from disk, the parsed object, until `df()` asks for the Map (1.4 ms at 5,000
+   * facts); `null` once converted, or when `df` was derived. (Held apart from `df`, not in its
+   * place, since #316 G4: a field that is one of two types is tested with `instanceof Map`.)
    */
-  lens: Map<string, unknown> | Record<string, unknown>;
+  dfRaw: Record<string, unknown> | null;
+  avgdl: number;
+  /** Per doc, the token count of each FIELD_BOOST field, as derived; validated one by one when read. */
+  lens: Map<string, unknown>;
+  /**
+   * `lens` as read from disk, the parsed object, never copied into a Map: that copy cost 1.9 ms
+   * of a 5,000-fact recall. `null` when `lens` was derived.
+   */
+  lensRaw: Record<string, unknown> | null;
   lensTotal: [number, number, number];
   boost: number[];
   cols: IndexCols;
   fingerprint: string;
   shards: Shards;
   /** The second line, unparsed, until something asks for `files`/`docs`/`df`/`lens`. */
-  tail: Buffer | Record<string, unknown> | null;
+  tailBytes: Buffer | null;
+  /** The second line of a head read whole, parsed, until it is merged in. */
+  tailObj: Record<string, unknown> | null;
+  /**
+   * `tailLine` of `files`, `docs`, `df` and `lens` as they are, when known: set by a write, or by
+   * `completeTail` when the second line read is the one this process wrote there (`WROTE_TAIL`);
+   * `null` from the moment a patch changes any of them (#316 G4, J90-P7B).
+   */
+  tailText: string | null;
+}
+
+/**
+ * A parsed head's two keys that a HotIndex method also names, typed so `tools/ts2py` reads them
+ * as data (`load`; J89-4a: the declared type decides). `cols` is checked by `isCols` when read.
+ */
+interface HeadParts {
+  cols: Record<string, unknown>;
+  avgdl: number;
+}
+
+/** A parsed head's `shards` (checked by `isFps`), read by family: `postings` is also a method. */
+interface ShardPrints {
+  postings: string[];
+  words: string[];
+}
+
+/** A parsed second line (each value checked by `isObj`), read as data (`completeTail`). */
+interface TailParts {
+  files: Record<string, unknown>;
+  docs: Record<string, unknown>;
+  df: Record<string, unknown>;
+  lens: Record<string, unknown>;
 }
 
 /** FIELD_BOOST as the whole numbers `cols.length` is summed from. */
@@ -147,31 +189,58 @@ const isIntList = (v: unknown): v is number[] => Array.isArray(v) && v.every((x)
 /** `cols` as `derive` writes it: the reference's `_is_cols`. */
 function isCols(v: unknown): v is IndexCols {
   if (!isObj(v)) return false;
-  const { name, file, length, type, types, stale } = v as Record<string, unknown>;
+  const { name, file, length, type, types, stale: staleIds } = v as Record<string, unknown>;
   if (!isStrList(name) || !isStrList(file) || !isStrList(types)) return false;
-  if (!isIntList(length) || !isIntList(type) || !isIntList(stale)) return false;
+  if (!isIntList(length) || !isIntList(type) || !isIntList(staleIds)) return false;
   const n = name.length;
   if (file.length !== n || length.length !== n || type.length !== n) return false;
-  if (length.some((x) => x < 0) || type.some((x) => x < 0 || x >= types.length)) return false;
-  return stale.every((x) => x >= 0 && x < n);
+  // One counted loop, not three callbacks (#316 G4: 5,000 calls each per recall in the generated
+  // Python); the same answer, every element an integer already.
+  for (let i = 0; i < n; i += 1) {
+    const len = length[i]!;
+    const t = type[i]!;
+    if (len < 0 || t < 0 || t >= types.length) return false;
+  }
+  for (const x of staleIds) if (x < 0 || x >= n) return false;
+  return true;
 }
 
+/** The FIELD_BOOST fields a segment's three counts name, in order (`SEG` is a start, a run length
+ * and one count per field). */
+function segmentFields(): [Field, Field, Field] {
+  const fields = FIELD_BOOST.map(([f]) => f as Field);
+  if (fields.length !== SEG - 2) throw new Error('FIELD_BOOST must name SEG - 2 fields');
+  return [fields[0]!, fields[1]!, fields[2]!];
+}
+
+const SEG_FIELDS = segmentFields();
+const FIELD0 = SEG_FIELDS[0];
+const FIELD1 = SEG_FIELDS[1];
+const FIELD2 = SEG_FIELDS[2];
+
 /** A term's segments as `[name, field, tf]` rows, name order then field order. */
-export function decodeSegments(names: readonly string[], seg: unknown): Posting[] {
+export function decodeSegments(names: ArrayLike<string>, seg: unknown): Posting[] {
   if (!Array.isArray(seg) || seg.length % SEG !== 0 || !seg.every((x) => Number.isInteger(x))) {
     throw new Error('malformed postings');
   }
-  const fields = FIELD_BOOST.map(([f]) => f as Field);
+  const n = names.length;
+  const m = seg.length;
   const out: Posting[] = [];
-  for (let j = 0; j < seg.length; j += SEG) {
+  // A segment's five numbers read once, each run one counted loop (#316 G4, J90-P3: ts2py proves
+  // both loops once, for the whole array and for each run, and reads the elements directly).
+  for (let j = 0; j < m; j += SEG) {
     const start = seg[j] as number;
     const count = seg[j + 1] as number;
-    if (count < 1 || start < 0 || start + count > names.length) throw new Error('malformed postings');
-    for (let i = start; i < start + count; i += 1) {
-      fields.forEach((f, k) => {
-        const tf = seg[j + 2 + k] as number;
-        if (tf) out.push([names[i]!, f, tf]);
-      });
+    const tf0 = seg[j + 2] as number;
+    const tf1 = seg[j + 3] as number;
+    const tf2 = seg[j + 4] as number;
+    if (count < 1 || start < 0 || start + count > n) throw new Error('malformed postings');
+    const end = start + count;
+    for (let i = start; i < end; i += 1) {
+      const name = names[i]!;
+      if (tf0) out.push([name, FIELD0, tf0]);
+      if (tf1) out.push([name, FIELD1, tf1]);
+      if (tf2) out.push([name, FIELD2, tf2]);
     }
   }
   return out;
@@ -179,51 +248,72 @@ export function decodeSegments(names: readonly string[], seg: unknown): Posting[
 
 /** `[id, tf_name, tf_description, tf_keywords]` rows, ids ascending, as segments. */
 export function encodeSegments(rows: ReadonlyArray<readonly [number, number, number, number]>): number[] {
+  // The open run held in locals and pushed when it ends (#316 G4, J90-RF): the same runs as
+  // comparing each row with the last five numbers pushed, without reading them back.
   const out: number[] = [];
+  let start = 0;
+  let count = 0;
+  let ta = 0;
+  let tb = 0;
+  let tc = 0;
   for (const [i, a, b, c] of rows) {
-    const m = out.length;
-    if (m > 0 && out[m - 5]! + out[m - 4]! === i && out[m - 3] === a && out[m - 2] === b && out[m - 1] === c) {
-      out[m - 4]! += 1;
+    if (count > 0 && start + count === i && ta === a && tb === b && tc === c) {
+      count += 1;
     } else {
-      out.push(i, 1, a, b, c);
+      if (count > 0) out.push(start, count, ta, tb, tc);
+      start = i;
+      count = 1;
+      ta = a;
+      tb = b;
+      tc = c;
     }
   }
+  if (count > 0) out.push(start, count, ta, tb, tc);
   return out;
 }
 
 /** The head's bytes: `HEAD_KEYS` on the first line, `TAIL_KEYS` on the second, one object. */
 export function headText(d: Record<string, unknown>): string {
-  const head = dumpIndex(Object.fromEntries(HEAD_KEYS.map((k) => [k, d[k]])));
-  const tail = dumpIndex(Object.fromEntries(TAIL_KEYS.map((k) => [k, d[k]])));
-  return `${head.slice(0, -1)},\n${tail.slice(1)}`;
+  return `${headLine(d)},\n${tailLine(d)}`;
 }
+
+/** `headText`'s first line less its closing brace. */
+function headLine(d: Record<string, unknown>): string {
+  return dumpIndex(Object.fromEntries(HEAD_KEYS.map((k) => [k, d[k]]))).slice(0, -1);
+}
+
+/** `headText`'s second line: the `TAIL_KEYS` object less its opening brace. */
+function tailLine(d: Record<string, unknown>): string {
+  return dumpIndex(Object.fromEntries(TAIL_KEYS.map((k) => [k, d[k]]))).slice(1);
+}
+
+/**
+ * The second line this process last wrote at each head path (#316 G4, J90-P7B). A head read back
+ * whose second line is exactly that text holds what `tailLine` gives for the docs it parses to, so
+ * a write that changed none of them (a full refresh that found nothing moved) writes the text again
+ * instead of dumping the docs again: the same bytes, without the dump. One entry per index path.
+ */
+const WROTE_TAIL = new Map<string, string>();
 
 /** Three token counts, one per FIELD_BOOST field: the reference's `_is_lens`. */
 const isLens = (v: unknown): v is [number, number, number] =>
   Array.isArray(v) && v.length === 3 && v.every((x) => Number.isInteger(x) && (x as number) >= 0);
 
-const WIKI = /\[\[([^[\]\n]+)\]\]/gu;
-const TAGS_LINE = /^tags:/m;
+// The whole `[[x]]`; `wikiLinks` takes the two brackets off each side. (Was `/\[\[(…)\]\]/gu`
+// with `matchAll`: no match can be empty or hold a bracket or a newline, so each match and its
+// group are the same text without `u`, and `match` with `g` lists exactly the matches.)
+const WIKI = /\[\[[^[\]\n]+\]\]/g;
+// `^…` under `m`, spelled without the flag: a start of input or any of JS's four line terminators
+// before it (#316 G4, J90-2; the same `test` answer on every string).
+const TAGS_LINE = /(?:^|[\n\r\u2028\u2029])tags:/;
 // Claude Code nests `links` under `metadata:`, so the native read looks at indented keys too.
-const NATIVE_EXTRA_LINE = /^[ \t]*(?:tags|links):/m;
+const NATIVE_EXTRA_LINE = /(?:^|[\n\r\u2028\u2029])[ \t]*(?:tags|links):/;
 const ISO = /^(\d{4})-(\d{1,2})-(\d{1,2})T(\d{1,2}):(\d{1,2}):(\d{1,2})Z$/;
 export const DUPLICATE = 'duplicate name';
 
-/** `os.path.realpath`, which resolves what exists and keeps the rest (as `usage.ts` does). */
-function realpath(p: string): string {
-  const abs = path.resolve(p);
-  try {
-    return fs.realpathSync.native(abs);
-  } catch {
-    const parent = path.dirname(abs);
-    if (parent === abs) return abs;
-    return path.join(realpath(parent), path.basename(abs));
-  }
-}
-
 /** The first 16 hex characters of sha256 over the realpath, as UTF-8 (`usage.storeId`). */
 export function sha16(p: string): string {
-  return createHash('sha256').update(realpath(p), 'utf8').digest('hex').slice(0, 16);
+  return createHash('sha256').update(nodeRealpath(p), 'utf8').digest('hex').slice(0, 16);
 }
 
 /**
@@ -232,62 +322,95 @@ export function sha16(p: string): string {
  * as itself there; no indexed term holds one, so the term is absent either way.
  */
 export function shardOf(term: string): number {
-  return parseInt(createHash('sha256').update(term, 'utf8').digest('hex').slice(0, 8), 16) % SHARDS;
+  // Memoized (#316 G4, J90-P4): a held index answers the same few query terms on every recall,
+  // and the hash is most of a lookup's cost in the generated Python. A pure function of the
+  // term, so the memo changes no answer; it is emptied at SHARD_MEMO_MAX terms.
+  const got = SHARD_MEMO.get(term);
+  if (got !== undefined) return got;
+  const i = parseInt(createHash('sha256').update(term, 'utf8').digest('hex').slice(0, 8), 16) % SHARDS;
+  if (SHARD_MEMO.size >= SHARD_MEMO_MAX) SHARD_MEMO = new Map();
+  SHARD_MEMO.set(term, i);
+  return i;
 }
 
+const SHARD_MEMO_MAX = 4096;
+let SHARD_MEMO = new Map<string, number>();
+
 function fingerprint(value: unknown): string {
-  return createHash('sha256').update(dumpIndex(value), 'utf8').digest('hex').slice(0, 16);
+  return printOf(dumpIndex(value));
+}
+
+/** `fingerprint` of the value whose `dumpIndex` is `text`. */
+function printOf(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 16);
 }
 
 const isFps = (v: unknown): v is string[] =>
   Array.isArray(v) && v.length === SHARDS && v.every((x) => typeof x === 'string');
 
-/** The index's one serialisation; the reference's `hotindex.dumps`. */
+/**
+ * The index's one serialisation; the reference's `hotindex.dumps`. `avgdl` is a float even when
+ * it is integral: Python writes `4.0`, where `fromJs` would write 4 (`dumpJsValue`'s float key).
+ */
 export function dumpIndex(value: unknown): string {
-  return dumpJson(toPy(value), { sortKeys: true, ensureAscii: false, separators: [',', ':'] });
-}
-
-function toPy(value: unknown): PyValue {
-  // `avgdl` is a float even when it is integral: Python writes `4.0`, `fromJs` would write 4.
-  if (value !== null && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Map)) {
-    const obj = value as Record<string, unknown>;
-    if ('avgdl' in obj && typeof obj['avgdl'] === 'number') {
-      const out = fromJs(obj);
-      if (out.t === 'dict') out.v.set('avgdl', { t: 'float', v: obj['avgdl'] });
-      return out;
-    }
-  }
-  return fromJs(value);
+  return dumpJsValue(value, { sortKeys: true, ensureAscii: false, separators: [',', ':'] }, 'avgdl');
 }
 
 function isoNow(nowMs: number): string {
   return new Date(Math.floor(nowMs / 1000) * 1000).toISOString().replace('.000Z', 'Z');
 }
 
-/** Seconds since `full_at`; an unreadable stamp is infinitely old. */
-function ageS(fullAt: string, nowMs: number): number {
+const MONTH_DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31] as const;
+
+/** Days from 1970-01-01 to `y-m-d` in the proleptic Gregorian calendar (`y` at least 1). */
+export function daysFromCivil(y: number, m: number, d: number): number {
+  const yy = m <= 2 ? y - 1 : y;
+  const era = Math.floor(yy / 400);
+  const yoe = yy - era * 400;
+  const doy = Math.floor((153 * ((m + 9) % 12) + 2) / 5) + d - 1;
+  return era * 146097 + yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy - 719468;
+}
+
+/**
+ * Seconds since `full_at`; an unreadable stamp is infinitely old.
+ *
+ * A stamp reads as itself only when each field is in range and the year is 100 or later:
+ * `Date.UTC` takes a year 0..99 as 1900..1999, so such a stamp never round-tripped and was
+ * unreadable. Spelled as arithmetic (#316 G4, J90-2), which `tools/ts2py` lowers: the old
+ * `Date.UTC` and `getUTC*` round trip answered exactly this on 760,087 stamps (every year
+ * 0000..9999 at the edge months and days, every time edge, 200,000 seeded) at five clocks.
+ */
+/** `fullAt` as ms since the epoch, NaN when it is not a stamp `isoNow` could have written. */
+function fullAtMs(fullAt: string): number {
   const m = ISO.exec(fullAt);
-  if (!m) return Infinity;
-  const [y, mo, d, h, mi, s] = m.slice(1).map(Number) as [number, number, number, number, number, number];
-  const t = Date.UTC(y, mo - 1, d, h, mi, s);
-  const back = new Date(t);
-  if (
-    back.getUTCFullYear() !== y ||
-    back.getUTCMonth() !== mo - 1 ||
-    back.getUTCDate() !== d ||
-    back.getUTCHours() !== h ||
-    back.getUTCMinutes() !== mi ||
-    back.getUTCSeconds() !== s
-  ) {
-    return Infinity;
-  }
-  return nowMs / 1000 - t / 1000;
+  if (!m) return NaN;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  const h = Number(m[4]);
+  const mi = Number(m[5]);
+  const s = Number(m[6]);
+  if (y < 100 || mo < 1 || mo > 12 || h > 23 || mi > 59 || s > 59 || d < 1) return NaN;
+  const leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+  const last = mo === 2 && leap ? 29 : MONTH_DAYS[mo - 1]!;
+  if (d > last) return NaN;
+  return daysFromCivil(y, mo, d) * 86_400_000 + h * 3_600_000 + mi * 60_000 + s * 1000;
+}
+
+/** The last stamp `ageS` read and its `fullAtMs`: every fast refresh reads the same `full_at`
+ * until a full one writes the next (#316 G4, J90-P3: one parse per stamp, not per refresh). */
+let fullAtLast: [string, number] = ['', NaN];
+
+function ageS(fullAt: string, nowMs: number): number {
+  if (fullAt !== fullAtLast[0]) fullAtLast = [fullAt, fullAtMs(fullAt)];
+  const t = fullAtLast[1];
+  return Number.isNaN(t) ? Infinity : nowMs / 1000 - t / 1000;
 }
 
 function wikiLinks(body: string): string[] {
   const out: string[] = [];
-  for (const m of body.matchAll(WIKI)) {
-    const s = pyStrip(m[1]!);
+  for (const m of body.match(WIKI) ?? []) {
+    const s = pyStrip(m.slice(2, -2));
     if (s) out.push(s);
   }
   return out;
@@ -305,126 +428,12 @@ function frontOf(text: string): string {
   return parts.length === 3 ? parts[1]! : '';
 }
 
-/**
- * `key:\n  - a\n  - b` is the same list to PyYAML as `key:\n- a\n- b`, and the codec reads only
- * the second: an INDENTED block sequence directly under an empty `key:` is moved to column 0.
- * Only the items of that run move, so a block scalar holding `  - x` is left alone.
- */
-function outdentSequences(lines: string[]): string[] {
-  const out: string[] = [];
-  let inRun = false;
-  let runIndent = '';
-  for (const line of lines) {
-    const item = /^([ \t]+)- /.exec(line) ?? /^([ \t]+)-$/.exec(line);
-    const prev = out.length ? out[out.length - 1]! : '';
-    if (item && (inRun ? item[1] === runIndent : /^[A-Za-z_][A-Za-z0-9_-]*:[ \t]*$/.test(prev))) {
-      inRun = true;
-      runIndent = item[1]!;
-      out.push(line.slice(runIndent.length));
-      continue;
-    }
-    inRun = false;
-    out.push(line);
-  }
-  return out;
-}
-
-/**
- * The native frontmatter: PyYAML reads `metadata:` as a nested mapping and the store's codec
- * reads only a flat one, so the indented block under `metadata:` is cut out and read on its
- * own, dedented. Anything deeper is outside the codec and raises.
- */
-function parseNativeFront(front: string): Record<string, unknown> {
-  const lines = outdentSequences(front.split('\n'));
-  const top: string[] = [];
-  let metadata: Record<string, unknown> | undefined;
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i]!;
-    if (/^metadata:[ \t]*(?:#.*)?$/.test(line)) {
-      const block: string[] = [];
-      let j = i + 1;
-      while (j < lines.length && (/^[ \t]/.test(lines[j]!) || lines[j] === '')) {
-        block.push(lines[j]!);
-        j += 1;
-      }
-      while (block.length > 0 && block[block.length - 1] === '') block.pop();
-      const indent = block.find((l) => l !== '')?.match(/^[ \t]*/)?.[0].length ?? 0;
-      metadata =
-        block.length === 0
-          ? undefined
-          : (parseFrontmatter(`${outdentSequences(block.map((l) => l.slice(indent))).join('\n')}\n`) as Record<
-              string,
-              unknown
-            >);
-      i = j - 1;
-      continue;
-    }
-    top.push(line);
-  }
-  const meta = parseFrontmatter(top.join('\n')) as Record<string, unknown>;
-  if (metadata !== undefined) meta['metadata'] = metadata;
-  else if (front.match(/^metadata:/m)) meta['metadata'] = null;
-  return meta;
-}
-
-/** `divergence.parse_fact` for the native shape: name, description, type and body. */
-export function parseNative(p: string): { name: string; description: string; type: string; body: string; meta: Record<string, unknown> } {
-  let text: string;
-  try {
-    text = pyReadText(p);
-  } catch (e) {
-    if (e instanceof PyOSError || e instanceof PyUnicodeDecodeError) {
-      throw new BantamError(`unreadable fact file ${p}: ${e.message}`);
-    }
-    throw e;
-  }
-  const parts = pySplit(text, '---\n', 2);
-  if (parts.length !== 3) throw new BantamError(`malformed fact file ${p}: no frontmatter fences`);
-  const [head, front, body] = parts as [string, string, string];
-  if (pyStrip(head)) {
-    throw new BantamError(`malformed fact file ${p}: frontmatter is not at the top of the file`);
-  }
-  let meta: Record<string, unknown>;
-  try {
-    meta = parseNativeFront(front);
-  } catch (e) {
-    throw new BantamError(`malformed fact file ${p}: ${e instanceof Error ? e.message : String(e)}`);
-  }
-  // PyYAML reads a frontmatter of nothing but blanks and comments as `None`.
-  if (Object.keys(meta).length === 0) {
-    throw new BantamError(`malformed fact file ${p}: frontmatter is not a mapping`);
-  }
-  const name = meta['name'];
-  if (typeof name !== 'string' || !pyStrip(name)) {
-    throw new BantamError(`malformed fact file ${p}: no usable 'name'`);
-  }
-  const md = meta['metadata'];
-  const metadata = md !== null && typeof md === 'object' && !Array.isArray(md) ? (md as Record<string, unknown>) : {};
-  let type: string;
-  if (typeof meta['type'] === 'string') type = meta['type'];
-  else if (typeof metadata['type'] === 'string') type = metadata['type'];
-  else {
-    throw new BantamError(
-      `malformed fact file ${p}: no 'type' at the top level and none under ` +
-        `'metadata:' — this file matches neither store's shape`,
-    );
-  }
-  const description = meta['description'];
-  return {
-    name: pyStrip(name),
-    description: typeof description === 'string' ? description : '',
-    type,
-    body: pyStrip(body),
-    meta,
-  };
-}
-
 /** The frontmatter as a mapping, read only when it holds a key `pattern` names. */
-function secondary(p: string, pattern: RegExp, native: boolean): Record<string, unknown> {
+function secondary(p: string, pattern: RegExp): Record<string, unknown> {
   try {
     const front = frontOf(pyReadText(p));
     if (!pattern.test(front)) return {};
-    return (native ? parseNativeFront(front) : parseFrontmatter(front)) as Record<string, unknown>;
+    return parseFrontmatter(front) as Record<string, unknown>;
   } catch {
     return {};
   }
@@ -464,6 +473,25 @@ function allDocs(docs: Map<string, IndexDoc>): boolean {
   return true;
 }
 
+/** What `parse` reads off one file: a doc without its stat, and whether its `name` is not text. */
+type Parsed = Omit<IndexDoc, 'mtime_ns' | 'size'> & { loose: boolean };
+
+/** `parsed` stamped `(mtimeNs, size)`, its keys in the order the reference's doc holds them. */
+function stamped(parsed: Parsed, mtimeNs: string, size: number): IndexDoc {
+  return {
+    file: parsed.file,
+    name: parsed.name,
+    description: parsed.description,
+    type: parsed.type,
+    keywords: parsed.keywords,
+    links: parsed.links,
+    tags: parsed.tags,
+    refs: parsed.refs,
+    mtime_ns: mtimeNs,
+    size,
+  };
+}
+
 /** An object's OWN entries: `JSON.parse` makes `__proto__` an own key, and a Map keeps it one. */
 const entries = (v: Record<string, unknown>): Array<[string, unknown]> => Object.entries(v);
 
@@ -474,12 +502,21 @@ export class HotIndex {
   readonly real: string;
   readonly path: string;
   readonly dir: string;
+  /** `shardPath`'s fixed part, made on its first use: the head's directory joined with its name
+   * less `.json`. */
+  private shardStem: string | null = null;
   persisted = true;
   private data: IndexData | null = null;
   /** The head's (mtime_ns, size, ino) when `data` was read or written: an unchanged head is not re-read. */
   private headStat: string | null = null;
   /** `family:shard` -> [fingerprint, terms]; valid only while the head names that print. */
-  private readonly shards = new Map<string, [string, Map<string, unknown>]>();
+  private shards = new Map<string, [string, Map<string, unknown>]>();
+  /**
+   * `family:shard` -> [terms, `dumpIndex(terms)`]: the text `derive` printed each table from, which
+   * the `write` right after it reuses instead of dumping the same table again (#316 G4, J90-PF).
+   * Taken by `write` (emptied at its start); used only for the very table it was dumped from.
+   */
+  private dumped = new Map<string, [Map<string, unknown>, string]>();
   /**
    * Whether every doc of `data` has been shape-checked. A head read from disk is checked when
    * something reads ALL its docs (`docs()`, a patch), not on the hook's fresh path, which reads
@@ -495,7 +532,7 @@ export class HotIndex {
     this.source = pyJoin(source);
     this.kind = kind;
     this.home = home;
-    this.real = realpath(this.source);
+    this.real = nodeRealpath(this.source);
     const where = indexDir ?? path.join(home, '.bantamkit', 'index');
     this.path = path.join(where, `${sha16(this.source)}.json`);
     this.dir = kind === 'facts' ? pyJoin(this.source, 'facts') : this.source;
@@ -504,12 +541,13 @@ export class HotIndex {
   // ------------------------------------------------------------------------- reads
 
   docs(): Map<string, IndexDoc> {
-    const data = this.whole();
+    const data: IndexData = this.whole();
     if (!this.checked) {
       if (allDocs(data.docs)) this.checked = true;
       else this.rebuild(Date.now()); // a doc of the wrong shape is a corrupt index, not a crash
     }
-    return this.data!.docs;
+    const held: IndexData = this.data!;
+    return held.docs;
   }
 
   /** The doc names, from the head's first line: a membership test that reads no doc. */
@@ -519,18 +557,21 @@ export class HotIndex {
 
   /** The docs as read, shapes NOT checked: a caller reads only what it checks itself. */
   docsUnchecked(): Map<string, IndexDoc> {
-    return this.whole().docs;
+    const data: IndexData = this.whole();
+    return data.docs;
   }
 
   /** One doc by name, shape-checked on its own; `null` when absent or malformed. */
   doc(name: string): IndexDoc | null {
-    const got = this.whole().docs.get(name);
+    const data: IndexData = this.whole();
+    const got = data.docs.get(name);
     return got !== undefined && isDoc(got) ? got : null;
   }
 
   /** The head's per-doc columns, in name order (doc id = position). */
   cols(): IndexCols {
-    return this.loaded().cols;
+    const data: IndexData = this.loaded();
+    return data.cols;
   }
 
   /** The file the index holds `name` in, from the first line; `null` when absent. */
@@ -543,7 +584,8 @@ export class HotIndex {
   private ids(): Map<string, number> {
     // Keyed on the names column itself: a patch mutates the head in place but always writes a
     // new column (`columns`).
-    const names = this.loaded().cols.name;
+    const data: IndexData = this.loaded();
+    const names = data.cols.name;
     if (this.idOf === null || this.idOf[0] !== names) this.idOf = [names, new Map(names.map((n, i) => [n, i]))];
     return this.idOf[1];
   }
@@ -577,32 +619,41 @@ export class HotIndex {
   }
 
   df(): Map<string, number> {
-    const data = this.whole();
+    const data: IndexData = this.whole();
     // Read from disk the table stays the parsed object until someone asks (1.4 ms at 5,000 facts).
-    if (!(data.df instanceof Map)) data.df = new Map(entries(data.df as Record<string, unknown>)) as Map<string, number>;
+    if (data.dfRaw !== null) {
+      data.df = new Map(entries(data.dfRaw)) as Map<string, number>;
+      data.dfRaw = null;
+    }
     return data.df;
   }
 
   avgdl(): number {
-    return this.loaded().avgdl;
+    const data: IndexData = this.loaded();
+    return data.avgdl;
   }
 
-  /** How many docs the index holds: BM25's `n` for this source. */
-  size(): number {
+  /**
+   * How many docs the index holds: BM25's `n` for this source. (Was `size()`, renamed in #316 G4
+   * as J89-4a renamed the store's `usage()`: a compiled class's method name is refused wherever a
+   * property of that name is read, and every Map's `size` is one. The Python shim keeps `size()`.)
+   */
+  docCount(): number {
     return this.cols().name.length;
   }
 
   /** `name`'s token counts per FIELD_BOOST field; `null` when absent or malformed. */
   lens(name: string): [number, number, number] | null {
-    const held = this.whole().lens;
-    const got =
-      held instanceof Map ? held.get(name) : Object.hasOwn(held, name) ? (held as Record<string, unknown>)[name] : undefined;
+    const data: IndexData = this.whole();
+    const raw = data.lensRaw;
+    const got = raw === null ? data.lens.get(name) : Object.hasOwn(raw, name) ? raw[name] : undefined;
     return isLens(got) ? got : null;
   }
 
   /** The sum of every doc's `lens`, field by field: BM25's collection length, uncounted. */
   lensTotal(): [number, number, number] {
-    return this.loaded().lensTotal;
+    const data: IndexData = this.loaded();
+    return data.lensTotal;
   }
 
   get skipped(): Map<string, string> {
@@ -640,13 +691,25 @@ export class HotIndex {
     this.data = null;
     this.headStat = null;
     this.idOf = null;
-    this.shards.clear();
+    this.shards = new Map();
+  }
+
+  /** A file this index writes: its head (`<sha16>.json`) or one of its shards (`<sha16>.<shard>.json`). */
+  private writesName(name: string): boolean {
+    const head = path.basename(this.path);
+    return name === head || (name.startsWith(`${head.slice(0, -5)}.`) && name.endsWith('.json'));
   }
 
   shardPath(family: Family, i: number): string {
-    const base = path.basename(this.path, '.json');
-    return path.join(path.dirname(this.path), `${base}.${family}-${String(i).padStart(2, '0')}.json`);
+    // `path.join(dirname, `${base}.${family}-NN.json`)`, the join made once (#316 G4, J90-PF): the
+    // name joined is the 16-hex-digit stem plus a suffix with no `/`, so joining the stem alone
+    // and appending the suffix normalizes the same path.
+    if (this.shardStem === null) {
+      this.shardStem = path.join(path.dirname(this.path), path.basename(this.path).slice(0, -5));
+    }
+    return `${this.shardStem}.${family}-${String(i).padStart(2, '0')}.json`;
   }
+
 
   private loaded(): IndexData {
     if (this.data === null) this.refresh('fast');
@@ -656,7 +719,7 @@ export class HotIndex {
   /** The held head with its second line parsed; one that is not the shape written rebuilds. */
   private whole(): IndexData {
     const data = this.loaded();
-    if (!completeTail(data)) this.rebuild(Date.now());
+    if (!completeTail(data, this.path)) this.rebuild(Date.now());
     return this.data!;
   }
 
@@ -665,13 +728,26 @@ export class HotIndex {
     const byShard = new Map<number, string[]>();
     for (const t of want) {
       const i = shardOf(t);
-      let list = byShard.get(i);
-      if (list === undefined) byShard.set(i, (list = []));
-      list.push(t);
+      const list = byShard.get(i);
+      if (list === undefined) byShard.set(i, [t]);
+      else list.push(t);
     }
     const out = new Map<string, unknown>();
+    // `shard(family, i)`'s first test, inline (#316 G4, J90-PF): the table held under the print
+    // the head names for it. `prints` is the head's, read again after any `shard` call (which may
+    // rebuild the head); nothing else here changes it.
+    let prints = this.loaded().shards[family];
     for (const i of [...byShard.keys()].sort((a, b) => a - b)) {
-      const table = this.shard(family, i);
+      const fp = prints[i];
+      const key = `${family}:${i}`;
+      const held = this.shards.get(key);
+      let table: Map<string, unknown>;
+      if (held !== undefined && held[0] === fp) {
+        table = held[1];
+      } else {
+        table = this.shard(family, i);
+        prints = this.loaded().shards[family];
+      }
       for (const t of byShard.get(i)!) if (table.has(t)) out.set(t, table.get(t));
     }
     return out;
@@ -695,7 +771,9 @@ export class HotIndex {
   private readShard(family: Family, i: number, fp: string): Map<string, unknown> | null {
     let got: unknown;
     try {
-      got = JSON.parse(fs.readFileSync(this.shardPath(family, i), 'utf8'));
+      // Strict UTF-8, as the reference's `read_text`: a shard a lossy decode would trust with a
+      // U+FFFD term is refused and the index rebuilt, so the term is found (J90-1F #3).
+      got = JSON.parse(pyReadText(this.shardPath(family, i)));
     } catch {
       return null;
     }
@@ -723,7 +801,7 @@ export class HotIndex {
       }
       // The directory moved: list it, and trust the recorded stat of a file whose
       // (mtime_ns, size) did not change.
-      if (!completeTail(data) || !this.check(data)) {
+      if (!completeTail(data, this.path) || !this.check(data)) {
         this.rebuild(nowMs);
         return 'rebuilt';
       }
@@ -734,7 +812,7 @@ export class HotIndex {
       this.write(before);
       return 'patched';
     }
-    if (!completeTail(data) || !this.check(data)) {
+    if (!completeTail(data, this.path) || !this.check(data)) {
       this.rebuild(nowMs);
       return 'rebuilt';
     }
@@ -763,9 +841,10 @@ export class HotIndex {
   // -------------------------------------------------------------------------- disk
 
   private statHead(): string | null {
+    // `${mtimeNs}:${size}:${ino}` of `fs.statSync(this.path, { bigint: true })` (#316 G4, J90-PF:
+    // an adapter answers it in Python from the stat, without the BigIntStats object).
     try {
-      const st = fs.statSync(this.path, { bigint: true });
-      return `${st.mtimeNs}:${st.size}:${st.ino}`;
+      return statStamp(this.path);
     } catch {
       return null;
     }
@@ -796,14 +875,16 @@ export class HotIndex {
       return null;
     }
     let top: Record<string, unknown> | null = null;
-    let tail: Buffer | Record<string, unknown> | null = null;
+    let tailBytes: Buffer | null = null;
+    let tailObj: Record<string, unknown> | null = null;
     const cut = raw.indexOf(0x0a);
     if (cut > 0 && raw[cut - 1] === 0x2c) {
       try {
-        const got: unknown = JSON.parse(`${raw.toString('utf8', 0, cut - 1)}}`);
+        // Strict UTF-8, as the reference's `json.loads(bytes)`: a head that is not UTF-8 rebuilds.
+        const got: unknown = JSON.parse(`${pyDecodeUtf8(raw.subarray(0, cut - 1))}}`);
         if (isObj(got) && sameKeys(got, HEAD_KEYS)) {
           top = got;
-          tail = raw.subarray(cut + 1);
+          tailBytes = raw.subarray(cut + 1);
         }
       } catch {
         top = null;
@@ -812,13 +893,14 @@ export class HotIndex {
     if (top === null) {
       let whole: unknown;
       try {
-        whole = JSON.parse(raw.toString('utf8'));
+        whole = JSON.parse(pyDecodeUtf8(raw));
       } catch {
         return null;
       }
       if (!isObj(whole) || !sameKeys(whole, [...HEAD_KEYS, ...TAIL_KEYS])) return null;
-      top = whole;
-      tail = Object.fromEntries(TAIL_KEYS.map((k) => [k, whole[k]]));
+      const parsed = whole;
+      top = parsed;
+      tailObj = Object.fromEntries(TAIL_KEYS.map((k) => [k, parsed[k]]));
     }
     // Python's `!= 4`: `4` and `4.0` pass (JSON.parse already folds 4.0 into 4).
     if (top['version'] !== INDEX_VERSION) return null;
@@ -831,8 +913,11 @@ export class HotIndex {
     const boost = top['boost'];
     const want = boostInts();
     if (!(Array.isArray(boost) && boost.length === want.length && boost.every((b, i) => b === want[i]))) return null;
-    if (!isCols(top['cols'])) return null;
+    // Typed, so the reads below are data: `cols` and `avgdl` are also HotIndex methods (J89-4a).
+    const parts: HeadParts = top as unknown as HeadParts;
+    if (!isCols(parts.cols)) return null;
     const sh = top['shards'] as Record<string, unknown>;
+    const prints: ShardPrints = sh as unknown as ShardPrints;
     const fams = Object.keys(sh).sort(cmpCodepoint);
     if (fams.length !== FAMILIES.length || fams.some((f, i) => f !== FAMILIES[i])) return null;
     if (!FAMILIES.every((f) => isFps(sh[f]))) return null;
@@ -852,18 +937,22 @@ export class HotIndex {
       skipped,
       loose: [...(top['loose'] as string[])],
       df: new Map(),
-      avgdl: top['avgdl'] as number,
+      dfRaw: null,
+      avgdl: parts.avgdl,
       lens: new Map(),
+      lensRaw: null,
       lensTotal: [...(top['lens_total'] as [number, number, number])],
       boost: want,
-      cols: top['cols'] as IndexCols,
+      cols: parts.cols as IndexCols,
       fingerprint: top['fingerprint'],
-      shards: { postings: [...(sh['postings'] as string[])], words: [...(sh['words'] as string[])] },
-      tail,
+      shards: { postings: [...prints.postings], words: [...prints.words] },
+      tailBytes,
+      tailObj,
+      tailText: null,
     };
     // A head read whole has its second line parsed already: check it now, as a head always was.
     // Only `headText`'s two lines defer it.
-    if (tail !== null && !Buffer.isBuffer(tail) && !completeTail(data)) return null;
+    if (tailObj !== null && !completeTail(data, this.path)) return null;
     return data;
   }
 
@@ -873,42 +962,57 @@ export class HotIndex {
    * head while a shard was replaced finds a print it was not promised, and rebuilds.
    */
   private write(before: Shards | null): void {
-    const d = this.data!;
+    const d: IndexData = this.data!;
+    const dumped = this.dumped;
+    this.dumped = new Map();
     const texts: Array<[string, string]> = [];
     for (const family of FAMILIES) {
       for (let i = 0; i < SHARDS; i += 1) {
         const fp = d.shards[family][i]!;
         if (before !== null && before[family][i] === fp) continue;
-        const held = this.shards.get(`${family}:${i}`);
+        const key = `${family}:${i}`;
+        const held = this.shards.get(key);
         if (held === undefined || held[0] !== fp) throw new Error(`hotindex: shard ${family}-${i} not held`);
-        texts.push([this.shardPath(family, i), dumpIndex({ fingerprint: fp, terms: held[1] })]);
+        // `dumpIndex({fingerprint, terms})` is `{"fingerprint":...` and then `,"terms":` and the
+        // terms' own text (keys sorted, no indent: a value's text is the same at any depth), so the
+        // text `derive` printed this very table from is reused (#316 G4, J90-PF).
+        const done = dumped.get(key);
+        texts.push([
+          this.shardPath(family, i),
+          done !== undefined && done[0] === held[1]
+            ? `${dumpIndex({ fingerprint: fp }).slice(0, -1)},"terms":${done[1]}}`
+            : dumpIndex({ fingerprint: fp, terms: held[1] }),
+        ]);
       }
     }
-    texts.push([
-      this.path,
-      headText({
-        version: d.version,
-        kind: d.kind,
-        source: d.source,
-        dir_mtime_ns: d.dir_mtime_ns,
-        full_at: d.full_at,
-        files: d.files,
-        docs: d.docs,
-        skipped: d.skipped,
-        loose: d.loose,
-        df: d.df,
-        avgdl: d.avgdl,
-        lens: d.lens,
-        lens_total: d.lensTotal,
-        boost: d.boost,
-        cols: d.cols,
-        fingerprint: d.fingerprint,
-        shards: d.shards,
-      }),
-    ]);
+    const all: Record<string, unknown> = {
+      version: d.version,
+      kind: d.kind,
+      source: d.source,
+      dir_mtime_ns: d.dir_mtime_ns,
+      full_at: d.full_at,
+      files: d.files,
+      docs: d.docs,
+      skipped: d.skipped,
+      loose: d.loose,
+      df: d.dfRaw ?? d.df,
+      avgdl: d.avgdl,
+      lens: d.lensRaw ?? d.lens,
+      lens_total: d.lensTotal,
+      boost: d.boost,
+      cols: d.cols,
+      fingerprint: d.fingerprint,
+      shards: d.shards,
+    };
+    // `headText(all)`, with the second line dumped only when no write or read already holds it.
+    const tail = d.tailText ?? tailLine(all);
+    d.tailText = tail;
+    texts.push([this.path, `${headLine(all)},\n${tail}`]);
     try {
       fs.mkdirSync(path.dirname(this.path), { recursive: true });
       exclusive(this.path, () => {
+        // A killed writer's temps of this index's own files, once stale (#316 G4, J90-3F).
+        removeStaleTemps(path.dirname(this.path), (b) => this.writesName(b));
         for (const [p, text] of texts) {
           const tmp = path.join(path.dirname(p), `${path.basename(p)}.${process.pid}.tmp`);
           try {
@@ -925,7 +1029,11 @@ export class HotIndex {
         }
       });
     } catch (e) {
-      if (e instanceof Error && 'code' in e) {
+      // An fs call's error (or Node's argument TypeError): the ones that carry a string `code`.
+      // (Was `e instanceof Error && 'code' in e`, the same test on everything this block throws;
+      // spelled by the code alone since #316 G4, as the generated Python's fs errors are
+      // CPython's `OSError`, whose `code` it reads as Node's.)
+      if (typeof (e as NodeJS.ErrnoException).code === 'string') {
         this.persisted = false;
         this.headStat = null;
         return;
@@ -934,17 +1042,18 @@ export class HotIndex {
     }
     this.persisted = true;
     this.headStat = this.statHead();
+    WROTE_TAIL.set(this.path, tail);
   }
 
   private store(): MemoryStore {
     // The store's own reader, `create: false`: an index never makes a store exist.
-    this.reader ??= new MemoryStore(this.source, { create: false });
+    if (this.reader === null) this.reader = new MemoryStore(this.source, { create: false });
     return this.reader;
   }
 
   private dirMtime(): string | null {
     try {
-      return fs.statSync(this.dir, { bigint: true }).mtimeNs.toString();
+      return statMtimeNs(this.dir);
     } catch {
       return null;
     }
@@ -952,30 +1061,45 @@ export class HotIndex {
 
   /** The files this source holds, in the order the source's own reader lists them. */
   private listing(): string[] {
-    if (this.kind === 'facts') return this.store()['factPaths']();
+    if (this.kind === 'facts') return this.store().factPaths();
+    return this.mdPaths().filter((p) => isFile(p));
+  }
+
+  /** A native directory's `*.md` paths but `MEMORY.md`, in code-point order, files or not. */
+  private mdPaths(): string[] {
+    return this.mdNames().map((n) => pyJoin(this.dir, n));
+  }
+
+  /** `mdPaths`' names: each path is `pyJoin(this.dir, name)`, whose basename is the name. */
+  private mdNames(): string[] {
     let names: string[];
     try {
       names = fs.readdirSync(this.dir);
     } catch (e) {
-      if (e instanceof Error && (e as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return [];
       throw e;
     }
-    return names
-      .filter((n) => n.endsWith('.md') && n !== 'MEMORY.md' && isFile(pyJoin(this.dir, n)))
-      .sort(cmpCodepoint)
-      .map((n) => pyJoin(this.dir, n));
+    return names.filter((n) => n.endsWith('.md') && n !== 'MEMORY.md').sort(cmpCodepoint);
   }
 
   private statListing(): Array<[string, string, number]> {
     const out: Array<[string, string, number]> = [];
-    for (const p of this.listing()) {
-      let st: fs.BigIntStats;
+    // `listing`'s files, each stated once (#316 G4, J90-P4): a native path is kept when its one
+    // stat finds a file, where `listing` stats it for `isFile` and again here for its print.
+    // A native file is listed by name (`mdNames`) and joined here: its name is its basename.
+    const native = this.kind !== 'facts';
+    for (const f of native ? this.mdNames() : this.listing()) {
+      const p = native ? pyJoin(this.dir, f) : f;
+      // `[mtimeNs.toString(), Number(size), isFile()]` of `fs.statSync(p, { bigint: true })`
+      // (#316 G4, J90-PF: an adapter answers it in Python without the BigIntStats object).
+      let st: [string, number, boolean];
       try {
-        st = fs.statSync(p, { bigint: true });
+        st = statFile(p);
       } catch {
         continue; // gone between the listing and the stat: it is not there
       }
-      out.push([path.basename(p), st.mtimeNs.toString(), Number(st.size)]);
+      if (native && !st[2]) continue;
+      out.push([native ? f : path.basename(p), st[0], st[1]]);
     }
     return out;
   }
@@ -994,16 +1118,20 @@ export class HotIndex {
       skipped: new Map(),
       loose: [],
       df: new Map(),
+      dfRaw: null,
       avgdl: 0,
       lens: new Map(),
+      lensRaw: null,
       lensTotal: [0, 0, 0],
       boost: boostInts(),
       cols: { name: [], file: [], length: [], type: [], types: [], stale: [] },
       fingerprint: '',
       shards: { postings: [], words: [] },
-      tail: null,
+      tailBytes: null,
+      tailObj: null,
+      tailText: null,
     };
-    this.shards.clear();
+    this.shards = new Map();
     this.patch(data, this.statListing(), true);
     return data;
   }
@@ -1022,15 +1150,20 @@ export class HotIndex {
   private patch(data: IndexData, stats: Array<[string, string, number]>, force = false): boolean {
     const { files, docs, skipped } = data;
     const loose = new Set(data.loose);
-    const order = new Map<string, number>(stats.map(([n], i) => [n, i]));
-    const nowFiles = new Map<string, [string, number]>(stats.map(([n, m, s]) => [n, [m, s]]));
+    // One pass, and `order` only past the early return (#316 G4, J90-P7B: a full refresh that finds
+    // nothing moved built both maps through a destructuring callback per file).
+    const nowFiles = new Map<string, [string, number]>();
+    for (const [n, m, s] of stats) nowFiles.set(n, [m, s]);
     const redo = new Set<string>();
-    for (const [name, [m, s]] of nowFiles) {
+    for (const [name, now] of nowFiles) {
       const was = files.get(name);
-      if (was === undefined || was[0] !== m || was[1] !== s) redo.add(name);
+      if (was === undefined || was[0] !== now[0] || was[1] !== now[1]) redo.add(name);
     }
     const gone = new Set([...files.keys()].filter((n) => !nowFiles.has(n)));
     if (redo.size === 0 && gone.size === 0 && !force) return false;
+    data.tailText = null;
+    const order = new Map<string, number>();
+    stats.forEach(([n], i) => order.set(n, i));
     const derivedFrom = derivedKey(docs);
     // Only when something moved: a duplicate may now hold its name, or still not.
     for (const name of nowFiles.keys()) if ((skipped.get(name) ?? '').startsWith(DUPLICATE)) redo.add(name);
@@ -1048,9 +1181,8 @@ export class HotIndex {
         skipped.set(file, parsed);
         continue;
       }
-      const { loose: isLoose, ...rest } = parsed;
-      if (isLoose) loose.add(file);
-      const doc: IndexDoc = { ...rest, mtime_ns: mtimeNs, size };
+      if (parsed.loose) loose.add(file);
+      const doc = stamped(parsed, mtimeNs, size);
       const held = docs.get(doc.name);
       if (held === undefined) {
         docs.set(doc.name, doc);
@@ -1064,7 +1196,7 @@ export class HotIndex {
     data.files = nowFiles;
     data.loose = [...loose].sort(cmpCodepoint);
     if (force || derivedKey(docs) !== derivedFrom) this.derive(data);
-    data.cols = columns(docs, data.lens);
+    data.cols = columns(docs, data);
     data.boost = boostInts();
     return true;
   }
@@ -1077,32 +1209,32 @@ export class HotIndex {
   parseFile(p: string, mtimeNs: string, size: number): IndexDoc | string {
     const got = this.parse(p);
     if (typeof got === 'string') return got;
-    const { loose, ...doc } = got;
-    if (loose) return 'name is not a string';
-    return { ...doc, mtime_ns: mtimeNs, size };
+    if (got.loose) return 'name is not a string';
+    return stamped(got, mtimeNs, size);
   }
 
   /** One file as a doc without its stat, or the sentence it was skipped with. */
-  private parse(p: string): (Omit<IndexDoc, 'mtime_ns' | 'size'> & { loose: boolean }) | string {
+  private parse(p: string): Parsed | string {
     const file = path.basename(p);
     if (this.kind === 'facts') {
       let fact;
       try {
-        fact = this.store()['readFact'](p);
+        fact = this.store().readFact(p);
       } catch (e) {
-        if (e instanceof BantamError || e instanceof PyOSError) return e.message;
+        if (e instanceof PyOSError) return pyOSErrorText(e);
+        if (e instanceof BantamError) return e.message;
         throw e;
       }
-      const extra = secondary(p, TAGS_LINE, false);
+      const extra = secondary(p, TAGS_LINE);
       return {
         file,
         name: pyText(fact.name),
         description: pyText(fact.description),
         type: pyText(fact.type),
         keywords: [...(fact.keywords ?? [])],
-        links: dedupe([...fact.links.map(pyText), ...wikiLinks(fact.body)]),
+        links: dedupe([...fact.links.map((x) => pyText(x)), ...wikiLinks(fact.body)]),
         tags: strList(extra['tags']),
-        refs: factRefs(pyText(fact.description), [...(fact.keywords ?? [])].map(pyText), pyText(fact.body)),
+        refs: factRefs(pyText(fact.description), [...(fact.keywords ?? [])].map((x) => pyText(x)), pyText(fact.body)),
         loose: typeof fact.name !== 'string',
       };
     }
@@ -1113,12 +1245,14 @@ export class HotIndex {
       if (e instanceof BantamError) return e.message;
       throw e;
     }
-    const extra = NATIVE_EXTRA_LINE.test(frontOf(safeRead(p))) ? stored.meta : {};
+    // `stored.front` is the frontmatter `parseNative` read, `frontOf` of the same text (#316 G4,
+    // J90-PF: the file was read a second time for it).
+    const extra = NATIVE_EXTRA_LINE.test(stored.front) ? stored.meta : {};
     const md = extra['metadata'];
     const nested = md !== null && typeof md === 'object' && !Array.isArray(md) ? (md as Record<string, unknown>) : {};
     // A top-level key wins, as a top-level `type` does in `parse_fact`.
     const fl = 'links' in extra ? extra['links'] : nested['links'];
-    const frontLinks = Array.isArray(fl) ? fl.map(pyText) : [];
+    const frontLinks = Array.isArray(fl) ? fl.map((x) => pyText(x)) : [];
     const tags = 'tags' in extra ? extra['tags'] : nested['tags'];
     return {
       file,
@@ -1139,54 +1273,94 @@ export class HotIndex {
    * table's fingerprint and `write` writes the tables whose print moved.
    */
   private derive(data: IndexData): void {
-    const rows = Array.from({ length: SHARDS }, () => new Map<string, Array<[number, number, number, number]>>());
-    const words = Array.from({ length: SHARDS }, () => new Map<string, string[]>());
+    const rows: Array<Map<string, Array<[number, number, number, number]>>> = [];
+    const words: Array<Map<string, string[]>> = [];
+    for (let i = 0; i < SHARDS; i += 1) {
+      rows.push(new Map());
+      words.push(new Map());
+    }
     const df = new Map<string, number>();
+    // term -> its shard, memoized per derive. Read inline (no closure per term): `Map.get` in a
+    // loop is the one call ts2py expands to the dict read (#316 G4, J90-RF).
     const at = new Map<string, number>();
-    const shardAt = (t: string): number => {
-      let i = at.get(t);
-      if (i === undefined) at.set(t, (i = shardOf(t)));
-      return i;
-    };
     let total = 0;
     const lens = new Map<string, unknown>();
     const lensTotal: [number, number, number] = [0, 0, 0];
-    const names = [...data.docs.keys()].sort(cmpCodepoint);
-    names.forEach((name, docId) => {
-      const d = data.docs.get(name)!;
+    const docs = data.docs;
+    const names = [...docs.keys()].sort(cmpCodepoint);
+    for (let docId = 0; docId < names.length; docId += 1) {
+      const name = names[docId]!;
+      const d = docs.get(name)!;
       const text: Record<Field, string> = { name: d.name, description: d.description, keywords: d.keywords.join(' ') };
-      // term -> its count per field, fields in FIELD_BOOST order
-      const tfs = new Map<string, [number, number, number]>();
+      // term -> its posting row `[docId, tf per field]`, fields in FIELD_BOOST order: the row is
+      // built as it is counted and pushed as it is (was a count triple copied into a new row).
+      const tfs = new Map<string, [number, number, number, number]>();
       const flens: [number, number, number] = [0, 0, 0];
       lens.set(name, flens);
-      for (const [fi, [field, boost]] of FIELD_BOOST.entries()) {
+      for (let fi = 0; fi < FIELD_BOOST.length; fi += 1) {
+        const [field, boost] = FIELD_BOOST[fi]!;
         const toks = tokenizeV2(text[field as Field]);
         total += boost * toks.length;
         flens[fi] = toks.length;
-        lensTotal[fi]! += toks.length;
+        lensTotal[fi] = lensTotal[fi]! + toks.length;
+        const k = fi + 1;
         for (const t of toks) {
-          let c = tfs.get(t);
-          if (c === undefined) tfs.set(t, (c = [0, 0, 0]));
-          c[fi]! += 1;
+          const row = tfs.get(t);
+          if (row === undefined) {
+            const fresh: [number, number, number, number] = [docId, 0, 0, 0];
+            fresh[k] = 1;
+            tfs.set(t, fresh);
+          } else {
+            // Through a local, so the store is of a plain value (#316 G4, J90-PF: ts2py writes
+            // such a store inline in a loop; `row[k] = row[k]! + 1` read the row inside it).
+            const n = row[k]! + 1;
+            row[k] = n;
+          }
         }
       }
-      for (const [term, [a, b, c]] of tfs) {
-        const table = rows[shardAt(term)]!;
-        let list = table.get(term);
-        if (list === undefined) table.set(term, (list = []));
-        list.push([docId, a, b, c]);
-        df.set(term, (df.get(term) ?? 0) + 1);
+      for (const [term, row] of tfs) {
+        let i = at.get(term);
+        if (i === undefined) {
+          i = shardOf(term);
+          at.set(term, i);
+        }
+        const table = rows[i]!;
+        const list = table.get(term);
+        // A term's `df` is how many docs so far hold it, which is its posting list's length: each
+        // doc pushes one row per term, and both start empty here (#316 G4, J90-PF: was a read, a
+        // `?? 0` and a sum per term). First set when first seen, as before, so in the same order.
+        if (list === undefined) {
+          table.set(term, [row]);
+          df.set(term, 1);
+        } else {
+          const held = list.push(row);
+          df.set(term, held);
+        }
       }
       for (const w of tokens(`${d.name} ${d.description}`)) {
-        const table = words[shardAt(w)]!;
-        let list = table.get(w);
-        if (list === undefined) table.set(w, (list = []));
-        list.push(name);
+        let i = at.get(w);
+        if (i === undefined) {
+          i = shardOf(w);
+          at.set(w, i);
+        }
+        const table = words[i]!;
+        const list = table.get(w);
+        if (list === undefined) table.set(w, [name]);
+        else list.push(name);
       }
-    });
-    const postings = rows.map((table) => new Map([...table].map(([t, r]) => [t, encodeSegments(r)])));
+    }
+    // A loop, not two `map` callbacks and a destructuring per term (#316 G4, J90-PF): the same
+    // tables, each term in the same order.
+    const postings: Array<Map<string, number[]>> = [];
+    for (const table of rows) {
+      const encoded = new Map<string, number[]>();
+      for (const [t, r] of table) encoded.set(t, encodeSegments(r));
+      postings.push(encoded);
+    }
     data.df = df;
+    data.dfRaw = null;
     data.lens = lens;
+    data.lensRaw = null;
     data.lensTotal = lensTotal;
     data.avgdl = names.length ? pyRound9(total / names.length) : 0;
     const prints: Shards = { postings: [], words: [] };
@@ -1194,11 +1368,14 @@ export class HotIndex {
       ['postings', postings],
       ['words', words],
     ] as Array<[Family, Array<Map<string, unknown>>]>) {
-      tables.forEach((table, i) => {
-        const fp = fingerprint(table);
+      for (let i = 0; i < tables.length; i += 1) {
+        const table = tables[i]!;
+        const text = dumpIndex(table);
+        const fp = printOf(text);
         prints[family].push(fp);
         this.shards.set(`${family}:${i}`, [fp, table]);
-      });
+        this.dumped.set(`${family}:${i}`, [table, text]);
+      }
     }
     data.shards = prints;
     data.fingerprint = fingerprint(prints);
@@ -1206,7 +1383,8 @@ export class HotIndex {
 }
 
 /** The head's per-doc columns, in name order: the reference's `_columns`. */
-function columns(docs: Map<string, IndexDoc>, lens: Map<string, unknown> | Record<string, unknown>): IndexCols {
+function columns(docs: Map<string, IndexDoc>, data: IndexData): IndexCols {
+  const raw = data.lensRaw;
   const boost = boostInts();
   const names = [...docs.keys()].sort(cmpCodepoint);
   const types = [...new Set(names.map((n) => docs.get(n)!.type))].sort(cmpCodepoint);
@@ -1214,7 +1392,7 @@ function columns(docs: Map<string, IndexDoc>, lens: Map<string, unknown> | Recor
   const cols: IndexCols = { name: names, file: [], length: [], type: [], types, stale: [] };
   names.forEach((name, i) => {
     const d = docs.get(name)!;
-    const l = (lens instanceof Map ? lens.get(name) : (lens as Record<string, unknown>)[name]) as number[];
+    const l = (raw === null ? data.lens.get(name) : raw[name]) as number[];
     cols.file.push(d.file === `${name}.md` ? '' : d.file);
     cols.type.push(code.get(d.type)!);
     cols.length.push(boost[0]! * l[0]! + boost[1]! * l[1]! + boost[2]! * l[2]!);
@@ -1223,31 +1401,41 @@ function columns(docs: Map<string, IndexDoc>, lens: Map<string, unknown> | Recor
   return cols;
 }
 
-/** The parsed second line of `data`'s head, merged in once; false when it is not the shape written. */
-function completeTail(data: IndexData): boolean {
-  const tail = data.tail;
-  if (tail === null) return true;
-  data.tail = null;
-  let got: unknown = tail;
-  if (Buffer.isBuffer(tail)) {
+/**
+ * The parsed second line of `data`'s head (read from `headPath`), merged in once; false when it is
+ * not the shape written.
+ */
+function completeTail(data: IndexData, headPath: string): boolean {
+  const bytes = data.tailBytes;
+  let got: unknown = data.tailObj;
+  if (bytes === null && got === null) return true;
+  data.tailBytes = null;
+  data.tailObj = null;
+  let text: string | null = null;
+  if (bytes !== null) {
     try {
-      got = JSON.parse(`{${tail.toString('utf8')}`);
+      text = pyDecodeUtf8(bytes);
+      got = JSON.parse(`{${text}`);
     } catch {
       return false;
     }
   }
   if (!isObj(got) || !sameKeys(got, TAIL_KEYS)) return false;
   for (const key of TAIL_KEYS) if (!isObj(got[key])) return false;
+  // Typed, so the reads below are data: `docs`, `df` and `lens` are also HotIndex methods.
+  const tail: TailParts = got as unknown as TailParts;
   const files = new Map<string, [string, number]>();
-  for (const [k, v] of entries(got['files'] as Record<string, unknown>)) {
+  for (const [k, v] of entries(tail.files)) {
     if (!(Array.isArray(v) && v.length === 2 && typeof v[0] === 'string' && Number.isInteger(v[1]))) return false;
     files.set(k, [v[0], v[1]]);
   }
   data.files = files;
   // Unchecked here: `docs()` and a patch check them all, `doc()` checks the one it reads.
-  data.docs = new Map(entries(got['docs'] as Record<string, unknown>)) as Map<string, IndexDoc>;
-  data.df = got['df'] as unknown as Map<string, number>; // converted by `df()` when asked
-  data.lens = got['lens'] as Record<string, unknown>; // read lazily by `lens()`
+  data.docs = new Map(entries(tail.docs)) as Map<string, IndexDoc>;
+  data.dfRaw = tail.df; // converted by `df()` when asked
+  data.lensRaw = tail.lens; // read lazily by `lens()`
+  // The line this process wrote here, read back unchanged: `tailLine` of what it parsed to.
+  if (text !== null && text === WROTE_TAIL.get(headPath)) data.tailText = text;
   return true;
 }
 
@@ -1263,14 +1451,6 @@ function derivedKey(docs: Map<string, IndexDoc>): string {
   for (const [n, d] of docs) rows.push([n, d.description, d.keywords]);
   rows.sort((a, b) => cmpCodepoint(a[0], b[0]));
   return JSON.stringify(rows);
-}
-
-function safeRead(p: string): string {
-  try {
-    return pyReadText(p);
-  } catch {
-    return '';
-  }
 }
 
 function isFile(p: string): boolean {

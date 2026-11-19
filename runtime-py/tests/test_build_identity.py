@@ -39,9 +39,11 @@ import os
 import shutil
 import subprocess
 import sys
+from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
 
 import pytest
+from conftest import checkout_only
 
 pytest.importorskip("mcp")
 
@@ -54,6 +56,31 @@ from bantamkit.memory import Memory  # noqa: E402
 
 PACKAGE_SRC = Path(bantamkit.__file__).resolve().parent
 ASSET_SRC = assets_root()
+
+
+def _copy_package(import_root: Path, src_root: Path | None = None) -> None:
+    """`bantamkit/` and, beside it, mypyc's group library: the build this checkout runs.
+
+    #316 G4, J90-RF2. With the mypyc extensions beside the `.py` files, every compiled module
+    imports one shared library mypyc writes for the group, `<hash>__mypyc.<ext suffix>`, by
+    that TOP-LEVEL name, from the directory that holds `bantamkit/` (where a wheel puts it in
+    site-packages). A copy of `bantamkit/` alone could not import there: J90-RR measured six
+    errors in this file. Copying the library keeps each copy the SAME build as the checkout,
+    compiled or pure, which is what these nodes compare; a pure checkout has no such file.
+
+    `src_root` (default: the directory holding the imported package) exists for
+    `test_the_copy_takes_the_group_library_beside_the_package`, which hands it a synthetic
+    tree: see there for why the real tree cannot prove this copy works.
+    """
+    src_root = PACKAGE_SRC.parent if src_root is None else src_root
+    shutil.copytree(
+        src_root / "bantamkit",
+        import_root / "bantamkit",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    for lib in src_root.iterdir():
+        if "__mypyc." in lib.name and lib.name.endswith(tuple(EXTENSION_SUFFIXES)):
+            shutil.copy2(lib, import_root / lib.name)
 
 PROTOCOL_VERSION = "2024-11-05"
 
@@ -79,6 +106,7 @@ FIELDS = {
     "interpreter",
     "python_version",
     "python_implementation",
+    "compiled",
     "mcp_sdk_version",
     "unavailable",
 }
@@ -157,11 +185,7 @@ def _tree(root: Path, name: str) -> Path:
     """
     tree = root / name
     (tree / "runtime-py" / "src").mkdir(parents=True)
-    shutil.copytree(
-        PACKAGE_SRC,
-        tree / "runtime-py" / "src" / "bantamkit",
-        ignore=shutil.ignore_patterns("__pycache__"),
-    )
+    _copy_package(tree / "runtime-py" / "src")
     shutil.copytree(ASSET_SRC, tree / "assets", ignore=shutil.ignore_patterns("__pycache__"))
     return tree
 
@@ -179,9 +203,7 @@ def _wheel_shaped(root: Path, name: str) -> Path:
     """
     pkgroot = root / name / "pkgroot"
     pkgroot.mkdir(parents=True)
-    shutil.copytree(
-        PACKAGE_SRC, pkgroot / "bantamkit", ignore=shutil.ignore_patterns("__pycache__")
-    )
+    _copy_package(pkgroot)
     shutil.copytree(
         ASSET_SRC, pkgroot / "bantamkit" / "assets", ignore=shutil.ignore_patterns("__pycache__")
     )
@@ -323,6 +345,132 @@ def test_git_commit_is_a_stated_refusal_and_never_reads_as_a_value():
     assert "git_commit" in identity["unavailable"]
 
 
+def _generated_stems() -> list[str]:
+    generated = Path(bantamkit.__file__).resolve().parent / "_generated"
+    return sorted(p.stem for p in generated.glob("*.py") if p.stem != "__init__")
+
+
+def test_compiled_names_the_build_the_modules_were_loaded_from():
+    """#316 G4 (J90-P8): `compiled` says which wheel is running, counted from the imports.
+
+    The mypyc platform wheel and the pure wheel carry the same `.py` files, so `build_id`
+    is one value for both; this field is what tells them apart. Recounted here by IMPORTING
+    every generated module and reading the file each one came from, so the node holds on the
+    pure checkout (`none`) and against an installed platform wheel (`mypyc`) alike.
+    """
+    import importlib
+    from importlib.machinery import EXTENSION_SUFFIXES
+
+    stems = _generated_stems()
+    loaded = [importlib.import_module(f"bantamkit._generated.{stem}") for stem in stems]
+    compiled = sum(1 for m in loaded if m.__file__.endswith(tuple(EXTENSION_SUFFIXES)))
+    kind = "mypyc" if compiled else "none"
+    expected = f"{kind} ({compiled} compiled, {len(stems) - compiled} interpreted)"
+    assert build_identity()["compiled"] == expected
+    assert "compiled" not in build_identity()["unavailable"]
+
+
+def test_compiled_counts_an_extension_module_the_import_system_would_load(tmp_path):
+    """The count reads the import system's own answer, not a file listing of `.py` files.
+
+    A copy of the package (extensions left out, so it is the pure build) gains ONE empty
+    extension-module file beside a generated module nothing has imported yet; the import
+    system now resolves that module to the extension, and `compiled` must count exactly it.
+    """
+    copy = tmp_path / "bantamkit"
+    shutil.copytree(
+        Path(bantamkit.__file__).resolve().parent,
+        copy,
+        ignore=shutil.ignore_patterns("__pycache__", "*.so", "*.pyd"),
+    )
+    probe = (
+        "import importlib, importlib.machinery, pathlib, sys\n"
+        "import bantamkit.mcpserver as m\n"
+        "gen = pathlib.Path(m.find_spec('bantamkit._generated').submodule_search_locations[0])\n"
+        "free = [p.stem for p in sorted(gen.glob('*.py')) if p.stem != '__init__'\n"
+        "        and 'bantamkit._generated.' + p.stem not in sys.modules]\n"
+        "print(m._compiled_build())\n"
+        "(gen / (free[0] + importlib.machinery.EXTENSION_SUFFIXES[0])).write_bytes(b'')\n"
+        "importlib.invalidate_caches()\n"
+        "print(m._compiled_build())\n"
+    )
+    env = {**os.environ, "PYTHONPATH": str(tmp_path)}
+    out = subprocess.run(
+        [sys.executable, "-c", probe], env=env, capture_output=True, text=True, check=True,
+        encoding="utf-8",
+    ).stdout.splitlines()
+    total = len(_generated_stems())
+    assert out == [
+        f"none (0 compiled, {total} interpreted)",
+        f"mypyc (1 compiled, {total - 1} interpreted)",
+    ]
+
+
+# #316 G4, J90-RF3 (J90-RR2 F1). WHY THESE TWO NODES USE A SYNTHETIC TREE. Under the compiled
+# gate the venv's editable install (`_editable_impl_bantamkit.pth`) puts the checkout's
+# `runtime-py/src` on `sys.path` of every child, so a copy that left the group library behind
+# still imports it FROM THE CHECKOUT: J90-RR2 replaced the `shutil.copy2` above with `pass` and
+# saw this file pass 14. The server-launching nodes cannot see this copy break; only a tree in
+# which the copy is the ONLY way the file can arrive can. A fake group library is bytes, not a
+# loadable extension: what is asserted is that the copy takes it, by name and content, and
+# takes nothing else beside the package.
+_FAKE_GROUP_LIBRARY = f"0123abcd__mypyc{EXTENSION_SUFFIXES[0]}"
+
+
+def _synthetic_src(root: Path, *, compiled: bool) -> Path:
+    src = root / "src"
+    (src / "bantamkit" / "_generated").mkdir(parents=True)
+    (src / "bantamkit" / "__init__.py").write_text("x = 1\n", encoding="utf-8")
+    (src / "bantamkit" / "_generated" / "mod.py").write_text("y = 2\n", encoding="utf-8")
+    (src / "bantamkit" / "__pycache__").mkdir()
+    (src / "bantamkit" / "__pycache__" / "stale.pyc").write_bytes(b"stale")
+    (src / "README.txt").write_text("not part of the build\n", encoding="utf-8")
+    if compiled:
+        (src / _FAKE_GROUP_LIBRARY).write_bytes(b"\x7fELF group library " + bytes(range(256)))
+    return src
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["pure", "compiled"])
+def test_the_copy_takes_the_group_library_beside_the_package(tmp_path, compiled):
+    """`_copy_package` copies `bantamkit/` and, on a compiled layout, the group library."""
+    src = _synthetic_src(tmp_path, compiled=compiled)
+    dest = tmp_path / "dest"
+    dest.mkdir()
+
+    _copy_package(dest, src)
+
+    copied = sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file())
+    expected = ["bantamkit/__init__.py", "bantamkit/_generated/mod.py"]
+    if compiled:
+        expected.append(_FAKE_GROUP_LIBRARY)
+    assert copied == sorted(expected), (
+        f"the copy is not the build beside it ({'compiled' if compiled else 'pure'} layout)"
+    )
+    if compiled:
+        assert (dest / _FAKE_GROUP_LIBRARY).read_bytes() == (src / _FAKE_GROUP_LIBRARY).read_bytes()
+
+
+def test_the_real_copy_takes_every_group_library_this_checkout_has(tmp_path):
+    """The same property on the tree this run imports: compiled gate non-empty, pure empty."""
+    beside = sorted(
+        p.name
+        for p in PACKAGE_SRC.parent.iterdir()
+        if "__mypyc." in p.name and p.name.endswith(tuple(EXTENSION_SUFFIXES))
+    )
+    _copy_package(tmp_path)
+    taken = sorted(p.name for p in tmp_path.iterdir() if p.is_file())
+    assert taken == beside
+
+
+_CHECKOUT_ONLY = checkout_only(
+    because=(
+        "this node digests the checkout's source and asset tree, which an installed package "
+        "lays out differently (its assets inside it)"
+    ),
+)
+
+
+@_CHECKOUT_ONLY
 def test_the_digests_covered_the_files_that_are_really_there():
     """Vacuity: a digest over zero files is a constant that agrees with every other one."""
     identity = build_identity()
@@ -420,6 +568,7 @@ def test_a_change_no_behavioural_probe_could_see_is_still_a_different_build(pris
     assert mutant["build_id"] != pristine["build_id"]
 
 
+@_CHECKOUT_ONLY
 def test_an_asset_only_change_moves_the_build_id_on_its_own(pristine, tmp_path):
     """The asset half, shown firing alone: same code, different pack, different build.
 
@@ -464,6 +613,7 @@ def test_two_copies_of_one_build_at_two_paths_are_one_build(pristine, tmp_path):
         assert twin[field] == pristine[field], field
 
 
+@_CHECKOUT_ONLY
 def test_one_build_in_two_install_shapes_is_one_build(pristine, tmp_path):
     """The control that FOUND A DEFECT, and it is the reason it is here.
 
@@ -493,6 +643,7 @@ def test_one_build_in_two_install_shapes_is_one_build(pristine, tmp_path):
     assert wheel["build_id"] == pristine["build_id"]
 
 
+@_CHECKOUT_ONLY
 def test_pip_byte_compiling_the_packs_fixtures_is_not_a_different_pack(pristine, tmp_path):
     """The same defect as the test above, one field over, found on the PUBLISHED artifacts.
 

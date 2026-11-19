@@ -54,7 +54,7 @@ fn package(dir: &Path, modules: &[ts2py::Compiled]) {
     std::fs::write(package.join("_ts2py_runtime.py"), ts2py::RUNTIME).unwrap();
     std::fs::write(
         package.join("_ts2py_adapters.py"),
-        ts2py::adapters_module("._ts2py_runtime"),
+        ts2py_bantamkit::adapters_module("._ts2py_runtime"),
     )
     .unwrap();
     for module in modules {
@@ -69,7 +69,7 @@ fn package(dir: &Path, modules: &[ts2py::Compiled]) {
 fn compile_package(sources: &[(&str, &str)]) -> Vec<ts2py::Compiled> {
     let options = ts2py::Options {
         runtime_module: Some("._ts2py_runtime".to_string()),
-        ..ts2py::Options::default()
+        ..ts2py_bantamkit::options()
     };
     ts2py::compile_modules(sources, &options)
         .unwrap_or_else(|lines| panic!("refused:\n{}", lines.join("\n")))
@@ -89,7 +89,7 @@ fn g2_constructs_answer_like_node() {
     let modules = compile_package(&[("j88_g2_probe.ts", source)]);
     let code = &modules[0].code;
     // The lowerings themselves.
-    assert!(code.contains("SHIFTED = 1048576\n"), "{code}");
+    assert!(code.contains("SHIFTED: _JsAny = 1048576\n"), "{code}");
     assert!(code.contains("_js_json_stringify_with(doc, None, 2)"));
     assert!(code.contains("_js_date_to_iso(ms)"));
     assert!(code.contains("    finally:\n"));
@@ -231,6 +231,8 @@ fn g2_modules_compile_together() {
         "runtime-ts/src/storage/logsegment.ts",
         "runtime-ts/src/eventlog.ts",
         "runtime-ts/src/tokenledger.ts",
+        // J90-2 (#316 G4): the lock is compiled now, not an adapter.
+        "runtime-ts/src/storage/lock.ts",
     ];
     let sources: Vec<String> = paths
         .iter()
@@ -246,5 +248,8 @@ fn g2_modules_compile_together() {
     assert!(code("eventlog").contains("from .logsegment import LogSegment\n"));
     assert!(code("tokenledger").contains("from .pricing import "));
     assert!(code("logsegment").contains("exclusive(self.path, _js_fn"));
+    assert!(code("logsegment").contains(
+        "from .lock import LOCK_POLL_MS, LOCK_STALE_MS, exclusive as _js_bound_exclusive\n"
+    ));
     assert!(code("tokenledger").contains("class TokenLedgerError(BantamError):\n"));
 }
