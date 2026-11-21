@@ -3581,6 +3581,341 @@ the derive loop could drop its key, receiver and index tests.
   non-`str`). Judging by the size of `types.rs` and of J90-PF's rules, that is a unit of its own,
   not a single rule.
 
+
+### The pure build after J91-1 (#341: type facts for guarded expansions)
+
+**What J91-1 built** (`tools/ts2py/RULES.md`, *J91-1 rules*): three facts (`map`: a value `new Map()`
+made; `int`: a safe int; `idx`: an int in `[0, 2**52]`), counted loops (`for (let i = L; i < B; i += S)`
+whose variable is an index in its body), lengths as indices, exact `+` / `-` of two indices, and
+guarded expansions that leave out each test an operand's fact answers. No TypeScript changed (a
+`derive` respelling that let ts2py count its field loop was reverted: Node's `cold query x20` was
+0.5 ms slower after it in three runs). Every conformance suite still compares the two runtimes.
+
+**What it bought, where J90-PF2's bound said 11 ms.** That bound came from a `derive` micro with
+tokenizing, fingerprints and `encodeSegments` stubbed. In the real build (phase timers, 3.14, best of
+6) dropping EVERY guard of the derive loop by hand moved `derive` from 82 to 79-80 ms; hand's is 68.
+Key tests alone were about 1 ms, receiver tests 0.5, index tests 0.5. The facts J91-1 proves take
+about half of that bound (derive 82 to about 80). The element facts the brief named (`tokenizeV2`
+returns `str`s; a Map the loop fills keeps its row shape) are inside that same 1.3 ms bound and need
+more than the facts: `tokenizeV2` is called through its guarded entry (its argument, `text[field]`
+of a parsed doc, is not proven a `str`), whose untyped body slices what the `pyNfkcLower` adapter
+returns, of no proven type.
+
+**Where the remaining gap is** (3.14, 14-source build, best of 6; callees timed inside `derive`):
+
+| | hand (ms) | pure (ms) |
+|---|---|---|
+| `tokenizeV2` | 31.2 | 28.5 |
+| `tokens` | 12.4 | 7.1 |
+| shard hashing (8,285 terms) | 3.5 | 6.3 |
+| `encodeSegments` (8,285 calls, 2.65 rows each) | 2.2 | 5.8 |
+| fingerprints of 448 tables | 7.5 | 11.2 (lift guard 3.2 warm) |
+| `derive`'s own loops | 14.8 | 24.2 |
+| `derive` | 71 | 84 (wrappers included) |
+
+Parse is about 6 ms over hand and write even. The loop gap is structural: hand counts tokens with
+`collections.Counter`, whose `update` calls the C helper `_count_elements`
+([Lib/collections/__init__.py](https://github.com/python/cpython/blob/main/Lib/collections/__init__.py)),
+and fills postings with `dict.setdefault` and `Counter.update` of the keys, one C call each; the
+generated loop does the same work one Python-level operation at a time. With every guard gone, the
+loop alone measured 21.1 ms against hand's 13.7 (J90-PF2), so no type fact closes it. The adaptive
+interpreter already specializes each of those operations ([PEP 659](https://peps.python.org/pep-0659/)),
+and the compiled wheel, where mypyc compiles list and dict operations to C
+([performance tips](https://mypyc.readthedocs.io/en/latest/performance_tips_and_tricks.html)), is
+under hand on this path. `encodeSegments` is per-call overhead on tiny inputs (a guarded entry and a
+typed body per call); a one-time element check per call costs more than the guards it would save.
+
+**Measured** (`bench/drive.py` as J90-RR ran it, scratch HOME; n = 11 interleaved fresh processes
+per side; median [min..max] ms; macOS arm64; a virtual machine was running, load 3.7 at the start
+and 2.8 at the end; hand = 9c6bc181, main = a9ae1ff7, J91 = 9ce87c65, comp = each tree's mypyc wheel;
+verdict = J91 pure against hand's range without hand's maximum).
+
+| Path | 3.12 hand | 3.12 main | 3.12 J91 | comp main / J91 | verdict |
+|---|---|---|---|---|---|
+| import | 139.9 [95.8..157.4] | 101.8 | 99.7 | 108.5 / 109.7 | in |
+| hot cold build | 393.8 [384.3..440.2] | 407.2 [398.6..414.0] | 404.6 [389.1..410.6] | 359.9 / 358.4 | in (median +2.7%) |
+| hot open + query | 4.64 [4.2..5.2] | 5.06 | 5.07 | 4.53 / 5.08 | in |
+| hot held query x20 | 4.95 [4.7..5.2] | 5.20 | 5.06 | 3.55 / 3.70 | in |
+| hot full refresh | 14.48 [13.9..16.0] | 15.12 | 15.15 | 13.94 / 14.30 | **over** (+4.6%) |
+| cold build | 83.76 [81.6..108.0] | 83.37 | 82.49 | 44.91 / 45.31 | in |
+| cold query x20 | 35.72 | 19.81 | 19.52 | 12.65 / 12.81 | under |
+| cold compact with keep | 50.73 [49.0..54.3] | 51.45 | 51.23 | 31.87 / 32.16 | in |
+| retention run | 1230.1 | 1199.6 | 1199.4 | 928.6 / 930.7 | under |
+| tier lines x5 | 1404.6 | 771.5 | 770.8 | 699.9 / 704.0 | under |
+| first `memory_save` | 30.58 | 29.12 | 29.04 | 22.84 / 23.14 | under |
+| #204 bar recall p50 | 7.84 | 7.51 | 7.51 | 7.43 / 7.51 | under |
+
+| Path | 3.14 hand | 3.14 main | 3.14 J91 | comp main / J91 | verdict |
+|---|---|---|---|---|---|
+| import | 127.8 [89.5..149.7] | 93.9 | 93.0 | 103.7 / 103.7 | in |
+| hot cold build | 380.7 [375.3..401.2] | 398.3 [385.5..412.7] | 394.1 [388.6..414.3] | 357.6 / 358.0 | **over** (+3.5%) |
+| hot open + query | 4.36 [3.8..5.1] | 4.96 | 4.96 | 4.42 / 4.60 | **over** |
+| hot held query x20 | 5.02 [4.6..5.2] | 5.05 | 5.11 | 3.67 / 3.73 | in |
+| hot full refresh | 13.94 [13.6..42.8] | 14.77 | 14.90 | 13.82 / 14.15 | **over** |
+| cold build | 79.01 [77.5..86.6] | 78.45 | 77.98 | 49.25 / 49.78 | in |
+| cold query x20 | 29.77 | 19.94 | 19.43 | 13.03 / 13.16 | under |
+| cold compact with keep | 47.88 [47.1..53.9] | 49.73 | 49.40 | 34.21 / 34.80 | **over** (+3.2%) |
+| retention run | 1173.2 | 1163.7 | 1163.1 | 930.5 / 930.6 | under |
+| tier lines x5 | 1513.2 | 752.3 | 751.6 | 705.5 / 714.3 | under |
+| first `memory_save` | 30.23 | 28.92 | 28.75 | 22.75 / 22.95 | under |
+| #204 bar recall p50 | 7.62 | 7.31 | 7.28 | 7.53 / 7.60 | under |
+
+**Not closed.** The pure build is still over hand on the hot build (3.14), the hot open path
+(3.14), the full refresh (both) and compaction (3.14). J91-1 moved the 3.14 build 4 ms (398.3 to
+394.1 here; 395.6 to 391.2 on a quieter run of 9ce87c65's parent, n = 9); nothing else moved past
+its spread. What would close the build is C-level counterparts of hand's idioms (a tally into a
+`dict`, `setdefault`-and-append) as runtime helpers with their own exactness proofs, which #341
+did not ask for. Node is unchanged: no TypeScript changed (n = 11: 14-source build 213.3 main,
+213.4 J91).
+
+**The compiled build: one small regression, not closed.** A compiled-only rerun (n = 15) puts every
+path within its spread except the cold build, which is consistently about 0.5 ms slower: 45.20
+[44.2..46.6] against 44.73 [43.9..47.1] on 3.12 and 49.80 [48.4..51.8] against 49.20 [48.5..55.2]
+on 3.14, the same direction in all three runs that measured it (n = 9, 11, 15). The 3.14 full
+refresh was 13.93 against 13.42 here and 13.71 against 13.49 at n = 11. The open path is not slower
+(4.60 against 5.03 on 3.12). Not yet isolated: the generated code mypyc compiles differs only where a
+guard was dropped or a counter is now a plain int `+`.
+
+### The pure build after J91-2 (#341: exact runtime helpers, and mypyc's narrowing)
+
+**Re-measured first** (`bench/drive.py` as J90-RR ran it, scratch HOME, n = 11 interleaved fresh
+processes per side, load 1.52 at the start and 5.0 at the end with the VM running; 78f8d10c against
+hand 9c6bc181; verdict against hand's range without its maximum). Really over: the hot build (3.12
++3.6%, 3.14 +4.4%), the full refresh (3.12 +4.9%, 3.14 +6.3%), the 3.14 open path (+2.6%) and the
+3.14 compaction (+3.1%). The 3.12 open path and compaction were inside hand's range.
+
+**What J91-2 built** (`tools/ts2py/RULES.md`, *J91-2 rules*): `hash_hex_int` for
+`parseInt(<hash chain>.slice(0, N), 16)` (the shard hash: `derive` 80.4 to 78.6 ms, 3.14, best of
+4 per process over 6 interleaved processes), a destructuring for-of over a proven list unpacked in
+the loop without `_js_rows`' generator (`encodeSegments`' 8,285 calls 5.25 to 4.42 ms), and type
+tests kept where J91-1's facts had dropped them (below). The other idioms were each built by hand in
+the generated `derive` and measured there first; none was faster (RULES.md, *Measured and not
+taken*): a `Counter` tally 79.7 against 79.0, a group-into helper 79.5, an inline `shardOf` memo
+-0.5 ms, a per-call element check in `encodeSegments` 7.89 against 5.25 ms.
+
+**The compiled regression J91-1 left: found and fixed.** J91-1's facts dropped `type(m) is _JsMap`,
+`type(xs) is list` and `type(i) is int` from the guarded expansions. Those are the tests mypyc
+narrows a value by. Every generated function is unannotated, so mypy does not check its body and a
+value's only static type is what such a test narrows it to. With the test, mypyc reads `m._entries`
+from the native struct; without it, mypyc does a generic `CPyObject_GetAttr`. This was checked in the
+C that mypy 2.4.1's mypyc writes for a two-function module. A local annotation would type the value
+too, but mypy refuses it in an unchecked function (`annotation-unchecked`), and the build's mypy
+configuration is J90-P7's. J91-2 keeps every type test and drops only range and sign tests. Pure
+cost: about 0.5 ms of `derive`. Compiled, n = 15 interleaved, load 1.49 at the start (main / J91-1
+/ J91-2, median [min..max] ms):
+
+| Path | 3.12 main | 3.12 J91-1 | 3.12 J91-2 | 3.14 main | 3.14 J91-1 | 3.14 J91-2 |
+|---|---|---|---|---|---|---|
+| cold build | 44.75 [42.3..46.2] | 45.59 [43.8..47.1] | 45.05 [43.6..45.9] | 49.39 [47.5..50.8] | 50.11 [49.0..51.3] | 49.74 [48.4..50.9] |
+| cold compact with keep | 32.55 | 32.79 | 32.55 | 34.89 | 35.17 | 34.93 |
+| cold query x20 | 12.48 | 12.73 | 12.52 | 12.88 | 13.00 | 12.84 |
+| hot open + query | 5.00 [4.2..5.4] | 5.19 | 5.17 [4.5..5.5] | 4.98 [4.4..5.3] | 5.06 | 5.11 [4.2..5.4] |
+| hot full refresh | 14.49 | 14.42 | 14.51 | 14.13 | 14.05 | 14.14 |
+
+The cold build's +0.8 / +0.7 ms is now +0.3 / +0.35, inside main's spread. Compaction and cold query
+are back to main. The open path and the full refresh were never apart beyond their spread: a 3.14
+run of n = 11 before the fix put main 4.96, J91-1 4.98 and the fix 5.03 on the open path, and J91-1
+13.42 against main 13.55 on the refresh.
+
+**Measured** (n = 11 interleaved, load 1.30 at the start and 2.46 at the end; hand = 9c6bc181, main
+= a9ae1ff7, J91-2 = 2a2284b6; comp = each tree's mypyc wheel; median [min..max] ms):
+
+| Path | 3.12 hand | 3.12 main | 3.12 J91-2 | comp main / J91-2 | verdict |
+|---|---|---|---|---|---|
+| import | 143.61 [125.4..182.3] | 101.15 | 100.17 | 109.43 / 108.52 | under |
+| hot cold build | 398.70 [393.5..437.6] | 410.73 [396.1..435.5] | 408.95 [401.9..465.2] | 362.60 / 360.79 | **over** (+2.6%) |
+| hot open + query | 4.56 [4.3..5.4] | 5.06 | 5.10 [4.8..5.3] | 4.66 / 5.32 | **over** |
+| hot held query x20 | 5.06 [4.8..5.4] | 5.23 | 5.18 | 3.58 / 3.67 | in |
+| hot full refresh | 14.64 [14.3..15.3] | 15.17 | 15.37 [14.4..16.7] | 14.48 / 14.42 | **over** (+5.0%) |
+| cold build | 84.21 [82.5..85.3] | 83.71 | 83.71 | 44.86 / 45.11 | in |
+| cold query x20 | 35.62 | 19.89 | 20.16 | 12.52 / 12.62 | under |
+| cold compact with keep | 51.03 [48.7..52.0] | 52.23 | 52.09 [51.6..76.6] | 32.51 / 32.71 | **over** (+2.1%) |
+| retention run | 1231.65 | 1197.69 | 1194.82 | 926.63 / 927.24 | under |
+| tier lines x5 | 1406.78 | 767.70 | 771.00 | 698.03 / 696.28 | under |
+| first `memory_save` | 30.90 | 29.19 | 29.07 | 23.05 / 22.80 | under |
+| #204 bar recall p50 | 8.01 | 7.42 | 7.49 | 7.43 / 7.45 | under |
+
+| Path | 3.14 hand | 3.14 main | 3.14 J91-2 | comp main / J91-2 | verdict |
+|---|---|---|---|---|---|
+| import | 120.15 [114.3..201.0] | 94.84 | 91.85 | 103.66 / 100.34 | under |
+| hot cold build | 381.99 [378.1..391.0] | 399.67 [396.7..407.4] | 398.07 [393.2..400.1] | 359.45 / 359.14 | **over** (+4.2%) |
+| hot open + query | 4.80 [4.4..5.0] | 5.09 | 5.01 [4.8..5.2] | 4.52 / 4.89 | **over** (+4.5%) |
+| hot held query x20 | 5.06 [4.7..5.4] | 5.12 | 5.06 | 3.68 / 3.79 | in |
+| hot full refresh | 14.13 [13.4..15.3] | 15.25 | 15.17 [14.8..15.6] | 14.11 / 14.01 | **over** (+7.3%) |
+| cold build | 79.18 [78.0..90.4] | 78.96 | 78.55 | 49.74 / 49.35 | in |
+| cold query x20 | 29.72 | 19.81 | 19.83 | 13.03 / 12.90 | under |
+| cold compact with keep | 48.59 [47.9..50.6] | 50.11 | 49.90 [49.6..50.6] | 34.78 / 34.73 | **over** (+2.7%) |
+| retention run | 1169.35 | 1160.75 | 1154.17 | 929.47 / 929.34 | under |
+| tier lines x5 | 1505.50 | 745.34 | 745.60 | 705.66 / 706.16 | under |
+| first `memory_save` | 30.24 | 28.78 | 28.49 | 23.21 / 22.90 | under |
+| #204 bar recall p50 | 7.55 | 7.24 | 7.24 | 7.49 / 7.54 | under |
+
+The compiled open path (4.66 / 5.32 and 4.52 / 4.89 in this run) is not a regression: at n = 15 (the
+table above) its three trees lie within each other's spread. Node is unchanged (no TypeScript
+changed; n = 11, main / J91-2 dist: 14-source build 217.71 / 218.83, open 4.22 / 4.17, refresh
+14.04 / 14.18, cold build 32.64 / 32.76, compaction 30.31 / 30.49).
+
+**Not closed: the floor.** J91-2 moved `derive` about 1.5 ms (3.14, best of 4 per process: J91-1
+79.8, J91-2 78.1). That is under 0.5% of the hot build, which is still over hand by 2.6% (3.12) and
+4.2% (3.14). Where the rest of `derive`'s gap is (3.14; the generated `derive` edited by hand, one
+change at a time, `/private/tmp/claude-501/j92/{ideal.py,mkexp.py}`):
+
+- every guard and helper of the loops removed: 77.3 to 69.6 ms (the per-field work over
+  `FIELD_BOOST`, an imported array no fact reaches, 2.5 of it);
+- `_js_lifted`'s shape scan: 3.1 ms of `dumpIndex`'s 9.3 over 448 tables, a type scan of every
+  item;
+- `encodeSegments`' guarded compares: 4.4 ms against 1.8 for the same loop on plain ints.
+
+A tight exact-JS `derive` with element facts assumed is 55-58 ms, against hand's 66-68. So the gap is
+element facts (what `tokenizeV2` returns, what `tfs` and `words` hold, what an imported const array
+is), not C helpers. Hand's C helpers do not beat plain Python here:
+
+- `Counter.update` runs `_count_elements` in C ([Lib/collections/__init__.py](https://github.com/python/cpython/blob/main/Lib/collections/__init__.py)).
+  Its loop still does a hash-keyed dict lookup and a generic `PyNumber_Add` per element
+  ([Modules/_collectionsmodule.c](https://github.com/python/cpython/blob/main/Modules/_collectionsmodule.c)).
+  With 25k of 27k tokens distinct, the saving is one interpreter dispatch per repeat, and building
+  the rows pays it back per distinct term (measured above).
+- The adaptive interpreter already specializes the plain loop's attribute and subscript operations
+  per instruction ([PEP 659](https://peps.python.org/pep-0659/)).
+
+The compiled wheel is the build where those operations are C. mypyc compiles operations on `Any`
+values to generic ones; the docs give the reason: "Operations on erased types use generic
+operations that work with arbitrary objects"
+([using type annotations](https://mypyc.readthedocs.io/en/latest/using_type_annotations.html)).
+Typed native-class attribute access is listed as fast
+([performance tips](https://mypyc.readthedocs.io/en/latest/performance_tips_and_tricks.html)).
+mypy does not check the bodies of unannotated functions without `--check-untyped-defs`
+([command line](https://mypy.readthedocs.io/en/stable/command_line.html),
+[annotation-unchecked](https://mypy.readthedocs.io/en/stable/error_code_list.html)).
+
+The full refresh and the open path were not profiled into `derive`: neither rebuilds. Parse (6 ms
+over hand on the build) is `extract_refs` and the YAML read, shared with hand.
+
+### The pure build after J91-3 (#341: element and return facts; the open path and the full refresh)
+
+**What J91-3 built** (`tools/ts2py/RULES.md`, *J91-3 rules*; pinned in
+`tools/ts2py-bantamkit/tests/j93.rs`): sealed `own` lists, Maps and Sets keep what was put in
+them; what a function returns is what every return proved, across the compiled modules (rounds of
+the whole compile, so also through the `hotindex.ts` / `store.ts` cycle); a `str` contract on the
+`pyNfkcLower` adapter row; a `g` match's `str`s; `a ?? b`; a for-of `const` narrowed by a guard;
+and `_js_json_ints_exact` over a byte probe. In `derive` the token loop's `t`, the term loop's
+`term` and the word loop's `w` are proven `str`s, so their eight key tests are gone; `shard_of` is
+called through its typed body; `toks.length` is `len(toks)`. `derive` (3.14, best of 4 per process,
+6 interleaved processes, `/private/tmp/claude-501/j93/vdrive.py`): 77.5 to 71.3 ms.
+
+Found and fixed on the way: a `const` and a `let` of one name in two blocks of one function are one
+Python binding, so the `const`'s key let a guard narrow the `let` past an assignment to it
+(`let v = rows[1]; if (Array.isArray(v)) { v = opaque(5); v.length }`: Node `undefined`, Python a
+TypeError). A binding is now narrowable only when nothing assigns it. No shipped module had the
+shape: regenerating every module with the fix changed none.
+
+**Measured and not taken**: `FIELD_BOOST` as a frozen constant across modules (an exported
+constant every importer only reads), whose counted per-field loop the generated `derive` was edited
+by hand to: 71.9 to 70.7 ms (3.14), about 0.3% of the build; it needs an escape analysis over every
+importing module and over the hand-written Python that imports the generated constant. A
+destructuring for-of over a sealed Map as `_entries.items()` (about 0.5 ms of `derive`): it needs
+proof that the body cannot change the Map.
+
+**The open path and the full refresh, profiled** (`/private/tmp/claude-501/j93/acc.py`: inclusive
+time of each method over the 14 sources, best of 15 in one process after a build; hand 9c6bc181 and
+J91-3; ms):
+
+| Path, method | 3.12 hand | 3.12 J91-3 | 3.14 hand | 3.14 J91-3 |
+|---|---|---|---|---|
+| open + query, total | 3.60 | 4.15 | 3.43 | 4.18 |
+| reading 70 shards (`readShard`) | 2.26 | 2.49 | 2.24 | 2.64 |
+| of which `JSON.parse` / `_loads` | 1.37 | 1.55 | 1.38 | 1.49 |
+| of which `new Map(entries(terms))` (`_js_map_entries`) | - | 0.10 | - | 0.27 |
+| the 14 heads (`load` / `_load`) | 0.49 | 0.88 | 0.48 | 0.76 |
+| full refresh, total | 12.55 | 13.18 | 12.29 | 12.82 |
+| `write` | 5.28 | 5.89 | 5.54 | 5.73 |
+| the tails' parse and checks (`_complete_tail`; hand: `_loads`) | 2.28 | 3.59 | 2.24 | 3.59 |
+| the stat listing | 3.58 | 1.94 | 3.19 | 1.94 |
+| `check` / `patch` | 0.85 | 1.25 | 0.88 | 1.20 |
+
+Where the time goes, function by function: the JSON parse's integer check (the full refresh's 14
+tails, 600 KB: 1.03 ms before J91-3's byte probe, 0.69 after; the decode itself is hand's, 2.20
+against 2.17); the Map built from each shard's terms (`set(map(type, ...))` over the keys, the
+copy, the digit scan: 0.28 ms for all 448 tables); the head's checks in `load` (each property a
+`_js_get` dispatch, and `isCols`' per-element range loop over every doc, where hand takes `min` /
+`max` at C speed); `write`'s property reads (J91-3 reads each family's prints once); the tails'
+`files` loop (J91-3 narrows the for-of `const` `v` by `Array.isArray`, so its reads are list reads).
+
+**Measured** (n = 11 interleaved fresh processes per side, each round started at a 1-minute load
+of 1.5 or less: 1.19 to 1.50; hand = 9c6bc181, main = a9ae1ff7, J91-2 = b696340a, J91-3 = f5dbfe2f;
+comp = each tree's mypyc wheel; median [min..max] ms; verdict = J91-3 pure against hand's range
+without its maximum):
+
+| Path | 3.12 hand | 3.12 main | 3.12 J91-2 | 3.12 J91-3 | comp main / J91-2 / J91-3 | verdict |
+|---|---|---|---|---|---|---|
+| import | 131.58 [86.2..144.8] | 94.75 | 93.72 | 93.63 | 104.96 / 104.45 / 103.73 | under |
+| hot cold build | 416.06 [377.3..433.3] | 390.55 | 388.32 | 383.42 [379.1..396.3] | 348.29 / 347.56 / 347.64 | under |
+| hot open + query | 4.27 [4.0..4.9] | 4.81 | 4.76 | 4.78 [4.6..4.9] | 4.28 / 4.80 / 4.87 | **over** (+12.1%) |
+| hot held query x20 | 4.74 [4.6..4.8] | 5.02 | 4.95 | 5.03 [4.8..5.4] | 3.50 / 3.58 / 3.49 | **over** (+6.0%; main the same) |
+| hot full refresh | 13.76 [13.3..14.6] | 14.63 | 14.74 | 14.24 [13.6..24.5] | 13.59 / 14.02 / 13.47 | **over** (+3.5%) |
+| cold build | 81.23 [79.5..84.5] | 80.74 | 81.07 | 69.25 [68.6..71.0] | 43.93 / 43.70 / 41.93 | under |
+| cold query x20 | 34.16 | 19.22 | 19.33 | 19.48 | 12.06 / 12.25 / 12.25 | under |
+| cold compact with keep | 49.11 [47.4..51.8] | 51.10 | 50.35 | 45.17 [44.4..46.2] | 31.16 / 31.48 / 30.69 | under |
+| retention run | 1198.88 | 1170.83 | 1169.36 | 1000.74 | 906.03 / 905.85 / 822.03 | under |
+| tier lines x5 | 1361.00 | 734.75 | 734.75 | 742.18 | 668.19 / 672.78 / 671.74 | under |
+| first `memory_save` | 29.51 | 28.13 | 28.08 | 27.63 | 21.39 / 21.45 / 21.40 | under |
+| #204 bar recall p50 | 7.81 | 7.30 | 7.36 | 7.36 | 7.24 / 7.30 / 7.38 | under |
+
+| Path | 3.14 hand | 3.14 main | 3.14 J91-2 | 3.14 J91-3 | comp main / J91-2 / J91-3 | verdict |
+|---|---|---|---|---|---|---|
+| import | 125.26 [78.2..171.0] | 89.55 | 88.89 | 88.68 | 100.83 / 101.95 / 98.99 | under |
+| hot cold build | 371.39 [366.3..389.7] | 388.17 | 386.84 | 380.55 [376.8..403.5] | 349.69 / 349.56 / 344.12 | in (+2.5%) |
+| hot open + query | 4.56 [4.3..5.0] | 4.63 | 4.72 | 4.81 [4.6..5.3] | 4.25 / 4.77 / 4.74 | **over** (+5.4%) |
+| hot held query x20 | 5.02 [4.6..5.1] | 4.97 | 5.09 | 5.01 | 3.67 / 3.71 / 3.62 | in |
+| hot full refresh | 13.77 [13.1..14.1] | 14.67 | 14.88 | 14.35 [13.5..15.4] | 13.46 / 13.39 / 13.36 | **over** (+4.2%) |
+| cold build | 78.19 [77.0..82.9] | 78.23 | 77.84 | 65.73 [64.8..68.7] | 48.89 / 48.71 / 45.47 | under |
+| cold query x20 | 29.27 | 19.53 | 19.58 | 19.57 | 12.70 / 12.64 / 12.63 | under |
+| cold compact with keep | 47.99 [46.9..49.3] | 49.63 | 49.38 | 44.01 [43.4..45.4] | 34.26 / 33.99 / 32.56 | under |
+| retention run | 1159.15 | 1148.63 | 1148.55 | 964.89 | 922.83 / 921.51 / 831.01 | under |
+| tier lines x5 | 1468.50 | 727.26 | 727.00 | 728.29 | 685.79 / 690.68 / 691.85 | under |
+| first `memory_save` | 29.42 | 27.85 | 27.74 | 27.02 | 22.09 / 21.99 / 21.71 | under |
+| #204 bar recall p50 | 7.46 | 7.20 | 7.16 | 7.22 | 7.34 / 7.45 / 7.46 | under |
+
+Against main, the cold build (-14% / -16%), compaction (-12% / -11%) and the retention run (-15% /
+-16%) moved most (3.12 / 3.14): they parse the
+same large JSON texts the byte probe now checks without a loop step per 16-digit string. The hot
+build is under hand on 3.12 and inside hand's range on 3.14. Compiled, J91-3 is no slower than main
+on any path beyond the spread; the open path's compiled 4.28 (main) against 4.80 / 4.87 is J91-1's
+and J91-2's (n = 15 in *The pure build after J91-2*: the three trees inside each other's spread).
+
+Node (TypeScript changed: three respellings; n = 11 and 15 interleaved, main a9ae1ff7 dist against
+J91-3's): the build 208.30 / 208.30, the open path 4.17 / 4.22, the full refresh 13.50 / 13.68,
+compaction 28.61 / 28.58 (n = 15). The refresh's 0.2 ms is the noise of identical code: an A/A run
+(n = 11) put main's dist at 13.17, a byte-identical copy of it at 13.43 and J91-3's at 13.18; and
+J91-3's dist with `write`'s old loop restored measured 13.53 against J91-3's 13.52 (n = 15).
+
+**Not closed: the floor.** Open + query is over by 12.1% (3.12) and 5.4% (3.14), the full refresh
+by 3.5% and 4.2%; in-process, 0.55 / 0.75 ms and 0.63 / 0.53 ms. Each piece is a fixed Python cost
+of JS's semantics that hand does not pay:
+
+- `JSON.parse` of a shard keeps a JS number exact: a text with no `-0` and no 16-digit integer
+  token takes CPython's own integers, any other the per-token hook. CPython's scanner calls a
+  `parse_int` hook through Python unless it is `int` itself
+  ([Modules/_json.c](https://github.com/python/cpython/blob/main/Modules/_json.c),
+  `_match_number_unicode`: `custom_func` is NULL only when `parse_int` is `PyLong_Type`), so the
+  check runs first over every text, at about 1.1 ns a byte with the probe.
+- `new Map(Object.entries(terms))` must answer a Map whose order is JS's (array-index keys first),
+  so the keys are scanned for type and digits and the dict copied; hand returns the parsed dict.
+- The head's checks read each property through `_js_get` (a JS property read: an own key or
+  `undefined`), and `isCols` checks every doc's length and type in a counted loop where hand takes
+  `min` and `max` of each column at C speed ([Python/bltinmodule.c](https://github.com/python/cpython/blob/main/Python/bltinmodule.c),
+  `min_max`). The loop is the TypeScript's own (the fastest form in Node); taking `min` / `max`
+  would need proof that no element is NaN, which `isIntList`'s `Number.isInteger` gives JS but not
+  a fact ts2py reads.
+- The adaptive interpreter specializes the loop's operations per instruction but still dispatches
+  each ([PEP 659](https://peps.python.org/pep-0659/)); the 3.14 run here is 3.14.5, whose collector
+  is 3.13's generational one again ([What's New in 3.14](https://docs.python.org/3.14/whatsnew/3.14.html),
+  *Garbage collection*), so 3.14's larger `_js_map_entries` share (0.27 against 0.10 ms) is the
+  collection the first allocation after a parse pays, not a different collector.
+
+The compiled wheel answers the full refresh (13.47 / 13.36 against hand's 13.76 / 13.77); its open
+path (4.87 / 4.74) is J91-1's and J91-2's, as above, and stays over hand's pure 4.27 / 4.56.
+
 ## Concurrency
 
 Measured, not assumed: 12 pipelined saves all land in order; a recall behind a save **sees**

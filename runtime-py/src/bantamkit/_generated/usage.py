@@ -47,7 +47,7 @@ from ._ts2py_runtime import (  # noqa: F401
     _js_put,
     _js_re,
     _js_re_exec,
-    _js_rows,
+    _js_row,
     _js_size,
     _js_str,
     _js_str_slice,
@@ -302,7 +302,7 @@ def _weights_of(events, now):
 
 
 def _count_newlines(b):
-    return _js_num(len(_js_m_split(_js_m_toString(b, "latin1"), "\n")) - 1)
+    return len(_js_m_split(_js_m_toString(b, "latin1"), "\n")) - 1
 
 
 _MISSED: _JsAny = _JsMap()
@@ -437,7 +437,8 @@ def _reduce_usage__typed(pairs, now):
     latest_save = _JsMap()
     order = []
     seen = _JsSet()
-    for e, line in _js_rows(read, 2, (0, 1)):
+    for _js_r2 in read:
+        e, line = _js_r2 if type(_js_r2) is list and len(_js_r2) == 2 else _js_row(_js_r2, 2, (0, 1))
         if not _js_m_has(seen, _js_get(e, "fact")):
             _js_m_add(seen, _js_get(e, "fact"))
             order.append(_js_get(e, "fact"))
@@ -465,7 +466,8 @@ def reduce_usage(pairs, now):
     latest_save = _JsMap()
     order = []
     seen = _JsSet()
-    for e, line in _js_rows(read, 2, (0, 1)):
+    for _js_r3 in read:
+        e, line = _js_r3 if type(_js_r3) is list and len(_js_r3) == 2 else _js_row(_js_r3, 2, (0, 1))
         if not _js_m_has(seen, _js_get(e, "fact")):
             _js_m_add(seen, _js_get(e, "fact"))
             order.append(_js_get(e, "fact"))

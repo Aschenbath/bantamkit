@@ -35,7 +35,7 @@ from ._ts2py_runtime import (  # noqa: F401
     _js_number_is_integer,
     _js_or,
     _js_put,
-    _js_rows,
+    _js_row,
     _js_size,
     _js_sort_lex,
     _js_spread,
@@ -203,11 +203,12 @@ def _read__typed(root, options=_JS_UNDEFINED):
     lines = 0
     def omit(subject, site):
         seen = _js_coalesce_value(_js_m_get(counts, subject), 0)
-        if _js_strict_eq(seen, 0):
+        if seen == 0:
             _js_m_set(sites, subject, site)
-        _js_m_set(counts, subject, _js_add(seen, 1))
+        _js_m_set(counts, subject, _js_num(seen + 1))
         return _JS_UNDEFINED
-    for path, relpath in _js_rows(files, 2, (0, 1)):
+    for _js_r1 in files:
+        path, relpath = _js_r1 if type(_js_r1) is list and len(_js_r1) == 2 else _js_row(_js_r1, 2, (0, 1))
         text = _JS_UNDEFINED
         _js_caught6 = None
         try:
@@ -319,11 +320,12 @@ def read(root, options=_JS_UNDEFINED):
     lines = 0
     def omit(subject, site):
         seen = _js_coalesce_value(_js_m_get(counts, subject), 0)
-        if _js_strict_eq(seen, 0):
+        if seen == 0:
             _js_m_set(sites, subject, site)
-        _js_m_set(counts, subject, _js_add(seen, 1))
+        _js_m_set(counts, subject, _js_num(seen + 1))
         return _JS_UNDEFINED
-    for path, relpath in _js_rows(files, 2, (0, 1)):
+    for _js_r2 in files:
+        path, relpath = _js_r2 if type(_js_r2) is list and len(_js_r2) == 2 else _js_row(_js_r2, 2, (0, 1))
         text = _JS_UNDEFINED
         _js_caught8 = None
         try:

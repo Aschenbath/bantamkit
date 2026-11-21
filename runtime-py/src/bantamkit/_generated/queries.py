@@ -113,7 +113,7 @@ _write_failed__typed = _write_failed
 
 
 def sidecar_path(home, root):
-    return path_join(home, ".bantamkit", QUERIES_DIR, _js_str(sha16(root)) + ".json")
+    return path_join(home, ".bantamkit", QUERIES_DIR, sha16(root) + ".json")
 
 
 _sidecar_path__typed = sidecar_path
@@ -258,7 +258,7 @@ class _CountsView(_JsObject):
 def terms_path(home, root):
     override = _js_or_value(process_env(INDEX_DIR_ENV), None)
     where = _js_coalesce(override, lambda: path_join(home, ".bantamkit", "index"))
-    return path_join(where, _js_cat(_js_str(sha16(root)), TERMS_SUFFIX))
+    return path_join(where, _js_cat(sha16(root), TERMS_SUFFIX))
 
 
 _terms_path__typed = terms_path
@@ -298,9 +298,9 @@ def _cached__typed(p, sha):
             return None
         i = 0
         while i < len(flat):
-            if not isinstance((flat[i] if type(i) is int and 0 <= i < len(flat) else _js_list_at(flat, i)), str) or not _is_count(_js_list_at(flat, _js_num(i + 1))):
+            if not isinstance((flat[i] if type(i) is int and i < len(flat) else _js_list_at(flat, i)), str) or not _is_count(_js_list_at(flat, i + 1)):
                 return None
-            i = _js_num(i + 2)
+            i = i + 2
         _js_m_set(out, name, [_CountsView(flat), (dl + 0 if type(dl) is int and -4503599627370496 <= dl <= 4503599627370496 else _js_add(dl, 0))])
     return out
 
@@ -333,29 +333,19 @@ def _cached(p, sha):
             return None
         i = 0
         while i < len(flat):
-            if not isinstance((flat[i] if type(i) is int and 0 <= i < len(flat) else _js_list_at(flat, i)), str) or not _is_count(_js_list_at(flat, _js_num(i + 1))):
+            if not isinstance((flat[i] if type(i) is int and i < len(flat) else _js_list_at(flat, i)), str) or not _is_count(_js_list_at(flat, i + 1)):
                 return None
-            i = _js_num(i + 2)
+            i = i + 2
         _js_m_set(out, name, [_CountsView(flat), (dl + 0 if type(dl) is int and -4503599627370496 <= dl <= 4503599627370496 else _js_add(dl, 0))])
     return out
 
 
-def _counts_of__typed(queries):
+def _counts_of(queries):
     toks = tokenize_v2(_qdoc__typed(queries))
     counts = _JsMap()
     for t in toks:
         _js_m_set(counts, t, (_js_h3 + 1 if type(_js_h3 := _js_coalesce_value(_js_dispatch(counts, "get", _js_m_get, t), 0)) is int and -4503599627370496 <= _js_h3 <= 4503599627370496 else _js_add(_js_h3, 1)))
-    return [_js_len(toks), counts]
-
-
-def _counts_of(queries):
-    if type(queries) is list:
-        return _counts_of__typed(queries)
-    toks = tokenize_v2(qdoc(queries))
-    counts = _JsMap()
-    for t in toks:
-        _js_m_set(counts, t, (_js_h4 + 1 if type(_js_h4 := _js_coalesce_value(_js_dispatch(counts, "get", _js_m_get, t), 0)) is int and -4503599627370496 <= _js_h4 <= 4503599627370496 else _js_add(_js_h4, 1)))
-    return [_js_len(toks), counts]
+    return [len(toks), counts]
 
 
 def _py_int(n):
@@ -612,7 +602,7 @@ def _write_entries__typed(p, entries):
             text = dump_json({"t": "dict", "v": doc}, {"sortKeys": True, "ensureAscii": False, "separators": [",", ":"]})
             bad = lone_surrogate(text)
             if bad is not None:
-                raise SidecarWriteError("'utf-8' codec can't encode character " + _js_str(bad))
+                raise SidecarWriteError("'utf-8' codec can't encode character " + bad)
             write_file_sync(tmp, text, "utf8")
             rename_sync(tmp, p)
         except Exception as _js_error20:
@@ -662,7 +652,7 @@ def write_entries(p, entries):
             text = dump_json({"t": "dict", "v": doc}, {"sortKeys": True, "ensureAscii": False, "separators": [",", ":"]})
             bad = lone_surrogate(text)
             if bad is not None:
-                raise SidecarWriteError("'utf-8' codec can't encode character " + _js_str(bad))
+                raise SidecarWriteError("'utf-8' codec can't encode character " + bad)
             write_file_sync(tmp, text, "utf8")
             rename_sync(tmp, p)
         except Exception as _js_error24:

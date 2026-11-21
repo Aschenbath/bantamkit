@@ -65,6 +65,7 @@ from ._ts2py_runtime import (  # noqa: F401
     _js_or,
     _js_re,
     _js_re_exec,
+    _js_row,
     _js_rows,
     _js_str,
     _js_str_at,
@@ -225,7 +226,7 @@ def _analyze_scalar(chars):
         if ch == " ":
             if index == 0:
                 leading_space = True
-            if index == _js_num(len(chars) - 1):
+            if index == len(chars) - 1:
                 trailing_space = True
             if previous_break:
                 break_space = True
@@ -234,7 +235,7 @@ def _analyze_scalar(chars):
         elif _is_break(ch):
             if index == 0:
                 leading_break = True
-            if index == _js_num(len(chars) - 1):
+            if index == len(chars) - 1:
                 trailing_break = True
             if previous_space:
                 space_break = True
@@ -498,7 +499,21 @@ def _js_method__Emitter_writeSingleQuoted(self, chars, split):
     return _JS_UNDEFINED
 
 
+def _safe_dump_mapping__typed(entries):
+    e = _Emitter()
+    seen = []
+    _js_invoke(e, "increaseIndent", False, False)
+    for _js_r1 in entries:
+        key, value = _js_r1 if type(_js_r1) is list and len(_js_r1) == 2 else _js_row(_js_r1, 2, (0, 1))
+        _emit_mapping_entry(e, key, value, key, seen)
+    _js_invoke(e, "popIndent")
+    _js_invoke(e, "writeIndent")
+    return _js_m_toString(e)
+
+
 def safe_dump_mapping(entries):
+    if type(entries) is list:
+        return _safe_dump_mapping__typed(entries)
     e = _Emitter()
     seen = []
     _js_invoke(e, "increaseIndent", False, False)
@@ -509,13 +524,10 @@ def safe_dump_mapping(entries):
     return _js_m_toString(e)
 
 
-_safe_dump_mapping__typed = safe_dump_mapping
-
-
 def _is_simple_key(key):
     chars = [*key]
     analysis = _analyze_scalar(chars)
-    return _js_num(5 + len(chars)) < 128 and not _js_truthy(_js_get(analysis, "empty")) and not _js_truthy(_js_get(analysis, "multiline"))
+    return 5 + len(chars) < 128 and not _js_truthy(_js_get(analysis, "empty")) and not _js_truthy(_js_get(analysis, "multiline"))
 
 
 _is_simple_key__typed = _is_simple_key
@@ -571,14 +583,8 @@ def _claim(value, path, seen):
     return _JS_UNDEFINED
 
 
-def _is_array_index_key__typed(key):
-    return _JS_RE_8.search(_js_code_units(key)) is not None and _js_number(key) < 4294967295
-
-
 def _is_array_index_key(key):
-    if type(key) is str:
-        return _is_array_index_key__typed(key)
-    return _js_m_test(_JS_RE_8, key) and _js_number(key) < 4294967295
+    return _JS_RE_8.search(_js_code_units(key)) is not None and _js_number(key) < 4294967295
 
 
 def _emit_node__typed(e, value, mapping_context, path, seen):
@@ -621,8 +627,8 @@ def _emit_node__typed(e, value, mapping_context, path, seen):
                 if not isinstance(key, str):
                     raise YamlEmitError("cannot emit " + _js_typeof(key) + " key under " + path)
                 if _is_array_index_key(key):
-                    raise YamlEmitError("cannot emit key " + _js_str(key) + " under " + path + ": an array-index key is listed first by Object.entries, so the mapping no longer holds its own order")
-                _emit_mapping_entry(e, key, item, path + "." + _js_str(key), seen)
+                    raise YamlEmitError("cannot emit key " + key + " under " + path + ": an array-index key is listed first by Object.entries, so the mapping no longer holds its own order")
+                _emit_mapping_entry__typed(e, key, item, path + "." + key, seen)
             _js_invoke(e, "popIndent")
     else:
         raise YamlEmitError("cannot emit " + _js_typeof(value) + " for key " + path)
@@ -671,8 +677,8 @@ def _emit_node(e, value, mapping_context, path, seen):
                 if not isinstance(key, str):
                     raise YamlEmitError("cannot emit " + _js_typeof(key) + " key under " + _js_str(path))
                 if _is_array_index_key(key):
-                    raise YamlEmitError("cannot emit key " + _js_str(key) + " under " + _js_str(path) + ": an array-index key is listed first by Object.entries, so the mapping no longer holds its own order")
-                _emit_mapping_entry(e, key, item, _js_str(path) + "." + _js_str(key), seen)
+                    raise YamlEmitError("cannot emit key " + key + " under " + _js_str(path) + ": an array-index key is listed first by Object.entries, so the mapping no longer holds its own order")
+                _emit_mapping_entry(e, key, item, _js_str(path) + "." + key, seen)
             _js_invoke(e, "popIndent")
     else:
         raise YamlEmitError("cannot emit " + _js_typeof(value) + " for key " + _js_str(path))

@@ -302,11 +302,17 @@ fn frozen_module_array_unpacks_and_an_escaped_one_does_not() {
         classify,
         "pattern.search(_js_code_units(value)) is not None",
     );
-    // SHARED is also pushed to, so its rows prove nothing: each is read the general way
-    // (`_js_rows`, J90-P: `_js_get` of each name's index unless the row is a list that long).
+    // SHARED is also pushed to, so its rows prove nothing: each is read the general way (J90-P:
+    // `_js_get` of each name's index unless the row is a list that long). J91-2 (#341): SHARED
+    // itself is a list, so the loop is Python's over it and each row is unpacked there, through
+    // `_js_row` unless it is a list of exactly three.
     let loose = def_of(&module, "_loose");
-    has(loose, "in _js_rows(_SHARED, 3, (0, 1, 2)):");
-    lacks(loose, "in _SHARED:");
+    has(loose, "in _SHARED:");
+    has(
+        loose,
+        "tag, pattern, firsts = _js_r1 if type(_js_r1) is list and len(_js_r1) == 3 else _js_row(_js_r1, 3, (0, 1, 2))",
+    );
+    lacks(loose, "for tag, pattern, firsts in _SHARED:");
     has(loose, "_js_m_includes(firsts, ");
     has(loose, "_js_m_test(pattern, value)");
     assert_eq!(
@@ -350,8 +356,9 @@ export function probe(input: unknown): unknown[] {
 fn narrowing_after_a_guard_and_not_before_it() {
     let module = compile(NARROW, "narrow.ts");
     // After `if (w === undefined) throw`, `w` (a property of a frozen object of numbers) is a
-    // number; before the guard it is not.
-    has(def_of(&module, "_width"), "return _js_num(w + 1)");
+    // number; before the guard it is not. J91-1 (#341): the object's numbers are whole literals in
+    // `[0, 2**52]`, so `w` is an index and `w + 1` is Python's exact int `+` (no `_js_num`).
+    has(def_of(&module, "_width"), "return w + 1");
     has(def_of(&module, "_late"), "v = _js_add(w, 1)");
     // Inside `ch === "'" || ch === '"'`, `ch` is a string: the typed body of `twice` is called.
     has(def_of(&module, "_quote_of"), "return _twice__typed(ch)");

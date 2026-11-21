@@ -1236,3 +1236,275 @@ of any literal (red once the probe's receiver was a name, which the rule require
 `set` with kept keys allowed; the `has` Set arm on any receiver with `_items`; `statFile` through
 `lstat`; `statStamp` with `st_dev` for `st_ino`; `parseNative`'s `front` split from the text read
 without universal newlines.
+
+## J91-1 rules: type facts a guarded expansion reads (#341)
+
+Three new facts (`src/types.rs`, `Fact`), each a property of the Python value, met like the others
+over every assignment and return (SUBSET.md, *Types*), and one rule that reads them: a guarded
+expansion (J90-P6 / J90-PF, `hot` / `hot_stmt` and the loop-body member read) leaves out each test
+an operand's fact already answers, and is its fast arm alone when none is left.
+
+| Fact | The value | Proved by | Why it holds |
+|---|---|---|---|
+| `map` | `type(v) is _JsMap` | `new Map(...)` of the builtin (not a compiled class, not a local named `Map`), and `new Map(Object.entries(x))` (`_js_map_entries`) | both construct a `_JsMap` itself or raise; a binding keeps the flag (it is the value's type, which no later mutation of the Map changes) |
+| `int` | `type(v) is int`, `-2**53 <= v <= 2**53` | a whole literal Python spells as an int (`py_number`: below 2**53, not `-0`) and its negation; `+` / `-` of two indices; a counted update | a literal is that int; the sums are below |
+| `idx` | `type(v) is int`, `0 <= v <= 2**52` (`IDX_MAX`) | a whole literal in `[0, 2**52]`; `.length` of a proven list or `str` (`len_idx`); a proven list's `push` as a value; a counted loop's variable in its body | lengths: a list past 2**52 items needs 32 PiB of item pointers and a `str` past 2**52 UTF-16 units 2 PiB in one object, where the largest single-image machines address under 2**47 bytes; the loop: below |
+
+**Counted loops** (`lower.rs`, `counter`). `for (let i = L; i < B; i += S)` (also `i = i + S`,
+`i++`, `++i`) with `L` a whole literal in `[0, 2**52]`, `S` a whole literal in `[1, 2**20]`, `B` a
+whole literal in `[0, 2**52]`, a name proven an index, or `.length` of a name proven a list or a
+`str` (`idx_bound`), and the update the ONLY assignment to `i` inside the statement
+(`Assume::assign_spans`: the span start of every assignment target, per binding; the `let` is
+visible only inside the `for`, so an assignment anywhere else is to another binding). In the body
+`i` is narrowed to an index: it starts at `L >= 0`, only the update moves it, upward, by a whole
+`S`, so it is an int `>= 0`; the body runs only where `i < B` just held and `B <= 2**52`. The
+update is written `i = i + S`, Python's int `+`: at most `2**52 - 1 + 2**20 < 2**53`, so it is the
+double sum JS computes, and the binding observes a safe int (`int`, not `idx`: past the body `i`
+may be `B - 1 + S`).
+
+**Arithmetic.** `a + b` and `a - b` of two indices: `a + b` / `a - b` with no `_js_num` (the exact
+result lies within `[-2**52, 2**53]`, a double's exact int), an `int`.
+
+**Guarded expansions** read the fact of each operand from the read of that name made while lowering
+the expression the expansion rewrites (`Lowerer::proven`; `name_facts` stamped by `fact_seq`, so a
+fact from an earlier read never applies; an optimistic fact never does), and drop:
+
+| Expansion | Test dropped | When |
+|---|---|---|
+| `m.get(k)` / `m.has(k)` | `type(m) is _JsMap` (and `has`'s Set arm) | `m` proven a Map |
+| `m.get(k)` / `m.has(k)` / `m.set(k, v)` | the key test | `k` proven a `str` or a safe int: each is its own `_js_key` |
+| `m.set(k, v)` | `type(m) is _JsMap` | `m` proven a Map (`m._keys is None` stays: it is a property of the contents) |
+| `===` / `!==` | the `str` arm; a side's int and range tests | one side proven a number (so never two `str`s); a side proven a safe int |
+| `a + b` | `b`'s int and range test; `a`'s | `b` proven an index (within half the safe range); `a` proven one (a name) |
+| `xs[i]` (`_js_list_at`, the loop-body read) | `type(i) is int`; and `0 <=` | `i` proven a safe int; an index |
+| `xs[i] = v` | `type(xs) is list`; `type(i) is int`; `0 <=` | `xs` proven a list; `i` a safe int; an index |
+| `xs.push(x)` as a value | `type(xs) is list` | `xs` proven a list |
+
+**Measured and not taken** (docs/porting.md, *The pure build after J91-1*): element facts of a
+container a function fills itself (`tfs`'s rows, `rows`' Maps) and of what a function returns
+(`tokenizeV2`'s `str`s), whose bound in `derive` is under 1.3 ms of a 14-source build; a
+`shardHash` without `shardOf`'s memo for `derive`, which moved nothing; and bounding `derive`'s
+per-field loop by `flens.length` (so `fi` is counted), reverted: Node's `cold query x20` measured
+0.5 ms slower after it, three runs (n = 9, 11, 15).
+
+Pinned in `tools/ts2py-bantamkit/tests/j91.rs`: `probe()` and `fuzz(3000)` of
+`tests/fixtures/j91_probe.ts` equal to what Node v26.13.0 printed (`fixtures/j91_probe.node.txt`):
+a `new Map()` set, read and tested by every pool value (from JSON: lone surrogates, `1` and `1.0`,
+`-0`, ints past 2**53, `true`, `null`) and by counted indices, NaN / `-0` / `0.5` keys proven
+numbers, a `new Set()`, a Map passed in; counted loops reading at `i`, `i + 1` past the end and
+`i - 1` (-1 first), storing at `i + 1`, a stride and a literal bound; loops that are not counted
+(the body assigns `i`, a negative start, a bound or a start passed in, a stride that is a name),
+`.length` of an object, a store by a counted index into an object; `+` / `-` of indices, of a safe
+int past 2**52 (`big + 2` rounds), `===` against JSON ints past 2**53. Every fast form has a guarded
+twin (operands through `opaque`, counters by `while`): the fuzz counts the cases where they differ
+(0, in Node and in Python), and in Python both twins run over 3,000 seeded lists of values JS cannot
+build (ints past 2**53, bools, `1.0`, `-0.0`, NaN, `inf`, BigInts, `None`) with the same answer or
+exception, and a Map parameter that is a subclass, a dict, a Set or `None` answers as the helpers.
+The compiled text is asserted to hold each form where its fact holds and the guard where it does not.
+
+Mutations, each red in `cargo test --test j91` (a scratch copy of both crates, one at a time,
+`/private/tmp/claude-501/j91/mut/run.py`): a counted loop with another assignment to `i` inside it;
+any start; any name as the bound; any stride; `.length` of any receiver an index; `new Set()` a
+Map; `===`'s unproven side without its range test; two safe ints (not indices) added plainly; an
+addend proven a safe int (not an index) untested; a list read by a safe int without `0 <=`; a key
+proven any number taken as its own tag; a store into any receiver as into a list.
+
+## J91-2 rules: two exact runtime helpers, and the type tests mypyc narrows by (#341)
+
+Measured in docs/porting.md (*The pure build after J91-2*). Pinned in
+`tools/ts2py-bantamkit/tests/j92.rs` (the two helpers) and `tests/j91.rs` (the type tests).
+
+**`hash_hex_int` (the shard hash).** `parseInt(createHash(A).update(x, 'utf8').digest('hex')
+.slice(0, N), 16)`, the hash chain J90-P2 matches (`A` a literal `'sha256'` or `'sha1'`, the
+`node:crypto` adapter not shadowed), `N` a whole literal in `[1, 13]`, the slice's start the literal
+`0` and the radix the literal `16` (`hash_int_chain`): `hash_hex_int(A, x, N)`, an index. A sha1
+digest is 40 hex digits and a sha256 one 64, so the slice is N lower-case hex digits and `parseInt`
+reads all of them: the int they spell, below 16**13 = 2**52. The adapter hashes `hash_hex`'s bytes
+(`_hash_bytes`, the same lone-surrogate and surrogate-escape handling) and reads the first N digits
+(`int.from_bytes` of the first N/2 digest bytes for an even N: the same digits, big-endian); any
+value but a `str` is `int(hash_hex(A, x)[:N], 16)`, so it is `hash_hex`'s answer or its refusal.
+`x` is evaluated before the call and nothing before the hash can throw, as in JS. Not taken: 14
+digits or more, a slice from anything but 0, another radix or none, a slice of anything but the
+chain.
+
+**A destructuring for-of over a proven list.** `for (const [a, b, ...] of xs)`, `xs` proven a list
+and its elements not proven fresh tuples of the pattern's length (J87 unpacks those directly):
+`for _js_rN in xs:` and, first in the body, `a, b, ... = _js_rN if type(_js_rN) is list and
+len(_js_rN) == n else _js_row(_js_rN, n, wanted)`. `_js_rows(xs, n, wanted)` over a list is `for
+item in xs:` yielding `item` when it is a list of exactly `n`, `item[:n]` when longer, and
+`_js_get` of each wanted index otherwise; `_js_row` is that answer for one item. Python's list
+iterator is the one `_js_rows` iterated, so an item pushed during the walk is visited (as in JS),
+and the unpack runs at the start of each pass, where the generator's resume ran. No generator is
+made or resumed (`encodeSegments`, 8,285 calls of 2.65 rows: 5.25 to 4.42 ms, 3.14).
+
+**A fact drops a range or sign test, never a type test.** J91-1's facts also left out `type(m) is
+_JsMap`, `type(xs) is list` and `type(i) is int`. Those are the tests mypyc narrows a value by: under
+`type(m) is _JsMap` it reads `m._entries` from the native struct, without it `CPyObject_GetAttr`
+(checked in the C mypy 2.4.1's mypyc writes for a two-function module: `((M *)m)->__entries` with
+the test, `CPyObject_GetAttr(m, '_entries')` without). Every generated function is unannotated, so
+mypy does not check its body and a value's only static type is what such a test narrows it to; a
+local annotation is refused there (`annotation-unchecked`) unless the build's mypy configuration
+changes, which J90-P7 fixed. So J91-2 keeps every type test and drops only what a fact answers
+beyond it:
+
+| Expansion | J91-1 | J91-2 |
+|---|---|---|
+| `m.get(k)` / `m.has(k)` / `m.set(k, v)`, `m` a proven Map | no receiver test | `type(m) is _JsMap` (`has` still has no Set arm) |
+| `xs[i]` / `xs[i] = v`, `i` an index | `i < len(xs)` | `type(i) is int and i < len(xs)` |
+| the same, `i` a safe int (not an index) | `0 <= i < len(xs)` | `type(i) is int and 0 <= i < len(xs)` (as unproven) |
+| `xs[i] = v` / `xs.push(x)` as a value, `xs` a proven list | no list test | `type(xs) is list` |
+| `===` / `!==`, a side a proven safe int | no test on that side | `type(x) is int` |
+| `a + b`, `a` or `b` an index | no test on it | `type(x) is int` |
+
+A type test the fact proves always passes, so each fast arm runs where it ran; where it would not
+pass the helper answers, as everywhere. Pure cost: about 0.5 ms of `derive` (3.14); compiled, the
+cold build and compaction come back to main's (porting.md).
+
+**Measured and not taken** (3.14, `derive` of the 14-source build inside the real refresh, best of
+4 per process, 6 interleaved processes per variant, hand-edited generated code;
+`/private/tmp/claude-501/j92/{mkexp.py,vdrive.py}`): a `Counter`-backed tally of `toks` into `tfs`
+(79.7 ms against 79.0 as generated and 77.5 for the same loop with no guards at all: 25k of 27k
+tokens are distinct, so `_count_elements` saves a dispatch per repeat and a second pass pays it per
+distinct term); a group-into helper (`_js_group_push(table, key, value)`, the get-or-set-and-push
+as one call: 79.5, the call costing what its tests save; the unguarded inline form is 78.0, which
+needs element facts of `words`' Maps); `shardOf`'s memo read and written inline (78.1 against 78.6:
+three helper calls per term, not worth a module-`let` Map fact); a one-time element check per
+`encodeSegments` call (7.89 ms against 5.25 for 8,285 calls: the check costs more than the guards on
+2.65 rows); a `sum`-based int scan in `_js_lift_values_same` (0.07 ms against 0.29 for the type scan
+of 47,161 items, but `sum` admits an `int` subclass the type scan refuses).
+
+Pinned in `tests/j92.rs`: `probe()` and `fuzz(3000)` of `tests/fixtures/j92_probe.ts` equal to what
+Node v26.13.0 printed (`fixtures/j92_probe.node.txt`, 51 lines): every N in [1, 13] of both
+algorithms over strings with lone lead and trail surrogates, a split pair, astral characters, U+FFFD,
+NUL and 300 characters, the chains not taken (14 digits, a slice from 1, radix 10, no radix, a slice
+of the input), rows shorter and longer than the pattern, empty, with holes, one name and a list
+pushed to while walked, each against a twin laundered through `opaque`; the compiled text holds
+each form where it applies and not where it does not. In Python: `hash_hex_int` against the general
+lowering (`_js_parse_int(_js_str_slice(hash_hex(...), 0, N), 16)`) over 3,000 seeded strings of
+lone, escaped and paired surrogates for every N and both algorithms, and over `None`, numbers,
+bools, `bytes`, `bytearray`, `memoryview`, a list, a dict, undefined, a BigInt, a Map and `str`
+subclasses (the same answer or exception); `_js_row` against `_js_rows` for each of 15 items JS
+cannot build (tuples, strings, dicts, a Map, `None`, `7`) and four patterns; the inline unpack
+against `_js_rows` over 3,000 seeded lists of them (81,144 checks, 0 differ).
+
+Mutations, each red in `cargo test --test j92 --test j91` (a scratch copy of both crates, one at a
+time, `/private/tmp/claude-501/j92/mut/run.py`, 13 of 13 red): 14 digits taken; any slice start;
+any radix; the adapter reading bytes for an odd count; the adapter hashing a `str` subclass or
+`bytes` as a `str`; any iterable unpacked in the loop; a list at least the pattern's length unpacked
+as it is; `_js_row` not slicing a longer list; a proven Map's receiver test dropped; an index store
+without its type test; `===` without a proven int's type test; `+` without an index's type test; a
+list read by an index without its type test.
+
+J91-1's mutations after this change: the nine whose code is still there (any assignment inside a
+counted loop, any start, any name as the bound, `.length` of any receiver, `new Set()` a Map,
+`===`'s unproven side without its range test, two safe ints added plainly, any proven number a key's
+own tag, any stride) are still red in `cargo test --test j91`; the three that mutated a test J91-2
+now always writes (an addend's, a list read's and a store's type tests) have no code left to mutate.
+
+## J91-3 rules: element and return facts (#341)
+
+Measured in docs/porting.md (*The pure build after J91-3*). Pinned in
+`tools/ts2py-bantamkit/tests/j93.rs` (fixtures `j93_probe.ts` and `j93_lib.ts`, two modules in an
+import cycle).
+
+**`own` and `elem`.** A new flag of `types::Fact`, `own`: the value is a list, `_JsMap` or `_JsSet`
+nothing else can reach. A value is `own` when it was just made (an array literal, `new Map()`,
+`new Set(...)` of the builtins, `s.match(re)` of a `g` regex), when it is the read of a sealed
+binding (below), or when it is what a function returns and every return of it is `own`. `elem`
+(J87: what every element of a frozen constant is) now also says what an `own` value holds: a list's
+elements, a Set's items, a Map's entries (as the fresh `[key, value]` pair its for-of yields, so
+`tuple` holds the key's and the value's facts). A binding keeps `own` and `elem` only when sealed;
+every other binding keeps the flags alone (`shallow`), as before. A module constant is never `own`.
+
+**Sealed bindings** (`lower.rs`, `Seal`, `seal_read`, `fill`, `sealed_fact`). A local `const` bound
+to an `own` value is sealed when every read of it is one of:
+
+| Read | Why it lets nothing else reach the value |
+|---|---|
+| receiver of `push` / `set` / `get` / `has` / `add` | the builtin reads or changes it in place; what `push` / `set` / `add` puts in is met into the binding's `elem` (`fill`) |
+| object of `.length` / `.size`; a for-of's iterable | a read in place |
+| `return x` in the body that declares `x` (`Seal::Return`), when every nested function that reads `x` is a sealed closure (`returnable`) | the caller gets the only reference: the frame is gone and no function that reads `x` can still run |
+
+A sealed closure is a `const f = (...) => ...` whose every read is a direct call from the body
+that declares it (`Seal::Call`): it cannot run once that body has returned. Any other read of the
+binding (an argument, an alias, an index read or store, `splice`, a return from a nested function)
+unseals it (`Assume::unsealed`, which only grows), and the binding keeps nothing of what the value
+holds. What a sealed binding keeps of an element is shallow (an element is a value other reads can
+reach and change), except that a Map's entry stays a pair (each iteration makes a new one). What is
+put in: `push(v...)` the meet of each `v`'s shallow fact (a spread: nothing); `set(k, v)` the pair
+of `k` (less `f64`: `-0` is stored as `0`) and `v`; `add(v)` a `str` only when `v` is one (a
+`str` item is itself; a number's tag may not be). An optimistic argument puts in "anything" for the
+round (`Fact::top`, the meet's identity), as every optimistic value does.
+
+**Reads of what a sealed value holds.** A for-of over it binds each element's fact (J87's rule,
+now for any `elem`); a destructuring for-of over a Map binds the pair's sides and still walks it
+with `_js_rows` (no pair is made); `m.get(k)` of a Map whose entries are proven is the value's
+fact met with `undefined` (`contents_fact`); a Map none of whose entries was ever set answers
+`undefined`.
+
+**Return facts across modules** (`lib.rs`, `ModuleExports::rets`, `Lowerer::export_rets`). The
+compile runs in rounds (`MAX_COMPILE_ROUNDS` = 4): each lowers every module, to its own settled
+fixpoint, with what the previous round proved of the other modules' exported functions (nothing in
+the first), until a round proves what it was given. A call of an imported function proves what
+both of its bodies' returns proved, met (a call by the exported name runs the guarded entry, which
+runs the untyped body for an argument it cannot admit); an untyped function's one body; nothing for
+a function whose returns were never seen, a generator, or a name a `[[rebound]]` row names (the
+call may not run this body). Every round's facts are sound: the first assumes nothing of another
+module, and each later one only what an earlier round proved of the same JavaScript functions,
+whose Python answers do not depend on how their bodies were lowered (every lowering answers what JS
+answers). A round left unsettled at the cap is still sound, and is the output.
+
+**An adapter row's `str` contract** (`adapters::Contract::Str`, `contract = "str"`): the function
+answers an exact `str` or raises, whatever its arguments, so a call is a proven `str`. Taken by one
+row: `pyNfkcLower`, whose adapter is now `str.lower(unicodedata.normalize('NFKC', text))`.
+`normalize` refuses anything but a `str` (TypeError, as before); `str.lower` is the base method, so
+a `str` subclass with its own `lower` (whose `normalize` may answer the argument itself) still
+gives an exact `str`. For an exact `str` it is the same call as before.
+
+**A `g` match** (`contents_fact`): `s.match(re)`, `re` proven a `_JsGlobalRegExp` (a new flag,
+`gregex`, of a `g` literal and of a module constant bound to one), is `null` or an `own` list of
+`str`s (`_js_m_match`: every match's text through `_js_from_units`). A match without `g` proves
+nothing of its elements (a group may be `undefined`).
+
+**`a ?? b`** is `a` only where `a` is neither `null` nor `undefined`: what `a` is when defined, met
+with `b` (was: `a`'s fact met with `b`'s, so `x ?? []` never proved a list).
+
+**A for-of `const` may be narrowed** by a guard (`Array.isArray(v)`), as any `const`: it is never
+reassigned in the body, and each pass binds it anew. **And no narrowing outlives an assignment**:
+a binding is narrowable only when nothing assigns it (`Assume::assign_spans`). A `const` and a `let`
+of one name in two blocks of one function are one Python binding (one key), so the `const`'s key in
+`consts` let a guard narrow the `let` past an assignment to it: `let v = rows[1]; if
+(Array.isArray(v)) { v = opaque(5); v.length }` was `len(v)` (a TypeError where Node answers
+`undefined`). No shipped module had that shape (the regenerated modules are unchanged by the fix).
+
+**The JSON integer scan, over bytes** (`_js_json_ints_exact`, runtime). The same answer as J90-PF's
+(pinned against that function, embedded in the test, over 60,000 seeded texts of token-like atoms;
+and `JSON.parse` answering the slow decoder's value and types over 3,000 seeded arrays): the `-0`
+candidates by the same pattern over the UTF-8 bytes (no byte of a multi-byte sequence is ASCII),
+and the runs of 16 digits first through a probe (`_JS_JSON_RUN_PROBE`: a digit to `0`, each of `[`,
+`,`, `:`, `-` and the four blanks to `a`, any other byte to `b`). A run that could be a token starts
+right after one of those or at the start, so a probe with no `a` + 16 zeros that does not start
+with 16 zeros has none; only a probe with such a candidate walks the runs as before. A hot index
+tail's 19-digit `mtime_ns` strings (each a run after a quote) no longer cost a Python loop step each:
+the scan of a full refresh's 14 tails (600 KB) 1.03 to 0.69 ms (3.14).
+
+**Two TypeScript respellings, neither slower in Node** (porting.md): `tokenizeV2`'s one-unit run
+pushes `s.slice(runAt, end)` (the one unit `s[runAt]` is, `end - runAt === 1`, but a `string`
+without the `undefined` an index may answer), and `derive`'s encoded tables iterate `[key, r]`, not
+`[t, r]` (Python has one `t` per function, and the token loop's `t` is proven a `str`, which those
+keys are not). And `write` reads each family's prints once, not per shard.
+
+Mutations, each red in `cargo test --test j93` (a scratch copy of both crates, one at a time,
+`/private/tmp/claude-501/j91rf/mut/run20.py`, 20 of 20 red): every read a sealed use; a nested
+function's reader never stopping a sealed `return`; a sealed `return` from any function; a sealed
+closure called from anywhere; what `push` / `set` / `add` puts in never met; `Seal::Use` for any
+method; a pushed value's contents kept (not shallow); any item `add`ed to a Set kept; `new
+Set(list)` of any list's items `str`s; a Map's `get` never `undefined`; a `[[rebound]]` name's
+returns taken; a function's typed body's returns alone; the `str` contract for any adapter; the
+`str` adapter calling its argument's own `lower`; any regex's match a list of `str`s; `a ?? b`
+proving `a`'s facts alone; a narrowing past an assignment; `-` before a run not a JSON scan
+candidate; a candidate run not walked. And (J91-R F1) a `new Map(entries)` read as a Map made
+empty (`elem` vacuous, so a sealed Map none of whose entries was `set` answers `undefined`):
+`const mm = new Map([['a', 5]]); const r = mm.get('a') ?? []; r.length` would be `len(r)`, a
+TypeError where Node answers `undefined`; pinned by `mapMade` and its `opaque` twin
+`mapMadeGuarded` (both answer `o:undefined` in Node and Python, and `.length` stays `_js_len`).
