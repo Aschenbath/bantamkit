@@ -2,7 +2,7 @@
  * The per-file sandbox (#204, J69-9 F5). Every `*.test.mjs` imports this FIRST.
  *
  * `npm test` goes through `scripts/run-tests.mjs`, which hands every file one scratch
- * `BANTAMKIT_INDEX_DIR` and `BANTAMKIT_RETENTION=off` and marks the run with
+ * HOME, USERPROFILE, `BANTAMKIT_INDEX_DIR` and `BANTAMKIT_RETENTION=off` and marks the run with
  * `SANDBOX_ENV`. A file run directly — `node --test runtime-ts/test/<file>` — gets none of
  * that: the operator's HOME, no index override, Retention armed. An in-process store then
  * writes the real `~/.bantamkit/index/` and `cold/`, and a spawned server or SessionStart

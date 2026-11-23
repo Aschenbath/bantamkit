@@ -17,6 +17,15 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const GUARD = pathToFileURL(path.join(HERE, '_sandbox.mjs')).href;
 const KEYS = ['HOME', 'USERPROFILE', 'BANTAMKIT_INDEX_DIR', 'BANTAMKIT_RETENTION', 'BANTAMKIT_SKILL_AUDIT', 'BANTAMKIT_TEST_SANDBOX'];
 
+test('the runner isolates the home as well as the index', () => {
+  const scratch = process.env.BANTAMKIT_TEST_SANDBOX;
+  assert.ok(scratch, 'runner did not set its sandbox marker');
+  assert.equal(os.homedir(), path.join(scratch, 'home'));
+  assert.equal(process.env.HOME, os.homedir());
+  assert.equal(process.env.USERPROFILE, os.homedir());
+  assert.equal(process.env.BANTAMKIT_INDEX_DIR, path.join(scratch, 'index'));
+});
+
 /** The env a child that imported the guard sees, given `env` (no inherited marker). */
 function guarded(env) {
   const base = { ...process.env };
