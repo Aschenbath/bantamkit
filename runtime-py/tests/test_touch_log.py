@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -241,6 +242,36 @@ def test_git_on_path_never_counts_a_batch_file(tmp_path):
     assert git_on_path(str(cmd), "", True) is False
     assert git_on_path(str(cmd), ".CMD;.BAT", True) is False
     assert git_on_path(f"{cmd};{both}", "", True) is True  # the .exe further on is found
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        subprocess.TimeoutExpired("git", 2),
+        OSError("temporarily unavailable"),
+        subprocess.CompletedProcess(["git"], -15),
+    ],
+    ids=["timeout", "spawn-error", "signal"],
+)
+def test_git_on_path_retries_incomplete_probes(tmp_path, monkeypatch, first):
+    from bantamkit.touch import repo
+
+    candidate = tmp_path / "git"
+    candidate.touch()
+    state = tmp_path / "state"
+    monkeypatch.setattr(repo, "_GIT_FOUND", {})
+    monkeypatch.setattr(repo, "_git_candidate", lambda *args: str(candidate))
+    run = Mock(side_effect=[first, subprocess.CompletedProcess(["git"], 0)])
+    monkeypatch.setattr(repo.subprocess, "run", run)
+
+    assert git_on_path(str(tmp_path), state_dir=str(state)) is False
+    assert not (state / GIT_PROBE_FILE).exists()
+    assert git_on_path(str(tmp_path), state_dir=str(state)) is True
+    assert json.loads((state / GIT_PROBE_FILE).read_text(encoding="utf-8"))["ok"] is True
+    assert git_on_path(str(tmp_path), state_dir=str(state)) is True
+    monkeypatch.setattr(repo, "_GIT_FOUND", {})
+    assert git_on_path(str(tmp_path), state_dir=str(state)) is True
+    assert run.call_count == 2  # completed results still use both caches
 
 
 def _fake_git(d: Path, code: int) -> Path:

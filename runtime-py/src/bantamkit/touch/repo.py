@@ -172,8 +172,8 @@ def _probe_cached(state_dir: str, key: str) -> bool | None:
     return None
 
 
-def _git_runs(cand: str) -> bool:
-    """`<cand> --version` exits 0 within `GIT_TIMEOUT_MS`: no shell, no stdin, no window."""
+def _git_runs(cand: str) -> bool | None:
+    """Whether `<cand> --version` exits 0; None when no exit status was obtained."""
     try:
         done = subprocess.run(  # noqa: S603 - argv list, no shell
             [cand, "--version"],
@@ -184,7 +184,9 @@ def _git_runs(cand: str) -> bool:
             **_no_window(),
         )
     except (OSError, ValueError, subprocess.SubprocessError):
-        return False
+        return None
+    if done.returncode < 0:
+        return None
     return done.returncode == 0
 
 
@@ -204,7 +206,8 @@ def git_on_path(
     candidate path and its `mtime_ns:size`, good while the file's mtime is within
     `GIT_PROBE_TTL_S` of now; a spawn is paid only on a miss. A simulated platform
     (`windows` not this OS's) never spawns: the stat walk answers. Cached per process, keyed
-    by the PATH and PATHEXT it read.
+    by the PATH and PATHEXT it read. A timeout or failed spawn answers False for this call
+    without caching it, so a later call can retry.
     `runtime-ts`'s `gitOnPath` is the port.
     """
     real = os.name == "nt"
@@ -225,6 +228,8 @@ def git_on_path(
             found = cached
         else:
             found = _git_runs(cand)
+            if found is None:
+                return False
             if state_dir is not None and pk is not None:
                 try:
                     os.makedirs(state_dir, exist_ok=True)
