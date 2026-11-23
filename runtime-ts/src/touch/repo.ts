@@ -141,13 +141,14 @@ function probeCached(stateDir: string, key: string): boolean | null {
   return null;
 }
 
-/** `<cand> --version` exits 0 within `GIT_TIMEOUT_MS`: no shell, no stdin, no window. */
-function gitRuns(cand: string): boolean {
+/** Whether `<cand> --version` exits 0; null when no exit status was obtained. */
+function gitRuns(cand: string): boolean | null {
   try {
     const r = spawnSync(cand, ['--version'], { env: { ...process.env, ...GIT_ENV }, timeout: GIT_TIMEOUT_MS, windowsHide: true, stdio: 'ignore' });
-    return !r.error && !r.signal && r.status === 0;
+    if (r.error || r.signal || r.status === null) return null;
+    return r.status === 0;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -160,7 +161,8 @@ function gitRuns(cand: string): boolean {
  * `GIT_TIMEOUT_MS`. The answer is kept in `<stateDir>/git-probe.json` (`{"key","ok"}`, `key`
  * the sha256 of the candidate and its `mtime_ns:size`) while the file is under
  * `GIT_PROBE_TTL_S` old. A simulated platform never spawns. Cached per process, keyed by the
- * PATH and PATHEXT it read.
+ * PATH and PATHEXT it read. A timeout or failed spawn answers false for this call without
+ * caching it, so a later call can retry.
  */
 export function gitOnPath(p: string | null = null, pathext: string | null = null, windows: boolean | null = null, stateDir: string | null = null): boolean {
   const real = process.platform === 'win32';
@@ -180,7 +182,9 @@ export function gitOnPath(p: string | null = null, pathext: string | null = null
     if (cached !== null) {
       found = cached;
     } else {
-      found = gitRuns(cand);
+      const result = gitRuns(cand);
+      if (result === null) return false;
+      found = result;
       if (stateDir !== null && pk !== null) {
         try {
           fs.mkdirSync(stateDir, { recursive: true });

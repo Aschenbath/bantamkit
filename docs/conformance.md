@@ -31,10 +31,11 @@ two sources and agreed they match — which is the check that has never once cau
 difference that mattered. Every defect this job found in the port was found by running both
 sides, not by reading either.
 
-## The fifty-six suites
+## The fifty-seven suites
 
 | suite | what it compares |
 |---|---|
+| `touch-probe-retry` | A fake git times out once, then succeeds on both runtimes (#342). Per-side literals pin the uncached first result, the successful retry, reuse of both caches, and exactly two invocations. The sleeping shebang fixture runs on POSIX; portable unit mocks cover incomplete spawn results on Windows. |
 | `cli` | the `bantamkit-mcp` command line as a process: stdout, stderr, exit code. **Extended 2026-09-11 by J46-28** to the question of WHO is on the other end of stdin: the bare invocation at a real terminal (the help, on stdout, exit 0), the bare invocation over a pipe driven with a real `initialize`, and `--store` at a terminal, which still SERVES because the empty argv is a scope and not a second signal. Five of its cases are NOT differential — what each side printed at a terminal, which stream carried it, that it is that runtime's own `-h` bytes, that a flagged terminal launch served, and that a piped bare launch answered — because a revert applied to BOTH runtimes leaves every differential green: measured, `--suite cli` goes from 4 failures on a one-sided revert to **3** on the two-sided one, and the differential `bare-at-a-tty/stdout` is one of the cases that goes back to passing |
 | `charsets` | `runtime-ts/src/charsets.ts` against the live CPython codec registry: the file against what `runtime-ts/scripts/charsets-table.py` writes today (header excluded), all 256 bytes of every single-byte codec decoded by the reference against the port's table, the alias map and the module list |
 | `codec` | fact-file frontmatter: emit byte-identically, and parse each other |

@@ -5,10 +5,11 @@
  */
 import './_sandbox.mjs';
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import childProcess, { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { syncBuiltinESMExports } from 'node:module';
 import { dirname, join, relative } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -294,6 +295,37 @@ test('gitOnPath runs the git it finds (208 item 6)', { skip: process.platform ==
   const probe = JSON.parse(readFileSync(join(state, GIT_PROBE_FILE), 'utf8'));
   assert.equal(probe.ok, false);
   assert.equal(probe.key.length, 16);
+});
+
+test('gitOnPath retries incomplete probes without caching them', (t) => {
+  const firstResults = [
+    { error: Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }), status: null, signal: 'SIGTERM' },
+    { error: Object.assign(new Error('spawn failed'), { code: 'EAGAIN' }), status: null, signal: null },
+    { status: null, signal: 'SIGTERM' },
+  ];
+  for (const first of firstResults) {
+    const dir = tmp();
+    const candidate = join(dir, process.platform === 'win32' ? 'git.exe' : 'git');
+    writeFileSync(candidate, '');
+    chmodSync(candidate, 0o755);
+    const state = join(dir, 'state');
+    let calls = 0;
+    const probe = t.mock.method(childProcess, 'spawnSync', () => ++calls === 1 ? first : { status: 0, signal: null });
+    syncBuiltinESMExports();
+    try {
+      assert.equal(gitOnPath(dir, '.exe', null, state), false);
+      assert.equal(existsSync(join(state, GIT_PROBE_FILE)), false);
+      assert.equal(gitOnPath(dir, '.exe', null, state), true);
+      assert.equal(JSON.parse(readFileSync(join(state, GIT_PROBE_FILE), 'utf8')).ok, true);
+      assert.equal(gitOnPath(dir, '.exe', null, state), true);
+      // Another PATH spelling misses the process cache, but reads the same disk key.
+      assert.equal(gitOnPath(dir + (process.platform === 'win32' ? ';' : ':'), '.exe', null, state), true);
+      assert.equal(calls, 2);
+    } finally {
+      probe.mock.restore();
+      syncBuiltinESMExports();
+    }
+  }
 });
 
 test('gitOnPath keeps its answer on disk', { skip: process.platform === 'win32' && 'a #!/bin/sh git cannot run on Windows; the git.cmd rule is injected instead' }, () => {
